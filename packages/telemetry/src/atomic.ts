@@ -7,7 +7,14 @@
 //   - create the temp with O_EXCL so two concurrent writers cannot share it;
 //   - chmod explicitly after creation — the `mode` argument to open() is masked by umask, and a
 //     022 umask would leave a 0644 secret behind;
-//   - fsync before rename so the rename cannot land ahead of the bytes.
+//   - fsync before rename so the rename cannot land ahead of the bytes;
+//   - fsync the DIRECTORY after the rename, because the rename is a directory-metadata change and
+//     syncing the file's contents says nothing about the durability of the entry that points at
+//     them. Without it a power loss can leave the OLD directory entry in place even though the new
+//     bytes are on disk — and for `instance.json` that is not a lost update but a lost IDENTITY:
+//     the next boot finds no file, mints a fresh secret, and every heartbeat already sent under the
+//     previous id becomes data the installation can no longer read OR DELETE, since the id is the
+//     capability a user exercises to ask for their data back.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -29,6 +36,7 @@ export function atomicWriteFileSync(filePath: string, data: string, mode: number
     fd = undefined;
     fs.chmodSync(tmp, mode); // umask-proof: open()'s mode is masked, chmod is not
     fs.renameSync(tmp, filePath);
+    fsyncDirSync(dir);
   } catch (err) {
     if (fd !== undefined) {
       try {
@@ -43,6 +51,36 @@ export function atomicWriteFileSync(filePath: string, data: string, mode: number
       /* best effort */
     }
     throw err;
+  }
+}
+
+/**
+ * Make the rename itself durable by syncing the directory that now holds the entry.
+ *
+ * BEST-EFFORT ON PURPOSE, and it must stay that way. Not every platform allows a directory to be
+ * opened and synced — Windows does not — and a filesystem may refuse it for its own reasons. The
+ * rename is already atomic without this; what the sync adds is a guarantee that it SURVIVES power
+ * loss. Turning a platform that cannot offer that guarantee into a hard write failure would break
+ * the product this package reports on, over a durability upgrade, which is the wrong trade in a
+ * module whose first rule is that telemetry never takes its host down. So every failure here is
+ * swallowed, and this function cannot throw — the caller's `catch` treats a throw as a failed
+ * write and deletes a temp file that the rename has already consumed.
+ */
+function fsyncDirSync(dir: string): void {
+  let dirFd: number | undefined;
+  try {
+    dirFd = fs.openSync(dir, "r");
+    fs.fsyncSync(dirFd);
+  } catch {
+    /* the platform will not sync a directory; the write itself still landed atomically */
+  } finally {
+    if (dirFd !== undefined) {
+      try {
+        fs.closeSync(dirFd);
+      } catch {
+        /* nothing left to do with it */
+      }
+    }
   }
 }
 

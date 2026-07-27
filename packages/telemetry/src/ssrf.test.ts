@@ -50,6 +50,18 @@ describe("blockedAddressReason", () => {
     "64:ff9b::a00:1",
     "2002:7f00:1::", // 6to4 wrapping 127.0.0.1
     "2002:a00:1::", // 6to4 wrapping 10.0.0.1
+    // The embedded-IPv4 spellings that were NOT caught until the final review. Each is accepted
+    // by net.isIP as an ordinary IPv6 address, so each reaches the classifier as a literal host
+    // AND as a resolver answer; each classified as public before these were added.
+    "::ffff:0:127.0.0.1", // IPv4-translated ::ffff:0:0:0/96 — the mapped form one group over
+    "::ffff:0:10.0.0.5",
+    "::ffff:0:169.254.169.254", // cloud metadata through the translated spelling
+    "::ffff:0:7f00:1", // …and the same address written without the dotted tail
+    "64:ff9b:1::7f00:1", // RFC 8215 local-use NAT64, outside the well-known /96
+    "64:ff9b:1::a00:5",
+    "64:ff9b:1:2:3:4:5:6", // anywhere in the /32 — no embedding to decode, refused wholesale
+    "2001::1", // Teredo 2001::/32
+    "2001:0:53aa:64c:1c:7b7f:5f3c:8b8c", // a realistic Teredo address
   ];
 
   for (const address of BLOCKED) {
@@ -58,7 +70,21 @@ describe("blockedAddressReason", () => {
     });
   }
 
-  const ALLOWED = ["1.1.1.1", "8.8.8.8", "93.184.216.34", "172.32.0.1", "100.63.255.255", "2606:4700::1111", "2a00:1450:4001:80e::200e"];
+  const ALLOWED = [
+    "1.1.1.1",
+    "8.8.8.8",
+    "93.184.216.34",
+    "172.32.0.1",
+    "100.63.255.255",
+    "2606:4700::1111",
+    "2a00:1450:4001:80e::200e",
+    // Guards the widened prefixes against over-blocking: these are real public IPv6 addresses
+    // that share leading bytes with the transition prefixes refused above and must still pass.
+    "2001:4860:4860::8888", // 2001:4860::/32 — public, and NOT Teredo's 2001:0000::/32
+    "2001:500:200::b", // likewise adjacent to the Teredo prefix
+    "64:ff9a::1", // one below the translation allocation
+    "65:ff9b::1", // one above it
+  ];
 
   for (const address of ALLOWED) {
     test(`allows public ${address}`, () => {

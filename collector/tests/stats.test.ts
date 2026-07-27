@@ -7,7 +7,7 @@
 // exists to keep that from coming back.
 
 import { describe, expect, test } from 'bun:test';
-import { foldRates, foldTotals } from '../src/totals';
+import { foldRates, foldTotals, type TotalsValue } from '../src/totals';
 import { ingestReq, makeHarness, statsReq } from './helpers';
 import { INSTANCE_A, makeV1, makeV2, SECRET_A } from './fixtures';
 
@@ -89,11 +89,34 @@ describe('stats: totals per product — and NO 500 when a section is absent', ()
   });
 
   test('a stored payload missing every declared path yields zeros, never a throw', () => {
+    // This asserted `expect(typeof value === 'number' ? value : value).toBeDefined()`
+    // — a dead ternary (both arms are `value`) feeding an assertion that holds
+    // for ANY value the fold could emit. It passed while claiming "yields
+    // zeros" without ever checking a zero, so a fold that returned 999 for
+    // every missing path, or dropped a product's declarations entirely, went
+    // unnoticed. The identity element per temporal class is now pinned
+    // exactly: `sum` ⇒ 0, `or` ⇒ false, gauge (`last`) ⇒ null, and brokkr's
+    // model breakdown ⇒ the empty list.
+    const expected: Record<string, Record<string, TotalsValue>> = {
+      brokkr: {
+        sessions: 0, minutes: 0, failed: 0, review_runs: 0,
+        spine_joints: 0, spine_estimated: false, spine_tokens_saved: 0, models: [],
+      },
+      saga: {
+        collect_runs: 0, collect_errors: 0, refusals: 0, mcp_tool_calls: 0,
+        mcp_refusals: 0, advisories_fired: 0, connections_total: null, uptime_bucket: null,
+      },
+      skuld: {
+        runs_total: 0, runs_succeeded: 0, runs_failed: 0, runs_chain_rejections: 0,
+        gate_rejections: 0, gate_approvals: 0, sandbox_pool_exhausted: 0,
+        sandbox_uid_vends: 0, detection_state: null, uptime_bucket: null,
+      },
+    };
     for (const product of ['brokkr', 'saga', 'skuld']) {
       const totals = foldTotals(product, [{ day: '2026-07-09' }, { metrics: {} }, {}]);
-      for (const [key, value] of Object.entries(totals)) {
-        expect(typeof value === 'number' ? value : value, `${product}.${key}`).toBeDefined();
-      }
+      // Exact object equality, so a REMOVED declaration fails just as loudly as
+      // a wrong value — the failure mode a per-key loop cannot see.
+      expect(totals, product).toEqual(expected[product]!);
       expect(() => JSON.stringify(totals)).not.toThrow();
     }
   });
