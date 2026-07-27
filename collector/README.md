@@ -252,13 +252,23 @@ So state **two** things, and both are required together:
 
 | Variable | Meaning |
 |---|---|
-| `MYTHICAL_TELEMETRY_TRUSTED_PROXIES` | **which peers** are your proxies — a comma-separated list of addresses or CIDRs (IPv4 and IPv6), e.g. `10.0.0.0/8,2001:db8:1::/48` |
+| `MYTHICAL_TELEMETRY_TRUSTED_PROXIES` | **which peers** are your proxies — a comma-separated list of addresses or CIDRs (IPv4 and IPv6), e.g. `10.0.0.0/8,2001:db8:1::/48`. List **every** proxy in the chain, not only the one that connects to the collector |
 | `MYTHICAL_TELEMETRY_TRUSTED_PROXY_HOPS` | **how many** of them are in the chain |
 
 A hop count alone is not enough, and the collector refuses to start with one: it would honour the
 header from whoever connected, so anyone with a direct route to the listener — a sibling container,
 a misconfigured security group, a leaked internal port — could hand themselves any bucket they
 liked. The header is read **only when the peer is on the list**.
+
+The declared hops are **verified, not assumed**. With two or more hops, the entries to the right of
+the client position were appended by your own infrastructure, so each of them must itself be on the
+list. That is why the list has to name every proxy: checking only the peer would let anyone who can
+reach an **inner** proxy directly — skipping an outer one — write those entries himself and choose,
+and freely rotate, his own throttle bucket. If a hop is not on the list the request did not arrive
+the way you described it, and the key falls back to the peer address, exactly as it does for an
+untrusted peer or a chain shorter than the declared count. A chain that silently collapses to one
+bucket is the symptom of a hop count that names more proxies than the list does; `GET /metrics`
+reports `throttle.rate_limit_keys` and `throttle.trusted_proxies_configured` so you can see it.
 
 With `N` hops, the rightmost `N` entries of the chain were appended by infrastructure you control,
 and the client address is taken from that position. Anything an attacker prepends sits to the left

@@ -77,8 +77,47 @@ describe('the trusted-proxy model', () => {
   });
 
   test('with two trusted hops the second-from-right entry is taken', () => {
-    expect(resolveSourceKey(req('203.0.113.9, 172.16.0.1'), server('10.0.0.1'), 2, PROXIES)).toBe(key('203.0.113.9'));
-    expect(resolveSourceKey(req('spoof, 203.0.113.9, 172.16.0.1'), server('10.0.0.1'), 2, PROXIES)).toBe(key('203.0.113.9'));
+    // The intermediate hop is 10.0.0.2 — INSIDE the trusted range, because a
+    // two-hop chain is only a chain the operator described if both of its
+    // proxies are ones the operator named. See the bypass test below.
+    expect(resolveSourceKey(req('203.0.113.9, 10.0.0.2'), server('10.0.0.1'), 2, PROXIES)).toBe(key('203.0.113.9'));
+    expect(resolveSourceKey(req('spoof, 203.0.113.9, 10.0.0.2'), server('10.0.0.1'), 2, PROXIES)).toBe(key('203.0.113.9'));
+  });
+
+  test('a DECLARED HOP that is not one of the operator\'s proxies is not taken on faith', () => {
+    // The bypass this closes. At two or more hops, verifying only the immediate
+    // peer left the inner positions of the chain unverified. An attacker who
+    // can reach an INNER proxy directly — skipping an outer one — writes those
+    // entries himself, and the entry the resolver then selects is one he chose:
+    //
+    //   attacker 198.51.100.7 -> P2 (10.0.0.1, trusted) -> collector
+    //   attacker sends:  "EVIL, <anything>"
+    //   P2 appends him:  "EVIL, <anything>, 198.51.100.7"
+    //   index = len - 2  ⇒  <anything>
+    //
+    // which is a freely rotatable throttle bucket, defeating the ingest, read
+    // and new-identity limiters at once. Every one of these must now come back
+    // as the peer instead.
+    for (const chosen of ['1.2.3.4', '5.6.7.8', '9.9.9.9', '203.0.113.9']) {
+      expect(
+        resolveSourceKey(req(`EVIL, ${chosen}, 198.51.100.7`), server('10.0.0.1'), 2, PROXIES),
+        chosen,
+      ).toBe(key('10.0.0.1'));
+    }
+    // The same shape one level deeper.
+    expect(resolveSourceKey(req('a, 1.2.3.4, 172.16.0.1, 198.51.100.7'), server('10.0.0.1'), 3, PROXIES)).toBe(
+      key('10.0.0.1'),
+    );
+    // An operator who declares two hops but lists only the inner proxy has not
+    // described a chain this code can verify, so it degrades to the peer — the
+    // safe direction — rather than trusting an unverifiable hop.
+    expect(resolveSourceKey(req('203.0.113.9, 172.16.0.1'), server('10.0.0.1'), 2, PROXIES)).toBe(key('10.0.0.1'));
+  });
+
+  test('one hop is unaffected — there is nothing to the right of the selected entry', () => {
+    // Guards against the new check over-reaching into the common configuration.
+    expect(resolveSourceKey(req('1.2.3.4, 198.51.100.7'), server('10.0.0.1'), 1, PROXIES)).toBe(key('198.51.100.7'));
+    expect(resolveSourceKey(req('203.0.113.9'), server('10.0.0.1'), 1, PROXIES)).toBe(key('203.0.113.9'));
   });
 
   test('an IPv4-mapped IPv6 peer still matches an IPv4 CIDR', () => {

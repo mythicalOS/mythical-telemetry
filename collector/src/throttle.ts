@@ -27,10 +27,17 @@
 //      address sits N from the right end. Anything an attacker prepends is to
 //      the LEFT of that position and is ignored.
 //
+// `trustedProxies` MUST NAME EVERY PROXY IN THE CHAIN, not just the one that
+// connects to this service. The declared hops are verified, not assumed: the
+// entries to the right of the selected one are addresses the operator's own
+// infrastructure appended, so each must itself be on the list. Verifying only
+// the immediate peer made a chain of two or more exploitable by anyone able to
+// reach an inner proxy directly — see `resolveSourceKey`.
+//
 // Every failure mode falls back to the peer address, never to a header value:
-// an untrusted peer, a chain shorter than the declared hop count, or an
-// implausible value all mean the request did not arrive the way the operator
-// described.
+// an untrusted peer, a chain shorter than the declared hop count, a declared
+// hop that is not one of the operator's proxies, or an implausible value all
+// mean the request did not arrive the way the operator described.
 
 import { addressKey, isTrustedPeer, type CidrPattern } from './ip';
 
@@ -76,6 +83,32 @@ export function resolveSourceKey(
 
   const candidate = parts[index];
   if (candidate === undefined) return peerKey;
+
+  // EVERY ENTRY TO THE RIGHT OF THE SELECTED ONE MUST ALSO BE A TRUSTED PROXY.
+  //
+  // Those positions hold the addresses the operator's own infrastructure
+  // appended as the request moved inward, so in the chain the operator
+  // described they are, by definition, the operator's own proxies. Checking
+  // only the immediate peer left the rest of the declared chain unverified,
+  // and at `trustedProxyHops >= 2` that is a bypass rather than a nicety: an
+  // attacker who can reach an INNER proxy directly — skipping an outer one, the
+  // sibling-container / leaked-internal-port case this file already worries
+  // about for the peer — supplies the entries that land in those positions
+  // himself. The entry selected above is then one he wrote, so he picks his own
+  // throttle bucket and can rotate it per request, which defeats the ingest
+  // limiter, the read limiter and the new-identity limiter simultaneously. (At
+  // one hop there is nothing to the right of the selected entry and the model
+  // was always sound; this is what makes deeper chains sound too.)
+  //
+  // Consequence for configuration, and it is deliberate: `trustedProxies` must
+  // list EVERY proxy in the chain, not merely the one that connects here. A
+  // hop that is not on the list means the request did not arrive the way the
+  // operator described, and — like every other mismatch in this function — that
+  // falls back to the peer address rather than to a value from the header.
+  for (let i = index + 1; i < parts.length; i += 1) {
+    if (!isTrustedPeer(parts[i]!, trustedProxies)) return peerKey;
+  }
+
   // The selected entry must PARSE as an address, and the key is derived from
   // its canonical bytes. A "looks address-ish" text test would let a caller
   // behind a misconfigured hop count mint unlimited near-miss buckets, and
