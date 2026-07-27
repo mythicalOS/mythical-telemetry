@@ -399,8 +399,10 @@ collector ships a **transactional rebuild** that runs at boot:
   them would not crash, it would silently fold zeros into every historical total;
 - the whole thing is one `IMMEDIATE` transaction: it lands completely or not at all, and a second
   process booting on the same file waits rather than racing;
-- the shape is detected from the actual tables, not from a version marker, so re-running is a
-  no-op and a hand-edited marker cannot skip a rebuild that is genuinely needed;
+- the shape is detected from the tables' actual **primary keys**, not from a version marker and not
+  merely from a column's presence, so re-running is a no-op while a naive `ALTER TABLE ... ADD
+  COLUMN product` hand-upgrade — which leaves the legacy key in place — is still completed rather
+  than mistaken for done. Any product values such an upgrade had already set are kept;
 - the payload pass has its **own** durable marker, separate from the shape version, so a database
   whose tables were converted by other means still gets its stored v1 documents normalized rather
   than silently folding zeros into every historical total;

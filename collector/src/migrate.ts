@@ -160,10 +160,26 @@ function tableExists(db: Database, name: string): boolean {
 
 function columnNames(db: Database, table: string): string[] {
   // PRAGMA takes no bound parameters; `table` is never user input — it is one
-  // of two literals below.
+  // of the literals below.
   const rows = db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all();
   return rows.map((r) => r.name);
 }
+
+/** The table's primary-key columns, in key order. Empty when it has none. */
+function primaryKeyColumns(db: Database, table: string): string[] {
+  const rows = db.query<{ name: string; pk: number }, []>(`PRAGMA table_info(${table})`).all();
+  return rows
+    .filter((r) => r.pk > 0)
+    .sort((a, b) => a.pk - b.pk)
+    .map((r) => r.name);
+}
+
+function sameColumns(actual: readonly string[], expected: readonly string[]): boolean {
+  return actual.length === expected.length && expected.every((name, i) => actual[i] === name);
+}
+
+const HEARTBEATS_KEY = ['instance_id', 'product', 'day'] as const;
+const INSTANCES_KEY = ['instance_id', 'product'] as const;
 
 /** A meta marker as an integer; 0 when absent or unreadable. */
 function readMetaInt(db: Database, key: string): number {
@@ -210,8 +226,16 @@ export function migrate(db: Database): MigrationReport {
     // Detection happens INSIDE the transaction — see above.
     const hasHeartbeats = tableExists(db, 'heartbeats');
     const hasInstances = tableExists(db, 'instances');
-    const heartbeatsNeedsProduct = hasHeartbeats && !columnNames(db, 'heartbeats').includes('product');
-    const instancesNeedsProduct = hasInstances && !columnNames(db, 'instances').includes('product');
+    // Detection is on the PRIMARY KEY, not merely on the column's presence.
+    // `ALTER TABLE ... ADD COLUMN product` is the obvious hand-upgrade, and it
+    // leaves the legacy key in place — a database that looks converted but
+    // whose `ON CONFLICT (instance_id, product, day)` matches no constraint,
+    // so the service cannot even prepare its statements. Keying off the
+    // constraint that actually has to exist catches that.
+    const heartbeatsNeedsProduct =
+      hasHeartbeats && !sameColumns(primaryKeyColumns(db, 'heartbeats'), HEARTBEATS_KEY);
+    const instancesNeedsProduct =
+      hasInstances && !sameColumns(primaryKeyColumns(db, 'instances'), INSTANCES_KEY);
 
     if (!hasHeartbeats && !hasInstances) report.createdFresh = true;
 
@@ -312,14 +336,20 @@ function rebuildHeartbeats(db: Database): number {
     );
   `);
   const before = db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM heartbeats').get()?.n ?? 0;
+  // A half-upgraded table may already carry product VALUES under the legacy
+  // key. Those are real data — keep them, and backfill only what is missing.
+  const productExpr = columnNames(db, 'heartbeats').includes('product')
+    ? "COALESCE(NULLIF(product, ''), ?1)"
+    : '?1';
   db.query(
     `INSERT INTO heartbeats_migration_tmp (instance_id, product, day, schema_version, payload, received_day)
-     SELECT instance_id, ?1, day, schema_version, payload, received_day FROM heartbeats`,
+     SELECT instance_id, ${productExpr}, day, schema_version, payload, received_day FROM heartbeats`,
   ).run(LEGACY_PRODUCT);
   const after = db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM heartbeats_migration_tmp').get()?.n ?? 0;
   if (after !== before) {
-    // Impossible given the uniqueness argument above; if it ever happens the
-    // transaction must abort rather than silently lose rows.
+    // `(instance_id, day)` was already unique, so adding a third key component
+    // cannot collide. A shortfall means the source table's constraints were
+    // not what they appeared to be — abort rather than silently lose rows.
     throw new Error(`migration would lose heartbeat rows: ${before} before, ${after} after`);
   }
   db.exec('DROP TABLE heartbeats');
@@ -341,9 +371,12 @@ function rebuildInstances(db: Database): number {
     );
   `);
   const before = db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM instances').get()?.n ?? 0;
+  const existing = columnNames(db, 'instances');
+  const productExpr = existing.includes('product') ? "COALESCE(NULLIF(product, ''), ?1)" : '?1';
+  const firstReportExpr = existing.includes('first_report_day') ? 'first_report_day' : 'NULL';
   db.query(
-    `INSERT INTO instances_migration_tmp (instance_id, product, first_seen_day, last_seen_day)
-     SELECT instance_id, ?1, first_seen_day, last_seen_day FROM instances`,
+    `INSERT INTO instances_migration_tmp (instance_id, product, first_seen_day, last_seen_day, first_report_day)
+     SELECT instance_id, ${productExpr}, first_seen_day, last_seen_day, ${firstReportExpr} FROM instances`,
   ).run(LEGACY_PRODUCT);
   const after = db.query<{ n: number }, []>('SELECT COUNT(*) AS n FROM instances_migration_tmp').get()?.n ?? 0;
   if (after !== before) {

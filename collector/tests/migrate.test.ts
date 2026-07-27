@@ -325,6 +325,68 @@ describe('migration against a REAL old-schema database', () => {
     }
   });
 
+  test('a naive ADD COLUMN upgrade is detected and completed, not mistaken for done', () => {
+    // The obvious hand-upgrade is `ALTER TABLE ... ADD COLUMN product`, which
+    // leaves the LEGACY primary key in place. Detecting on the column alone
+    // would call that database current — and the service could not even
+    // prepare its upsert, whose ON CONFLICT then matches no constraint.
+    const path = tempDbPath();
+    seedOldDatabase(path, [
+      { instanceId: INSTANCE_A, day: '2026-07-07', payload: JSON.stringify(makeV1(INSTANCE_A, '2026-07-07')) },
+      { instanceId: INSTANCE_B, day: '2026-07-08', payload: JSON.stringify(makeV1(INSTANCE_B, '2026-07-08')) },
+    ]);
+    const raw = new Database(path);
+    raw.exec("ALTER TABLE heartbeats ADD COLUMN product TEXT NOT NULL DEFAULT 'brokkr'");
+    raw.exec("ALTER TABLE instances ADD COLUMN product TEXT NOT NULL DEFAULT 'brokkr'");
+    // ...and mark it done, the way a hand-written script would.
+    raw.exec(`PRAGMA user_version = ${SCHEMA_USER_VERSION}`);
+    raw.close();
+
+    const db = new TelemetryDb({ path });
+    try {
+      expect(db.migration.rebuiltHeartbeats).toBe(true);
+      expect(db.migration.rebuiltInstances).toBe(true);
+      expect(db.migration.heartbeatRowsCarried).toBe(2);
+      expect(db.countHeartbeats(INSTANCE_A, LEGACY_PRODUCT)).toBe(1);
+      // The upsert works, which is the whole point.
+      expect(db.recordHeartbeat(INSTANCE_A, 'saga', '2026-07-09', 2, '{}', '2026-07-09').ok).toBe(true);
+      expect(db.countHeartbeats(INSTANCE_A, 'saga')).toBe(1);
+    } finally {
+      db.close();
+    }
+
+    const hb = columns(path, 'heartbeats');
+    expect(hb.filter((c) => c.pk > 0).sort((a, b) => a.pk - b.pk).map((c) => c.name)).toEqual([
+      'instance_id', 'product', 'day',
+    ]);
+  });
+
+  test('product values already present in a half-upgraded table are KEPT, not overwritten', () => {
+    const path = tempDbPath();
+    seedOldDatabase(path, [
+      { instanceId: INSTANCE_A, day: '2026-07-07', payload: JSON.stringify(makeV1(INSTANCE_A, '2026-07-07')) },
+      { instanceId: INSTANCE_B, day: '2026-07-08', payload: JSON.stringify(makeV1(INSTANCE_B, '2026-07-08')) },
+    ]);
+    const raw = new Database(path);
+    raw.exec('ALTER TABLE heartbeats ADD COLUMN product TEXT');
+    raw.exec('ALTER TABLE instances ADD COLUMN product TEXT');
+    // One row was already classified; the other was left blank.
+    raw.query('UPDATE heartbeats SET product = ?1 WHERE instance_id = ?2').run('saga', INSTANCE_B);
+    raw.query('UPDATE instances SET product = ?1 WHERE instance_id = ?2').run('saga', INSTANCE_B);
+    raw.close();
+
+    const db = new TelemetryDb({ path });
+    try {
+      expect(db.countHeartbeats(INSTANCE_B, 'saga')).toBe(1);
+      expect(db.countHeartbeats(INSTANCE_B, LEGACY_PRODUCT)).toBe(0);
+      expect(db.getInstance(INSTANCE_B, 'saga')).not.toBeNull();
+      // ...while the unclassified row still backfills to the legacy product.
+      expect(db.countHeartbeats(INSTANCE_A, LEGACY_PRODUCT)).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+
   test('an unparseable stored payload is carried over verbatim and counted, never dropped', () => {
     const path = tempDbPath();
     seedOldDatabase(path, [
