@@ -512,6 +512,42 @@ describe('migration against a REAL old-schema database', () => {
     }
   });
 
+  test('a LEGACY table declared with different casing is still found and rebuilt', () => {
+    // SQLite treats `Heartbeats` and `heartbeats` as one table. A
+    // case-sensitive existence check reports the legacy table as absent, skips
+    // its rebuild entirely, and leaves the service querying a `product` column
+    // that does not exist.
+    const path = tempDbPath();
+    const raw = new Database(path, { create: true });
+    raw.exec(`
+      CREATE TABLE Heartbeats (
+        Instance_ID TEXT NOT NULL, Day TEXT NOT NULL, Schema_Version INTEGER NOT NULL,
+        Payload TEXT NOT NULL, Received_Day TEXT NOT NULL,
+        PRIMARY KEY (Instance_ID, Day)
+      );
+      CREATE TABLE Instances (
+        Instance_ID TEXT PRIMARY KEY, First_Seen_Day TEXT NOT NULL, Last_Seen_Day TEXT NOT NULL
+      );
+    `);
+    raw.query('INSERT INTO Instances VALUES (?1, ?2, ?2)').run(INSTANCE_A, '2026-07-07');
+    raw
+      .query('INSERT INTO Heartbeats VALUES (?1, ?2, ?3, ?4, ?2)')
+      .run(INSTANCE_A, '2026-07-07', 1, JSON.stringify(makeV1(INSTANCE_A, '2026-07-07')));
+    raw.close();
+
+    const db = new TelemetryDb({ path });
+    try {
+      expect(db.migration.rebuiltHeartbeats).toBe(true);
+      expect(db.migration.rebuiltInstances).toBe(true);
+      expect(db.migration.heartbeatRowsCarried).toBe(1);
+      expect(db.countHeartbeats(INSTANCE_A, LEGACY_PRODUCT)).toBe(1);
+      expect(JSON.parse(db.getHeartbeats(INSTANCE_A, LEGACY_PRODUCT)[0]!.payload).metrics.sessions.count).toBe(12);
+      expect(db.recordHeartbeat(INSTANCE_A, 'saga', '2026-07-09', 2, '{}', '2026-07-09').ok).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
   test('a WITHOUT ROWID heartbeats table does not break the payload pass', () => {
     // It passes every shape check and so is not rebuilt — a pass that paged on
     // `rowid` would then fail, roll the migration back, and leave the service

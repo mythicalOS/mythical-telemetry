@@ -151,9 +151,21 @@ const INDEX_DDL = `
   CREATE INDEX IF NOT EXISTS idx_instances_first_seen ON instances (first_seen_day);
 `;
 
+/**
+ * Does this table exist, under any casing?
+ *
+ * `COLLATE NOCASE` for the same reason the column lookup folds case: SQLite
+ * treats `Heartbeats` and `heartbeats` as one table, so a case-sensitive
+ * comparison here would report a legacy table as absent, skip its rebuild
+ * entirely, and leave the service querying a `product` column that does not
+ * exist. Every statement elsewhere names tables in fixed lowercase, which
+ * SQLite resolves to whatever casing was declared.
+ */
 function tableExists(db: Database, name: string): boolean {
   const row = db
-    .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = ?1")
+    .query<{ n: number }, [string]>(
+      "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = ?1 COLLATE NOCASE",
+    )
     .get(name);
   return (row?.n ?? 0) > 0;
 }
