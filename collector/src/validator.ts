@@ -67,6 +67,18 @@ export interface HeartbeatValidator {
  * rejection. A throw from anywhere in here is the same class of failure as a
  * throw from `validate` itself, so it collapses to the same `validator_`-
  * prefixed reason and the server counts it as a validator error.
+ *
+ * WHERE THE GUARANTEE ENDS, stated rather than implied. What comes back is the
+ * validator's own `value` object, not a copy, so this function can only promise
+ * that the reads IT performs are safe. A pathological implementation could hand
+ * back an object that passes the checks here and then throws when the route
+ * re-reads it, or that makes `JSON.stringify` throw at the store (a cycle, a
+ * BigInt, a hostile `toJSON`); that would land in the route's catch-all as a
+ * 500. The line is drawn deliberately: NO NETWORK INPUT CAN REACH IT, because
+ * the canonical validator's `value` derives from `JSON.parse`, which yields
+ * plain data with no accessors, no cycles and no functions — and anyone able to
+ * inject a different validator is already executing code in this process, which
+ * is not a boundary a deep copy on every ingest would buy anything against.
  */
 export function safeValidate(validator: HeartbeatValidator, raw: unknown): ValidationResult {
   try {

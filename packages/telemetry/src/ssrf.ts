@@ -148,25 +148,61 @@ function blockedIPv6(b: number[]): string | undefined {
   if (allZero) return "unspecified (::)";
   if (b.slice(0, 15).every((x) => x === 0) && b[15] === 1) return "loopback (::1)";
 
-  // IPv4-mapped ::ffff:a.b.c.d and the deprecated IPv4-compatible ::a.b.c.d — both carry an
-  // embedded IPv4 address that must be judged by the IPv4 rules, or ::ffff:127.0.0.1 walks in.
-  const first10Zero = b.slice(0, 10).every((x) => x === 0);
+  // ── forms that carry an IPv4 destination INSIDE an IPv6 address ─────────────────────────
+  //
+  // Each of these is a different SPELLING of "deliver this to that IPv4 address". They have to
+  // be judged by the IPv4 rules or ::ffff:127.0.0.1 and its siblings walk straight in. The set
+  // is enumerated rather than guessed, and where a prefix exists ONLY to carry IPv4 traffic the
+  // whole prefix is refused instead of just the recognised embedding — see the NAT64 note.
+  const first8Zero = b.slice(0, 8).every((x) => x === 0);
+  const first10Zero = first8Zero && b[8] === 0 && b[9] === 0;
+
+  // IPv4-mapped ::ffff:a.b.c.d (::ffff:0:0/96).
   if (first10Zero && b[10] === 0xff && b[11] === 0xff) {
     const reason = blockedIPv4(b.slice(12));
     return reason === undefined ? undefined : `IPv4-mapped ${reason}`;
   }
+  // Deprecated IPv4-compatible ::a.b.c.d.
   if (first10Zero && b[10] === 0 && b[11] === 0) {
     return "IPv4-compatible IPv6 (deprecated, ::a.b.c.d)";
   }
-  // NAT64 well-known prefix 64:ff9b::/96 — another embedded-IPv4 path to an internal address.
-  if (b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b && b.slice(4, 12).every((x) => x === 0)) {
+  // IPv4-TRANSLATED ::ffff:0:a.b.c.d (::ffff:0:0:0/96, RFC 2765) — the mapped form's sibling,
+  // one group over. It was NOT caught by the mapped branch above: that branch needs bytes 0..9
+  // to be zero, and here the ffff sits in bytes 8..9, so `::ffff:0:169.254.169.254` classified
+  // as an ordinary public address and the cloud-metadata endpoint was reachable through it.
+  // The prefix is deprecated and holds no legitimate destination, so all of it is refused; the
+  // embedded reason is still reported when there is one, because that is what tells an operator
+  // what they actually pointed at.
+  if (first8Zero && b[8] === 0xff && b[9] === 0xff && b[10] === 0 && b[11] === 0) {
     const reason = blockedIPv4(b.slice(12));
-    return reason === undefined ? undefined : `NAT64-embedded ${reason}`;
+    const suffix = reason === undefined ? "" : ` — ${reason}`;
+    return `IPv4-translated (::ffff:0:a.b.c.d, deprecated)${suffix}`;
+  }
+  // IPv4/IPv6 TRANSLATION space 64:ff9b::/32 — the whole IANA allocation, not merely the
+  // well-known 64:ff9b::/96. RFC 8215 defines a local-use 64:ff9b:1::/48 inside it, and RFC 6052
+  // lets the embedded IPv4 address sit at six different offsets depending on the prefix length,
+  // so for an arbitrary operator prefix there is no single place to read it from — a check that
+  // decodes only the /96 embedding leaves `64:ff9b:1::7f00:1` looking public. Nothing legitimate
+  // is addressable inside a translation prefix, so the /32 is refused wholesale: simpler than
+  // guessing an embedding, and it cannot be outflanked by choosing another one.
+  if (b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b) {
+    if (b.slice(4, 12).every((x) => x === 0)) {
+      const reason = blockedIPv4(b.slice(12));
+      return reason === undefined ? "IPv4/IPv6 translation prefix (64:ff9b::/96)" : `NAT64-embedded ${reason}`;
+    }
+    return "IPv4/IPv6 translation prefix (64:ff9b::/32, incl. RFC 8215 local-use 64:ff9b:1::/48)";
   }
   // 6to4 2002::/16 embeds an IPv4 address in bytes 2..5.
   if (b[0] === 0x20 && b[1] === 0x02) {
     const reason = blockedIPv4(b.slice(2, 6));
     return reason === undefined ? undefined : `6to4-embedded ${reason}`;
+  }
+  // Teredo 2001::/32 — the third transition mechanism in this family, tunnelling IPv6 over UDP
+  // to an IPv4 endpoint with the client's IPv4 address obfuscated in the low 32 bits. Blocking
+  // 6to4 and NAT64 while leaving Teredo open would just name the remaining way through. The /32
+  // is IANA-reserved for the mechanism, so refusing it costs no reachable destination.
+  if (b[0] === 0x20 && b[1] === 0x01 && b[2] === 0x00 && b[3] === 0x00) {
+    return "Teredo tunneling (2001::/32)";
   }
 
   if ((b[0]! & 0xfe) === 0xfc) return "unique local address (fc00::/7)";
