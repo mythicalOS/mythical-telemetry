@@ -91,6 +91,10 @@ Only a global opt-out fences both.
 Partial state is exposed, not hidden — "central delivered, copy unresolved" is a real state and
 `SendReport.partial` reports it.
 
+**A copy endpoint that is configured but unusable does not suppress central.** The two destinations
+are validated and fenced independently: a typo in the operator URL retires the copy and is
+reported on the emit result, while central's unresolved deliveries are untouched.
+
 ## Operator-endpoint isolation
 
 The copy destination is attacker-controlled input, fetched from inside the deployment. `src/ssrf.ts`
@@ -99,6 +103,16 @@ resolve-and-block of loopback / link-local / RFC1918 / CGNAT / ULA / IPv4-mapped
 multicast / reserved space with **every** resolved address required to pass, a hard per-attempt
 deadline plus an overall fan-out budget, a bounded response read, bounded concurrency, and a
 circuit breaker.
+
+**Nothing the endpoint sends back is retained.** The response body is drained under a bound and
+discarded; what is kept is the HTTP status and, for a transport-level refusal, a reason from a
+closed set this package defines. Earlier revisions kept a scrubbed excerpt as an "actionable error"
+and tried to filter key material out of it — but the endpoint already holds the write key, so it
+chooses the spelling, and three successive filters were each defeated by the next encoding
+(punctuation-separated, then alphanumeric-interleaved, then \uXXXX escapes). Any content filter
+that passes prose will pass some encoding of a secret, so the class was removed rather than
+filtered. A status code is still specific and still actionable, and it carries no attacker-chosen
+bytes into local state, a log, or a support screenshot.
 
 **The connection is pinned to the validated address.** Validate-then-fetch leaves a DNS-rebinding
 window in which validation sees a public address and the connection resolves to `127.0.0.1`; the

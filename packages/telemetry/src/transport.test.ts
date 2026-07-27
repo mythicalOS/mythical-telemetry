@@ -66,8 +66,8 @@ function harness(
   return { transport, attempts, root, now };
 }
 
-const OK: PostResult = { status: 202, ok: true, detail: undefined };
-const FAIL: PostResult = { status: 503, ok: false, detail: "upstream down" };
+const OK: PostResult = { status: 202, ok: true };
+const FAIL: PostResult = { status: 503, ok: false };
 
 function sendInput(consent: ConsentState = userConsent(true, Date.parse("2026-01-01T00:00:00.000Z")), withCopy = true) {
   return {

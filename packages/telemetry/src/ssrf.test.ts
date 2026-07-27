@@ -253,28 +253,36 @@ describe("postPinned", () => {
     expect(seenKey).toBe("s3cr3t");
   });
 
-  test("a non-2xx surfaces the status and a bounded, sanitised detail", async () => {
+  test("a non-2xx surfaces the STATUS and nothing else", async () => {
     const { port } = await serve((_req, res) => {
       res.writeHead(400, { "content-type": "text/plain" });
-      res.end(`schema_version 2 not supported ${"x".repeat(5000)}`);
+      res.end("schema_version 2 not supported");
     });
     const result = await postPinned({ endpoint: await pinnedTo(port), body: "{}", headers: {}, timeoutMs: 2000 });
     expect(result.ok).toBe(false);
     expect(result.status).toBe(400);
-    expect(result.detail).toContain("schema_version 2 not supported");
-    expect(result.detail!.length).toBeLessThanOrEqual(200);
-    expect(result.detail!).toMatch(/^[\x20-\x7e]*$/); // printable ASCII only — never raw bytes
+    // No field carries anything the endpoint chose. The status is the actionable signal, and it
+    // is a number, so there is no encoding a hostile endpoint can hide a secret in.
+    expect(Object.keys(result).sort()).toEqual(["ok", "status"]);
   });
 
-  test("control characters and non-ASCII in an error body are scrubbed out of the detail", async () => {
+  test("NOTHING the endpoint says is returned, whatever it says", async () => {
+    const secret = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+    // Every spelling that defeated a previous generation of content filtering, at once.
+    const spellings = [secret, secret.match(/.{1,8}/g)!.join("-"), secret.split("").join("Z"), secret.split("").map((c) => `\\u00${c.charCodeAt(0).toString(16)}`).join("")];
     const { port } = await serve((_req, res) => {
-      res.writeHead(422, { "content-type": "text/plain" });
-      res.end("bad payload \u{1F600}");
+      res.writeHead(401, { "content-type": "text/plain" });
+      res.end(spellings.join(" "));
     });
-    const result = await postPinned({ endpoint: await pinnedTo(port), body: "{}", headers: {}, timeoutMs: 2000 });
-    expect(result.status).toBe(422);
-    expect(result.detail!).toMatch(/^[\x20-\x7e]*$/);
-    expect(result.detail!).toContain("bad payload");
+    const result = await postPinned({
+      endpoint: await pinnedTo(port),
+      body: "{}",
+      headers: { "X-Mythical-Write-Key": secret },
+      timeoutMs: 2000,
+    });
+    // The class is removed, not filtered: there is no string field for any spelling to land in.
+    expect(JSON.stringify(result)).not.toContain("a1b2");
+    expect(JSON.stringify(result)).toBe(JSON.stringify({ status: 401, ok: false }));
   });
 
   test("a REDIRECT is not followed — it is surfaced as a rejection", async () => {
@@ -311,11 +319,12 @@ describe("postPinned", () => {
     for (const res of held) res.end();
   });
 
-  test("a body larger than the cap is truncated rather than buffered without bound", async () => {
+  test("a huge body is drained under a bound and discarded, not buffered", async () => {
     const { port } = await serve((_req, res) => {
       res.writeHead(500, { "content-type": "text/plain" });
       res.end("y".repeat(2_000_000));
     });
+    const started = Date.now();
     const result = await postPinned({
       endpoint: await pinnedTo(port),
       body: "{}",
@@ -324,7 +333,7 @@ describe("postPinned", () => {
       maxResponseBytes: 1024,
     });
     expect(result.status).toBe(500);
-    expect(result.detail!.length).toBeLessThanOrEqual(200);
+    expect(Date.now() - started).toBeLessThan(3000);
   });
 
   test("an external abort ends the attempt promptly", async () => {
@@ -434,131 +443,3 @@ describe("resolution has its own deadline and its own abort hook", () => {
   });
 });
 
-describe("the surfaced detail never carries key material", () => {
-  const SECRET = "a".repeat(64);
-
-  test("an endpoint that ECHOES the write key back gets it redacted", async () => {
-    const { port } = await serve((req, res) => {
-      res.writeHead(401, { "content-type": "text/plain" });
-      res.end(`rejected key ${String(req.headers["x-mythical-write-key"] ?? "")} is unknown`);
-    });
-    const result = await postPinned({
-      endpoint: await pinnedTo(port),
-      body: "{}",
-      headers: { "X-Mythical-Write-Key": SECRET },
-      timeoutMs: 2000,
-      redactFromDetail: [SECRET],
-    });
-    expect(result.status).toBe(401);
-    expect(result.detail).not.toContain(SECRET);
-    // The whole excerpt is dropped rather than patched: once a body is known to carry key
-    // material, the safe move is to keep none of it.
-    expect(result.detail).toContain("[redacted");
-  });
-
-  test("a long hex run is redacted even when the caller did not name it", async () => {
-    const other = "b".repeat(48);
-    const { port } = await serve((_req, res) => {
-      res.writeHead(400, { "content-type": "text/plain" });
-      res.end(`token ${other} rejected`);
-    });
-    const result = await postPinned({ endpoint: await pinnedTo(port), body: "{}", headers: {}, timeoutMs: 2000 });
-    expect(result.detail).not.toContain(other);
-    expect(result.detail).toContain("[redacted");
-  });
-});
-
-describe("redaction survives a hostile endpoint choosing how to spell the key back", () => {
-  const SECRET = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
-
-  test("the key echoed in separated chunks is still redacted", async () => {
-    const chunked = SECRET.match(/.{1,8}/g)!.join("-");
-    const { port } = await serve((_req, res) => {
-      res.writeHead(401, { "content-type": "text/plain" });
-      res.end(`rejected: ${chunked}`);
-    });
-    const result = await postPinned({
-      endpoint: await pinnedTo(port),
-      body: "{}",
-      headers: { "X-Mythical-Write-Key": SECRET },
-      timeoutMs: 2000,
-      redactFromDetail: [SECRET],
-    });
-    expect(result.detail ?? "").not.toContain(chunked);
-    expect((result.detail ?? "").replace(/[^0-9A-Za-z]/g, "")).not.toContain(SECRET);
-  });
-
-  test("and when spelled with spaces, in a form nobody named", async () => {
-    const spaced = SECRET.match(/.{1,4}/g)!.join(" ");
-    const { port } = await serve((_req, res) => {
-      res.writeHead(400, { "content-type": "text/plain" });
-      res.end(`bad key ${spaced} sorry`);
-    });
-    // Not passed as a known secret: the last-resort collapsed-hex guard has to catch it.
-    const result = await postPinned({ endpoint: await pinnedTo(port), body: "{}", headers: {}, timeoutMs: 2000 });
-    expect((result.detail ?? "").replace(/[^0-9A-Za-z]/g, "")).not.toContain(SECRET);
-    expect(result.detail).toContain("[redacted");
-  });
-
-  test("a legitimate error that merely quotes an instance id keeps its actionable message", async () => {
-    const { port } = await serve((_req, res) => {
-      res.writeHead(409, { "content-type": "text/plain" });
-      res.end("instance 60e05bd1-b195-4f2f-9411-2fa7197a5c88 already has a row for that day");
-    });
-    const result = await postPinned({ endpoint: await pinnedTo(port), body: "{}", headers: {}, timeoutMs: 2000 });
-    expect(result.detail).toContain("already has a row for that day");
-  });
-});
-
-describe("redaction closes the interleaving bypass", () => {
-  const SECRET = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
-
-  test("the key interleaved with non-hex letters is caught by the subsequence test", async () => {
-    // Neither an exact substring, nor punctuation-separated, nor a hex run once separators are
-    // stripped — the letters ARE alphanumeric. Only a subsequence test sees it.
-    const interleaved = SECRET.split("").join("Z");
-    const { port } = await serve((_req, res) => {
-      res.writeHead(401, { "content-type": "text/plain" });
-      res.end(`nope ${interleaved}`);
-    });
-    const result = await postPinned({
-      endpoint: await pinnedTo(port),
-      body: "{}",
-      headers: {},
-      timeoutMs: 2000,
-      redactFromDetail: [SECRET],
-    });
-    expect(result.detail).toBe("[redacted — the response body contained key-like material]");
-  });
-
-  test("interleaved with mixed junk, and with the case flipped", async () => {
-    const interleaved = SECRET.toUpperCase().split("").join(" x-");
-    const { port } = await serve((_req, res) => {
-      res.writeHead(401, { "content-type": "text/plain" });
-      res.end(interleaved);
-    });
-    const result = await postPinned({
-      endpoint: await pinnedTo(port),
-      body: "{}",
-      headers: {},
-      timeoutMs: 2000,
-      redactFromDetail: [SECRET],
-    });
-    expect(result.detail).toBe("[redacted — the response body contained key-like material]");
-  });
-
-  test("an ordinary error message that happens to share letters is NOT redacted", async () => {
-    const { port } = await serve((_req, res) => {
-      res.writeHead(400, { "content-type": "text/plain" });
-      res.end("schema_version 2 is not supported by this collector; upgrade to >= 1.4.0");
-    });
-    const result = await postPinned({
-      endpoint: await pinnedTo(port),
-      body: "{}",
-      headers: {},
-      timeoutMs: 2000,
-      redactFromDetail: [SECRET],
-    });
-    expect(result.detail).toContain("schema_version 2 is not supported");
-  });
-});

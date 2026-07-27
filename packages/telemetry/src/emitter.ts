@@ -84,6 +84,12 @@ export type EmitResult =
        * retry window crossed it would never be revisited and would age out of retention unsent.
        */
       drained: SendReport[];
+      /**
+       * The copy destination was configured but unusable, so this send went to central only.
+       * Surfaced rather than swallowed — an operator's typo must be visible — and it does NOT
+       * suppress central, which is the whole point of decoupling the two destinations.
+       */
+      copy_error?: string;
     }
   | { sent: false; reason: "opted_out" | "invalid_payload" | "misconfigured"; detail: string };
 
@@ -167,40 +173,44 @@ export class HeartbeatEmitter<P extends ProductName> {
       return { sent: false, reason: "opted_out", detail: `consent source=${consent.source} enabled=${consent.enabled}` };
     }
 
+    // EACH DESTINATION IS JUDGED ON ITS OWN. Treating any configuration failure as a whole-config
+    // failure meant a typo in the OPERATOR's URL deleted central's unresolved payloads — a
+    // cross-destination purge, which is exactly what the per-destination fence exists to prevent.
+    const copyCheck = this.checkCopyEndpoint(endpoints.copyUrl);
+    if (copyCheck.error !== undefined) {
+      // The copy is retired: its scoped secret is destroyed and its queued deliveries purged.
+      // CENTRAL IS UNTOUCHED — a broken operator endpoint never suppresses central.
+      if (this.deps.identity.currentCopyDestination() !== undefined) this.deps.identity.clearCopyIdentity();
+      this.deps.transport.fenceDestination("copy", undefined, undefined);
+      this.log(`telemetry copy destination unusable, sending to central only — ${copyCheck.error}`);
+    }
+
     try {
-      assertDestinations({
-        central: endpoints.centralUrl === "" ? undefined : endpoints.centralUrl,
-        copy: endpoints.copyUrl === "" ? undefined : endpoints.copyUrl,
-      });
+      // The copy is passed too when it is USABLE, so "a copy configured without a central" keeps
+      // its own specific error rather than collapsing into a generic "central required".
+      assertDestinations({ central: endpoints.centralUrl === "" ? undefined : endpoints.centralUrl, copy: copyCheck.url });
       // Presence is not validity. `ftp://…`, a malformed URL, or one carrying credentials all pass
       // an is-it-configured check and then throw deep inside the transport — past the fence, with
-      // the previous endpoint's pending payload still retained. Normalising here turns every one
-      // of those into the same misconfiguration path, which fences.
+      // the previous endpoint's pending payload still retained.
       normalizeDestinationUrl(endpoints.centralUrl);
-      if (endpoints.copyUrl !== undefined && endpoints.copyUrl !== "") normalizeDestinationUrl(endpoints.copyUrl);
     } catch (err) {
-      // A destination that is no longer configured is a RETIRED destination: purge its queued
-      // deliveries and its retained payloads rather than leaving them for a URL that may never
-      // come back.
+      // Central is unusable, so it is retired — but only central.
       this.deps.transport.fenceDestination("central", undefined, undefined);
-      this.deps.transport.fenceDestination("copy", undefined, undefined);
-      if (this.deps.identity.currentCopyDestination() !== undefined) this.deps.identity.clearCopyIdentity();
       const detail = err instanceof TransportConfigError ? `${err.reason}: ${err.message}` : String(err);
       this.log(`heartbeat not sent — ${detail}`);
       return { sent: false, reason: "misconfigured", detail };
     }
 
     const central = this.deps.identity.centralIdentity();
-    const hasCopy = endpoints.copyUrl !== undefined && endpoints.copyUrl !== "";
+    const usableCopyUrl = copyCheck.url;
 
-    // A copy that has been REMOVED retires with its destination: the destination-scoped secret is
-    // destroyed and its queued deliveries are purged. Central is untouched.
-    if (!hasCopy) {
+    // A copy that has been REMOVED retires with its destination too.
+    if (usableCopyUrl === undefined && copyCheck.error === undefined) {
       if (this.deps.identity.currentCopyDestination() !== undefined) this.deps.identity.clearCopyIdentity();
       this.deps.transport.fenceDestination("copy", undefined, undefined);
     }
 
-    const copyIdentity = hasCopy ? this.deps.identity.copyIdentityFor(endpoints.copyUrl!) : undefined;
+    const copyIdentity = usableCopyUrl === undefined ? undefined : this.deps.identity.copyIdentityFor(usableCopyUrl);
     if (copyIdentity !== undefined && copyIdentity.instance_secret === central.instance_secret) {
       // Defensive: the central secret must never be presented to an operator endpoint. Holding it
       // would let that operator authenticate as this install at central and delete its data.
@@ -226,7 +236,9 @@ export class HeartbeatEmitter<P extends ProductName> {
     }
 
     const copyDestination =
-      copyIdentity === undefined || copyBody === undefined ? undefined : { url: endpoints.copyUrl!, identity: copyIdentity, body: copyBody };
+      copyIdentity === undefined || copyBody === undefined || usableCopyUrl === undefined
+        ? undefined
+        : { url: usableCopyUrl, identity: copyIdentity, body: copyBody };
 
     const report = await this.deps.transport.send({
       day,
@@ -247,7 +259,21 @@ export class HeartbeatEmitter<P extends ProductName> {
       exceptDay: day,
     });
 
-    return { sent: true, report, drained };
+    return copyCheck.error === undefined ? { sent: true, report, drained } : { sent: true, report, drained, copy_error: copyCheck.error };
+  }
+
+  /**
+   * Is the copy endpoint absent, usable, or configured-but-broken? Its verdict never touches
+   * central: they are independent destinations and a fault in one must not fence the other.
+   */
+  private checkCopyEndpoint(copyUrl: string | undefined): { url?: string; error?: string } {
+    if (copyUrl === undefined || copyUrl === "") return {};
+    try {
+      normalizeDestinationUrl(copyUrl);
+      return { url: copyUrl };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   /** Per-destination delivery state for a day, without sending. */
@@ -269,46 +295,36 @@ export class HeartbeatEmitter<P extends ProductName> {
    * consent and configuration are unchanged.
    */
   applyConfigChange(): void {
-    try {
-      this.applyConfigChangeInner();
-    } catch (err) {
-      // This is called from a settings-save path; it must never throw at the caller. A URL that
-      // cannot even be parsed is a retired destination — fence both rather than leave a pending
-      // payload addressed to something unusable.
-      this.log(`telemetry config change rejected: ${err instanceof Error ? err.message : String(err)}`);
-      this.deps.transport.fenceDestination("central", undefined, undefined);
-      this.deps.transport.fenceDestination("copy", undefined, undefined);
-      if (this.deps.identity.currentCopyDestination() !== undefined) this.deps.identity.clearCopyIdentity();
-    }
-  }
-
-  private applyConfigChangeInner(): void {
     const consent = this.deps.getConsent();
     if (!isSendPermitted(consent)) {
       this.deps.transport.fenceAll("telemetry disabled");
       return;
     }
     const endpoints = this.deps.getEndpoints();
-    if (endpoints.centralUrl === "") {
-      // Central was REMOVED. Same rule as the copy: retire the destination and purge what was
-      // queued for it. Skipping the fence here left pending payloads on disk indefinitely.
-      this.deps.transport.fenceDestination("central", undefined, undefined);
-    } else {
-      const central = this.deps.identity.centralIdentity();
-      const destination = normalizeDestinationUrl(endpoints.centralUrl);
-      this.deps.transport.fenceDestination(
-        "central",
-        destination,
-        destinationGeneration(consent, "central", destination, central.instance_secret),
-      );
-    }
-    if (endpoints.copyUrl === undefined || endpoints.copyUrl === "") {
-      if (this.deps.identity.currentCopyDestination() !== undefined) this.deps.identity.clearCopyIdentity();
-      this.deps.transport.fenceDestination("copy", undefined, undefined);
+    // Each destination is fenced on ITS OWN validity, in its own try. A malformed copy URL must
+    // not reach across and purge central's unresolved deliveries, and neither may throw at the
+    // caller — this runs on a settings-save path.
+    this.fenceOne("central", endpoints.centralUrl, consent);
+    this.fenceOne("copy", endpoints.copyUrl, consent);
+  }
+
+  private fenceOne(kind: DestinationKind, url: string | undefined, consent: ConsentState): void {
+    if (url === undefined || url === "") {
+      // Removed ⇒ retired: purge what was queued for it rather than leaving it addressed to
+      // something that may never come back.
+      if (kind === "copy" && this.deps.identity.currentCopyDestination() !== undefined) this.deps.identity.clearCopyIdentity();
+      this.deps.transport.fenceDestination(kind, undefined, undefined);
       return;
     }
-    const copy = this.deps.identity.copyIdentityFor(endpoints.copyUrl);
-    const destination = normalizeDestinationUrl(endpoints.copyUrl);
-    this.deps.transport.fenceDestination("copy", destination, destinationGeneration(consent, "copy", destination, copy.instance_secret));
+    try {
+      const destination = normalizeDestinationUrl(url);
+      const identity = kind === "central" ? this.deps.identity.centralIdentity() : this.deps.identity.copyIdentityFor(url);
+      this.deps.transport.fenceDestination(kind, destination, destinationGeneration(consent, kind, destination, identity.instance_secret));
+    } catch (err) {
+      // Unusable ⇒ retired, but only this destination.
+      this.log(`telemetry ${kind} destination unusable: ${err instanceof Error ? err.message : String(err)}`);
+      if (kind === "copy" && this.deps.identity.currentCopyDestination() !== undefined) this.deps.identity.clearCopyIdentity();
+      this.deps.transport.fenceDestination(kind, undefined, undefined);
+    }
   }
 }

@@ -325,8 +325,6 @@ async function resolveAll(host: string, policy: EndpointPolicy): Promise<Array<{
 export interface PostResult {
   status: number;
   ok: boolean;
-  /** A bounded, sanitised excerpt of a non-2xx body — the actionable half of a rejection. */
-  detail: string | undefined;
 }
 
 export interface PostOptions {
@@ -337,11 +335,6 @@ export interface PostOptions {
   timeoutMs: number;
   /** Cap on the response bytes read. Anything beyond is discarded and the socket destroyed. */
   maxResponseBytes?: number;
-  /**
-   * Values to redact from any surfaced response excerpt. Pass every secret the request carried —
-   * a hostile endpoint can echo the write key back in its error body, and the excerpt is persisted.
-   */
-  redactFromDetail?: readonly string[];
   /** Aborts the attempt from outside (opt-out fence, overall budget). */
   signal?: AbortSignal;
   /** TLS trust seam for tests; production uses the system trust store. */
@@ -350,57 +343,21 @@ export interface PostOptions {
 
 const DEFAULT_MAX_RESPONSE_BYTES = 4096;
 
-/**
- * Strip a response excerpt to a short printable-ASCII status detail — AND redact anything that
- * looks like key material.
- *
- * The endpoint is attacker-controlled, so it can echo the write key it just received back in an
- * error body. Without this, that key would be written into the durable delivery state and shown
- * on the status surface: a secret that was header-only on the wire would end up at rest on disk.
- * Any long hex run is redacted, so this holds even for a secret the caller did not name.
- */
-function sanitizeDetail(text: string, redact: readonly string[] = []): string | undefined {
-  let cleaned = text.replace(/[^\x20-\x7e]+/g, " ");
-
-  // DETECTION RUNS ON THE WHOLE CAPTURED BODY, then the survivor is truncated for display.
-  // Detecting on the truncated excerpt instead would hand the endpoint a trivial evasion: pad the
-  // key out past the display limit and the tail of it lands in the excerpt unexamined. The body is
-  // already bounded by `maxResponseBytes`, so this stays linear and cheap.
-  for (const secret of redact) {
-    if (secret.length < 8) continue;
-    // The endpoint ALREADY HOLDS the key, so it chooses how to spell it back. An exact substring
-    // and a punctuation-separated form are the easy cases; interleaving a letter between every
-    // character ("a1Zb2Zc3Z…") defeats both, and defeats a hex-run scan too, because the filler is
-    // alphanumeric. So the real test is a SUBSEQUENCE test: do the secret's characters appear in
-    // order anywhere in the body? Sixty-four specific characters, in order, do not occur in prose
-    // by accident.
-    if (containsSubsequence(cleaned, secret)) return REDACTED_DETAIL;
-  }
-
-  // Defence in depth for key-like material the caller did NOT name: a long hex run once every
-  // separator is removed. The threshold sits above a UUID's 32 hex digits so a collector echoing
-  // an instance id keeps its actionable message. Honest limit: this is a heuristic. Only the
-  // named-secret subsequence test above is a guarantee.
-  if (/[0-9a-fA-F]{40,}/.test(cleaned.replace(/[^0-9A-Za-z]/g, ""))) return REDACTED_DETAIL;
-
-  cleaned = cleaned.replace(/[0-9a-fA-F]{32,}/g, "[redacted]").trim().slice(0, MAX_DETAIL_CHARS);
-  return cleaned === "" ? undefined : cleaned;
-}
-
-const MAX_DETAIL_CHARS = 200;
-const REDACTED_DETAIL = "[redacted — the response body contained key-like material]";
-
-/** Case-insensitive: do `needle`'s characters appear in order within `haystack`? O(haystack). */
-function containsSubsequence(haystack: string, needle: string): boolean {
-  const h = haystack.toLowerCase();
-  const n = needle.toLowerCase();
-  let i = 0;
-  for (const ch of h) {
-    if (ch === n[i]) i += 1;
-    if (i === n.length) return true;
-  }
-  return false;
-}
+// THE RESPONSE BODY IS READ AND DISCARDED. NONE OF IT IS EVER SURFACED OR PERSISTED.
+//
+// Earlier revisions kept a short sanitised excerpt of a non-2xx body as an "actionable error", and
+// tried to scrub key material out of it. That is unwinnable. The endpoint ALREADY HOLDS the write
+// key, so it chooses the spelling: the literal string, then punctuation-separated chunks, then
+// alphanumeric interleaving, then \uXXXX escapes — three successive filters were each defeated by
+// the next encoding, and any content filter that passes prose will pass some encoding of a secret.
+//
+// So the class is removed rather than filtered: the body is drained (bounded) to close the socket
+// cleanly and then dropped on the floor. What is kept is the HTTP STATUS and, for a transport-level
+// refusal, a reason drawn from a closed set this package defines. That is still specific and still
+// actionable — "the collector answered 400" or "address_blocked" tells an operator what to do —
+// and it carries no attacker-chosen bytes into local state, a log, or a support screenshot.
+//
+// This is the same discipline the payload schema itself applies: closed values, never free text.
 
 /**
  * POST to a PINNED endpoint. One socket, no pooling, no redirects, hard deadline, bounded read.
@@ -494,28 +451,18 @@ export function postPinned(opts: PostOptions): Promise<PostResult> {
           failWith("redirect_not_followed", `endpoint answered ${status} — redirects are not followed`);
           return;
         }
-        const chunks: Buffer[] = [];
+        // Drain, bounded, and DISCARD. Nothing the endpoint sends back is retained.
         let read = 0;
         res.on("data", (chunk: Buffer) => {
-          // Keep only what fits, then stop reading. Dropping an over-sized chunk WHOLE would
-          // throw away the actionable first line of a large error body — the one thing an
-          // operator needs — while still doing all the work of receiving it.
-          if (read < maxBytes) {
-            const room = maxBytes - read;
-            chunks.push(chunk.length <= room ? chunk : chunk.subarray(0, room));
-          }
           read += chunk.length;
-          if (read >= maxBytes) res.destroy(); // bounded read: stop consuming a hostile body
+          if (read >= maxBytes) res.destroy(); // a hostile body must not be consumed without bound
         });
         res.on("aborted", () => {
           // Truncated by our own cap after a usable status line — that is a complete answer.
-          finish(() =>
-            resolve({ status, ok: status >= 200 && status < 300, detail: sanitizeDetail(Buffer.concat(chunks).toString("utf8"), opts.redactFromDetail) }),
-          );
+          finish(() => resolve({ status, ok: status >= 200 && status < 300 }));
         });
         res.on("end", () => {
-          const text = Buffer.concat(chunks).toString("utf8");
-          finish(() => resolve({ status, ok: status >= 200 && status < 300, detail: status >= 200 && status < 300 ? undefined : sanitizeDetail(text, opts.redactFromDetail) }));
+          finish(() => resolve({ status, ok: status >= 200 && status < 300 }));
         });
         res.on("error", (err) => failWith("response_error", err.message));
       });

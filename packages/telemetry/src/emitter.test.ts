@@ -66,7 +66,7 @@ function makeEmitter(opts: {
         secret: args.headers["X-Mythical-Write-Key"] ?? "",
       };
       sent.push(record);
-      return opts.respond?.(record) ?? { status: 202, ok: true, detail: undefined };
+      return opts.respond?.(record) ?? { status: 202, ok: true };
     },
   });
   const emitter = new HeartbeatEmitter<"brokkr">({
@@ -225,7 +225,7 @@ describe("emit", () => {
 
   test("removing the copy retires its identity and purges its queued deliveries", async () => {
     const root = tmpRoot();
-    const withCopy = makeEmitter({ root, respond: () => ({ status: 503, ok: false, detail: "down" }) });
+    const withCopy = makeEmitter({ root, respond: () => ({ status: 503, ok: false }) });
     await withCopy.emitter.emit("2026-07-26");
     const copySecret = withCopy.identity.copyIdentityFor(COPY).instance_secret;
     expect(withCopy.identity.currentCopyDestination()).toBe(COPY);
@@ -240,7 +240,7 @@ describe("emit", () => {
 
   test("applyConfigChange on a global opt-out fences both destinations", async () => {
     const root = tmpRoot();
-    const on = makeEmitter({ root, respond: () => ({ status: 503, ok: false, detail: "down" }) });
+    const on = makeEmitter({ root, respond: () => ({ status: 503, ok: false }) });
     await on.emitter.emit("2026-07-26");
     expect(on.emitter.status("2026-07-26")!.central.attempts).toBe(1);
 
@@ -250,7 +250,7 @@ describe("emit", () => {
   });
 
   test("partial delivery is REPORTED, not hidden", async () => {
-    const { emitter } = makeEmitter({ respond: (s) => ({ status: s.url.startsWith(CENTRAL) ? 202 : 500, ok: s.url.startsWith(CENTRAL), detail: undefined }) });
+    const { emitter } = makeEmitter({ respond: (s) => ({ status: s.url.startsWith(CENTRAL) ? 202 : 500, ok: s.url.startsWith(CENTRAL) }) });
     const result = await emitter.emit("2026-07-26");
     expect(result.sent).toBe(true);
     if (result.sent) {
@@ -301,7 +301,7 @@ describe("a day whose retry crossed midnight is not lost", () => {
     const failing = makeEmitter({
       root,
       endpoints: { centralUrl: CENTRAL },
-      respond: () => (fail ? { status: 503, ok: false, detail: "down" } : { status: 202, ok: true, detail: undefined }),
+      respond: () => (fail ? { status: 503, ok: false } : { status: 202, ok: true }),
     });
     // Day 2026-07-26 fails.
     await failing.emitter.emit("2026-07-26");
@@ -336,7 +336,7 @@ describe("a day whose retry crossed midnight is not lost", () => {
 describe("a removed endpoint does not escape the purge fences", () => {
   test("opting out with NO central configured still purges pending payloads", async () => {
     const root = tmpRoot();
-    const failing = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, respond: () => ({ status: 503, ok: false, detail: "down" }) });
+    const failing = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, respond: () => ({ status: 503, ok: false }) });
     await failing.emitter.emit("2026-07-26");
     expect(failing.emitter.status("2026-07-26")!.central.attempts).toBe(1);
 
@@ -352,7 +352,7 @@ describe("a removed endpoint does not escape the purge fences", () => {
 
   test("REMOVING central retires it — its queued deliveries and payloads are purged", async () => {
     const root = tmpRoot();
-    const failing = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, respond: () => ({ status: 503, ok: false, detail: "down" }) });
+    const failing = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, respond: () => ({ status: 503, ok: false }) });
     await failing.emitter.emit("2026-07-26");
 
     // Consent is unchanged; only the endpoint was removed. Both the emit path and the explicit
@@ -367,7 +367,7 @@ describe("a removed endpoint does not escape the purge fences", () => {
 
   test("applyConfigChange fences a removed central too", async () => {
     const root = tmpRoot();
-    const failing = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, respond: () => ({ status: 503, ok: false, detail: "down" }) });
+    const failing = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, respond: () => ({ status: 503, ok: false }) });
     await failing.emitter.emit("2026-07-26");
 
     const removed = makeEmitter({ root, endpoints: { centralUrl: "" } });
@@ -390,7 +390,7 @@ describe("a malformed endpoint is a misconfiguration, not an exception", () => {
 
   test("a malformed endpoint PURGES the previous endpoint's pending payload", async () => {
     const root = tmpRoot();
-    const failing = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, respond: () => ({ status: 503, ok: false, detail: "down" }) });
+    const failing = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, respond: () => ({ status: 503, ok: false }) });
     await failing.emitter.emit("2026-07-26");
     expect(failing.emitter.status("2026-07-26")!.central.attempts).toBe(1);
 
@@ -403,16 +403,36 @@ describe("a malformed endpoint is a misconfiguration, not an exception", () => {
     expect(check.emitter.status("2026-07-26")!.central.attempts).toBe(0);
   });
 
-  test("a malformed COPY endpoint does not throw either", async () => {
+  test("a malformed COPY endpoint does NOT suppress central — it is reported and skipped", async () => {
     const { emitter, sent } = makeEmitter({ endpoints: { centralUrl: CENTRAL, copyUrl: "gopher://ops.example.net" } });
     const result = await emitter.emit("2026-07-26");
-    expect(result).toMatchObject({ sent: false, reason: "misconfigured" });
-    expect(sent).toHaveLength(0);
+    expect(result.sent).toBe(true);
+    if (result.sent) {
+      expect(result.report.central.status).toBe("delivered");
+      expect(result.report.copy).toBeNull();
+      expect(result.copy_error).toBeDefined(); // surfaced, never swallowed
+    }
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.url.startsWith(CENTRAL)).toBe(true);
+  });
+
+  test("a malformed COPY endpoint does not purge CENTRAL's unresolved backlog", async () => {
+    const root = tmpRoot();
+    const failing = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, respond: () => ({ status: 503, ok: false }) });
+    await failing.emitter.emit("2026-07-26");
+    expect(failing.emitter.status("2026-07-26")!.central.attempts).toBe(1);
+
+    // A typo in the OPERATOR's URL must not reach across and delete central's pending delivery.
+    const typo = makeEmitter({ root, endpoints: { centralUrl: CENTRAL, copyUrl: "gopher://ops.example.net" } });
+    typo.emitter.applyConfigChange();
+
+    const check = makeEmitter({ root, endpoints: { centralUrl: CENTRAL } });
+    expect(check.emitter.status("2026-07-26")!.central.attempts).toBe(1);
   });
 
   test("applyConfigChange never throws on a malformed endpoint, and fences", async () => {
     const root = tmpRoot();
-    const failing = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, respond: () => ({ status: 503, ok: false, detail: "down" }) });
+    const failing = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, respond: () => ({ status: 503, ok: false }) });
     await failing.emitter.emit("2026-07-26");
 
     const broken = makeEmitter({ root, endpoints: { centralUrl: "://nonsense" } });

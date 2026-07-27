@@ -161,7 +161,6 @@ export interface TransportOptions {
     headers: Record<string, string>;
     timeoutMs: number;
     signal: AbortSignal;
-    redactFromDetail?: readonly string[];
   }) => Promise<PostResult>;
 }
 
@@ -260,7 +259,6 @@ export class Transport {
             headers: args.headers,
             timeoutMs: args.timeoutMs,
             signal: args.signal,
-            redactFromDetail: args.redactFromDetail,
           })),
     };
   }
@@ -780,9 +778,6 @@ export class Transport {
         },
         timeoutMs: this.opts.perAttemptTimeoutMs,
         signal: attemptAborter.signal,
-        // A hostile endpoint can echo the write key back in its error body, and that excerpt is
-        // persisted in the delivery state and shown on the status surface.
-        redactFromDetail: [args.input.identity.instance_secret],
       });
 
       if (result.ok) {
@@ -796,8 +791,10 @@ export class Transport {
         return this.outcomeFor(args.day, args.kind, args.destination, null);
       }
 
-      const detail = result.detail === undefined ? "" : ` — ${result.detail}`;
-      this.recordFailure(rec, state, bKey, `HTTP ${result.status}${detail}`, result.status);
+      // The status and nothing else. The response BODY is never read into local state: the
+      // endpoint is attacker-controlled and already holds the write key, so any excerpt of what it
+      // says is bytes of its choosing landing in a file and on a status surface. See ssrf.ts.
+      this.recordFailure(rec, state, bKey, `HTTP ${result.status}`, result.status);
       return this.outcomeFor(args.day, args.kind, args.destination, null);
     } catch (err) {
       const reason = err instanceof EndpointRejected ? `${err.reason}: ${err.message}` : err instanceof Error ? err.message : String(err);
