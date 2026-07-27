@@ -176,7 +176,7 @@ export class HeartbeatEmitter<P extends ProductName> {
     // EACH DESTINATION IS JUDGED ON ITS OWN. Treating any configuration failure as a whole-config
     // failure meant a typo in the OPERATOR's URL deleted central's unresolved payloads — a
     // cross-destination purge, which is exactly what the per-destination fence exists to prevent.
-    const copyCheck = this.checkCopyEndpoint(endpoints.copyUrl);
+    const copyCheck = this.checkCopyEndpoint(endpoints.copyUrl, endpoints.centralUrl);
     if (copyCheck.error !== undefined) {
       // The copy is retired: its scoped secret is destroyed and its queued deliveries purged.
       // CENTRAL IS UNTOUCHED — a broken operator endpoint never suppresses central.
@@ -240,40 +240,62 @@ export class HeartbeatEmitter<P extends ProductName> {
         ? undefined
         : { url: usableCopyUrl, identity: copyIdentity, body: copyBody };
 
-    const report = await this.deps.transport.send({
-      day,
-      product: this.deps.product,
-      consent,
-      central: { url: endpoints.centralUrl, identity: central, body: JSON.stringify(centralPayload) },
-      copy: copyDestination,
-    });
-
-    // Then re-attempt anything older that is still unresolved, using the bytes those deliveries
-    // were created with. A delta-normalising producer cannot rebuild an older day — its snapshot
-    // has moved on — so a retry that is not a re-send of the stored payload is not a retry at all.
-    const drained = await this.deps.transport.drain({
-      product: this.deps.product,
-      consent,
-      central: { url: endpoints.centralUrl, identity: central },
-      copy: copyDestination === undefined ? undefined : { url: copyDestination.url, identity: copyDestination.identity },
-      exceptDay: day,
-    });
+    let report: SendReport;
+    let drained: SendReport[];
+    try {
+      report = await this.deps.transport.send({
+        day,
+        product: this.deps.product,
+        consent,
+        central: { url: endpoints.centralUrl, identity: central, body: JSON.stringify(centralPayload) },
+        copy: copyDestination,
+      });
+      // Then re-attempt anything older that is still unresolved, using the bytes those deliveries
+      // were created with. A delta-normalising producer cannot rebuild an older day — its snapshot
+      // has moved on — so a retry that is not a re-send of the stored payload is not a retry at all.
+      drained = await this.deps.transport.drain({
+        product: this.deps.product,
+        consent,
+        central: { url: endpoints.centralUrl, identity: central },
+        copy: copyDestination === undefined ? undefined : { url: copyDestination.url, identity: copyDestination.identity },
+        exceptDay: day,
+      });
+    } catch (err) {
+      // The transport rejects only on a configuration fault. emit() must never throw at its
+      // caller: telemetry cannot be allowed to break the product it reports on.
+      const detail = err instanceof TransportConfigError ? `${err.reason}: ${err.message}` : String(err);
+      this.log(`heartbeat not sent — ${detail}`);
+      return { sent: false, reason: "misconfigured", detail };
+    }
 
     return copyCheck.error === undefined ? { sent: true, report, drained } : { sent: true, report, drained, copy_error: copyCheck.error };
   }
+
 
   /**
    * Is the copy endpoint absent, usable, or configured-but-broken? Its verdict never touches
    * central: they are independent destinations and a fault in one must not fence the other.
    */
-  private checkCopyEndpoint(copyUrl: string | undefined): { url?: string; error?: string } {
+  private checkCopyEndpoint(copyUrl: string | undefined, centralUrl: string): { url?: string; error?: string } {
     if (copyUrl === undefined || copyUrl === "") return {};
+    let normalizedCopy: string;
     try {
-      normalizeDestinationUrl(copyUrl);
-      return { url: copyUrl };
+      normalizedCopy = normalizeDestinationUrl(copyUrl);
     } catch (err) {
       return { error: err instanceof Error ? err.message : String(err) };
     }
+    // A copy pointing at CENTRAL is unusable for the same reason as a malformed one, and it has to
+    // be caught here: the transport rejects it by throwing, and a throw on this path would escape
+    // emit() (which must never throw), leave the day with no record at all, and skip the copy's
+    // retirement. Treated as an unusable copy, it retires and central proceeds alone.
+    try {
+      if (normalizedCopy === normalizeDestinationUrl(centralUrl)) {
+        return { error: "the copy destination must differ from central — the same endpoint would receive two identities for one install" };
+      }
+    } catch {
+      // Central is itself unusable; that is judged on its own below, not here.
+    }
+    return { url: copyUrl };
   }
 
   /** Per-destination delivery state for a day, without sending. */
@@ -303,9 +325,11 @@ export class HeartbeatEmitter<P extends ProductName> {
     const endpoints = this.deps.getEndpoints();
     // Each destination is fenced on ITS OWN validity, in its own try. A malformed copy URL must
     // not reach across and purge central's unresolved deliveries, and neither may throw at the
-    // caller — this runs on a settings-save path.
+    // caller — this runs on a settings-save path. An unusable copy (malformed, or pointing at
+    // central) fences as retired.
+    const copyCheck = this.checkCopyEndpoint(endpoints.copyUrl, endpoints.centralUrl);
     this.fenceOne("central", endpoints.centralUrl, consent);
-    this.fenceOne("copy", endpoints.copyUrl, consent);
+    this.fenceOne("copy", copyCheck.url, consent);
   }
 
   private fenceOne(kind: DestinationKind, url: string | undefined, consent: ConsentState): void {

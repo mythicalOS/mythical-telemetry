@@ -90,6 +90,7 @@ export {
   deliveryStateFilePath,
   ingestUrlFor,
   describeSendReport,
+  TRANSPORT_REASONS,
   type DestinationKind,
   type DeliveryStatus,
   type DeliveryRecord,

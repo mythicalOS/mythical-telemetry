@@ -442,3 +442,41 @@ describe("a malformed endpoint is a misconfiguration, not an exception", () => {
     expect(check.emitter.status("2026-07-26")!.central.attempts).toBe(0);
   });
 });
+
+describe("a copy pointing at CENTRAL is an unusable copy, not an exception", () => {
+  test("emit() reports it, retires the copy, and still delivers to central", async () => {
+    const { emitter, sent } = makeEmitter({ endpoints: { centralUrl: CENTRAL, copyUrl: `${CENTRAL}/` } });
+    // The transport refuses this configuration by throwing. Left uncaught it would escape emit()
+    // — which must never throw — and leave the day with no delivery record at all.
+    const result = await emitter.emit("2026-07-26");
+    expect(result.sent).toBe(true);
+    if (result.sent) {
+      expect(result.report.central.status).toBe("delivered");
+      expect(result.report.copy).toBeNull();
+      expect(result.copy_error).toContain("must differ from central");
+    }
+    expect(sent).toHaveLength(1);
+  });
+
+  test("the day is recorded, so a later configuration fix does not find it missing", async () => {
+    const root = tmpRoot();
+    const { emitter } = makeEmitter({ root, endpoints: { centralUrl: CENTRAL, copyUrl: CENTRAL } });
+    await emitter.emit("2026-07-26");
+    const check = makeEmitter({ root, endpoints: { centralUrl: CENTRAL } });
+    expect(check.emitter.status("2026-07-26")!.central.status).toBe("delivered");
+  });
+
+  test("applyConfigChange retires a copy that points at central", async () => {
+    const root = tmpRoot();
+    const failing = makeEmitter({ root, respond: () => ({ status: 503, ok: false }) });
+    await failing.emitter.emit("2026-07-26"); // leaves a real copy delivery pending
+    expect(failing.emitter.status("2026-07-26")!.copy!.attempts).toBe(1);
+
+    const collided = makeEmitter({ root, endpoints: { centralUrl: CENTRAL, copyUrl: CENTRAL } });
+    expect(() => collided.emitter.applyConfigChange()).not.toThrow();
+
+    const check = makeEmitter({ root, endpoints: { centralUrl: CENTRAL, copyUrl: COPY } });
+    expect(check.emitter.status("2026-07-26")!.copy!.attempts).toBe(0); // retired
+    expect(check.emitter.status("2026-07-26")!.central.attempts).toBe(1); // untouched
+  });
+});

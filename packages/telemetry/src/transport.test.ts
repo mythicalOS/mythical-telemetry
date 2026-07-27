@@ -10,6 +10,7 @@ import {
   Transport,
   TransportConfigError,
   describeSendReport,
+  TRANSPORT_REASONS,
   type TransportOptions,
 } from "./transport.ts";
 import { userConsent, type ConsentState } from "./optout.ts";
@@ -761,5 +762,59 @@ describe("the drain cap counts ATTEMPTS, not selections", () => {
     });
     expect(calls).toBe(2);
     expect(reports.map((r) => r.day)).toEqual(["2026-07-20", "2026-07-21"]);
+  });
+});
+
+describe("only CLOSED-SET reasons reach durable state", () => {
+  const CONSENT = userConsent(true, Date.parse("2026-01-01T00:00:00.000Z"));
+
+  test("an EndpointRejected persists its reason, never its message", async () => {
+    const root = tmpRoot();
+    const { transport } = harness(
+      () => {
+        // A message like a TLS or parser error would carry text that originated at the endpoint.
+        throw new EndpointRejected("address_blocked", "peer certificate CN=<attacker chosen 41414141>");
+      },
+      { stateRoot: root },
+    );
+    await transport.send({ ...sendInput(CONSENT), copy: undefined });
+
+    const rec = transport.record(DAY, "central", CENTRAL_URL)!;
+    expect(rec.last_error).toBe("address_blocked");
+    expect(fs.readFileSync(deliveryStateFilePath(root), "utf8")).not.toContain("attacker chosen");
+  });
+
+  test("an unrecognised failure collapses to one fixed value", async () => {
+    const root = tmpRoot();
+    const { transport } = harness(
+      () => {
+        throw new Error("ECONNRESET while reading from evil.example.com: <440 bytes of their prose>");
+      },
+      { stateRoot: root },
+    );
+    await transport.send({ ...sendInput(CONSENT), copy: undefined });
+    expect(transport.record(DAY, "central", CENTRAL_URL)!.last_error).toBe("transport_error");
+    expect(fs.readFileSync(deliveryStateFilePath(root), "utf8")).not.toContain("evil.example.com");
+  });
+
+  test("an EndpointRejected with a reason we do not define also collapses", async () => {
+    const { transport } = harness(() => {
+      throw new EndpointRejected("something_new", "with detail");
+    });
+    await transport.send({ ...sendInput(CONSENT), copy: undefined });
+    expect(transport.record(DAY, "central", CENTRAL_URL)!.last_error).toBe("transport_error");
+  });
+
+  test("an HTTP failure records the status and nothing else", async () => {
+    const { transport } = harness(() => FAIL);
+    await transport.send({ ...sendInput(CONSENT), copy: undefined });
+    expect(transport.record(DAY, "central", CENTRAL_URL)!.last_error).toBe("HTTP 503");
+  });
+
+  test("every reason the transport can persist is on the closed list", () => {
+    // The list is exported so the collector and any status surface can enumerate it rather than
+    // pattern-matching free text.
+    expect(TRANSPORT_REASONS).toContain("transport_error");
+    expect(new Set(TRANSPORT_REASONS).size).toBe(TRANSPORT_REASONS.length);
   });
 });

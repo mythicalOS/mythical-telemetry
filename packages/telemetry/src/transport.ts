@@ -797,8 +797,12 @@ export class Transport {
       this.recordFailure(rec, state, bKey, `HTTP ${result.status}`, result.status);
       return this.outcomeFor(args.day, args.kind, args.destination, null);
     } catch (err) {
-      const reason = err instanceof EndpointRejected ? `${err.reason}: ${err.message}` : err instanceof Error ? err.message : String(err);
-      this.recordFailure(rec, state, bKey, reason, null);
+      // ONLY the closed reason is persisted — never the exception message. A message can carry
+      // text that originated at the endpoint (a TLS error naming the certificate it presented, a
+      // parser quoting what it received), and that is exactly the attacker-chosen-bytes-at-rest
+      // problem the response-body removal exists to close. An unrecognised failure collapses to a
+      // single fixed value rather than leaking its own description.
+      this.recordFailure(rec, state, bKey, transportReason(err), null);
       return this.outcomeFor(args.day, args.kind, args.destination, null);
     } finally {
       args.budget.removeEventListener("abort", onBudget);
@@ -833,6 +837,35 @@ export class Transport {
     const capped = Math.min(this.opts.baseBackoffMs * 2 ** Math.max(0, attempts - 1), this.opts.maxBackoffMs);
     return Math.round(capped * (0.5 + 0.5 * this.opts.random()));
   }
+}
+
+/**
+ * The CLOSED set of transport failure reasons this package will persist. Anything not on it —
+ * including any exception message — collapses to `transport_error`.
+ */
+export const TRANSPORT_REASONS = [
+  "invalid_url",
+  "scheme_not_allowed",
+  "credentials_in_url",
+  "https_required",
+  "host_not_routable",
+  "address_blocked",
+  "dns_empty",
+  "dns_failed",
+  "dns_timeout",
+  "redirect_not_followed",
+  "timeout",
+  "aborted",
+  "request_failed",
+  "response_error",
+  "transport_error",
+] as const;
+
+const TRANSPORT_REASON_SET: ReadonlySet<string> = new Set<string>(TRANSPORT_REASONS);
+
+function transportReason(err: unknown): string {
+  if (err instanceof EndpointRejected && TRANSPORT_REASON_SET.has(err.reason)) return err.reason;
+  return "transport_error";
 }
 
 function parseRecord(value: unknown): DeliveryRecord | undefined {
