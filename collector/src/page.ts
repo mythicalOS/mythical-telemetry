@@ -19,6 +19,12 @@
 //      not listed at all, and any individual figure below the floor renders as
 //      "—". "3 installs, all on Linux" is a statement about three identifiable
 //      installations.
+//
+//      The COUNT of withheld products is not published either. With a closed
+//      product set, "two rows shown, one withheld" names the withheld product
+//      and says it has fewer than the floor — the suppression would announce
+//      exactly the fact it exists to hide. The page says only that anything
+//      below the floor is not listed.
 //   2. NO FAMILY TOTAL. Each product derives its own identity, so nothing
 //      joins one installation across products. Any family-wide count would
 //      double-count everyone running two products. The absence is stated on
@@ -49,8 +55,6 @@ export interface AggregateView {
   active_window_days: number;
   min_cell: number;
   products: AggregateProductView[];
-  /** Products present in the store but withheld entirely by the floor. */
-  suppressed_products: number;
 }
 
 /** Deterministic integer formatting with comma grouping (no locale dependence). */
@@ -114,15 +118,10 @@ export function renderAggregatePage(view: AggregateView): string {
 <tbody>${rows || '<tr><td colspan="4">Nothing to report yet.</td></tr>'}</tbody>
 </table>`;
 
-  const suppressed = view.suppressed_products > 0
-    ? `<p class="note">${esc(view.suppressed_products)} product${view.suppressed_products === 1 ? '' : 's'} withheld: fewer than ${esc(view.min_cell)} installations, which would describe identifiable ones.</p>`
-    : '';
-
   const body = `
 <h1>mythicalOS telemetry &mdash; population</h1>
 <p class="sub">Aggregate figures only, as of ${esc(view.generated_day)} (UTC).</p>
 ${table}
-${suppressed}
 <h2>How to read this</h2>
 <p class="note"><strong>There is no family total, by design.</strong> Each product derives its own
 installation identity, and nothing joins them. Adding these columns would count anyone running two
@@ -130,8 +129,10 @@ products twice, so no such figure is published.</p>
 <p class="note"><strong>These numbers are untrusted.</strong> Ingest is public and unauthenticated:
 anyone can mint an identity and submit well-formed junk. Treat them as an upper bound on activity,
 not as a measurement.</p>
-<p class="note"><strong>Figures below ${esc(view.min_cell)} are withheld</strong> and shown as
-&mdash;, because a small count describes identifiable installations rather than a population.</p>
+<p class="note"><strong>Anything below ${esc(view.min_cell)} is withheld.</strong> A figure under the
+floor shows as &mdash;, and a product under it is not listed at all &mdash; nor is the fact that one
+was withheld, which would name it. A small count describes identifiable installations rather than a
+population.</p>
 <h2>Your own data</h2>
 <p class="note">Per-installation figures are not published here. They require the installation's own
 secret, over the authenticated API &mdash; knowing an installation id grants nothing. The same

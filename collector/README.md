@@ -69,10 +69,15 @@ open to anyone holding the id, and the unauthenticated per-installation page tha
 | `/v1/instances/<uuid>/stats?product=<name>` | GET | instance secret | that installation's own days and totals; optional `&days=N` (1–400) |
 | `/v1/instances/<uuid>` | DELETE | instance secret | purges the identity across **every** product; idempotent `204` |
 
-All three authenticated routes share one per-source budget. Anyone can mint a valid (secret, id)
-pair, so an authenticated request is not a scarce one — an unthrottled read or no-op purge would
-reach the database for the price of a hash. The throttle sits **after** the identity proof, so a
-403 never depends on someone else's traffic.
+Every authenticated route is per-source throttled. Anyone can mint a valid (secret, id) pair, so an
+authenticated request is not a scarce one — an unthrottled read or no-op purge would reach the
+database for the price of a hash. Reads and deletes draw on a **separate** budget from ingest, so a
+read flood cannot stop heartbeat delivery for installations behind the same address, and the
+throttle sits **after** the identity proof, so a 403 never depends on someone else's traffic.
+
+The two public routes (`/` and `/v1/stats`) serve a **cached** aggregate, recomputed at most once a
+minute. The figures move at day granularity, so recomputing per request is pure waste — and on a
+public route that waste is an amplification lever.
 | `/v1/stats` | GET | none | per-product aggregate, small-cell suppressed |
 | `/` | GET | none | the aggregate give-back page |
 | `/v1/schema` | GET | none | the published JSON Schema, when the operator wired one; otherwise absent |
@@ -97,6 +102,10 @@ explicitly rather than omitting it — a gap invites someone to close it by summ
 The public aggregate applies a **small-cell floor** (`MYTHICAL_TELEMETRY_MIN_AGGREGATE_CELL`,
 default 5). A product below it is withheld entirely; an individual figure below it renders as `—`.
 "Three installations, all on Linux" is a statement about three identifiable installations.
+
+**The number of withheld products is not published either.** With a closed product set, "two rows
+shown, one withheld" names the withheld product and states that it is under the floor — the
+suppression would announce exactly the fact it exists to hide.
 
 ## Compatibility window
 
@@ -227,6 +236,7 @@ high is the dangerous direction: it selects a position an attacker can write.
 - every rejection counter, **including the ones that have never fired**, as zeros — a missing key
   and a zero are indistinguishable otherwise, and a rejection class that silently never registers
   is the failure this exists to prevent;
+- aggregate serves versus aggregate recomputes, so the cache's effectiveness is visible;
 - accepted counts split by wire version, which is the number the compatibility-window decision
   actually needs;
 - store gauges (identities total, identities admitted today) against their configured budgets;
@@ -244,6 +254,14 @@ above zero; a sustained rise in `ingest_accepted_new_instance`; `internal_error`
 - **A distributed flood from more sources than the throttle map holds** degrades the per-source
   limiter: idle keys are swept, then the least-recently-seen are evicted. A WAF or edge rate-limit
   tier is the mitigation for that shape, not this process.
+- **Callers who share a source address share its budget, and that is not fully fixable here.**
+  Identities are freely mintable, so an attacker behind the same NAT — or the same trusted proxy
+  client address — can spend the read/delete budget that legitimate installations at that address
+  would have used. Splitting reads and deletes off the ingest budget keeps heartbeat *delivery*
+  out of the blast radius, which is the part that loses data; it does not isolate callers from one
+  another. Doing that properly needs a trustworthy upstream client identity or an edge quota, and
+  this service has neither. If your population is concentrated behind few addresses, enforce
+  per-client quotas at the edge.
 - **Poisoned data already ingested** is not detectable after the fact. There is no provenance
   beyond the derived id, which the poisoner also controls. Deletion of a suspected range is a
   manual operator action against the database.
@@ -310,6 +328,7 @@ volumes:
 | `MYTHICAL_TELEMETRY_TRUSTED_PROXY_HOPS` | `0` | proxies in the chain; 0 = never trust `X-Forwarded-For` |
 | `MYTHICAL_TELEMETRY_TRUSTED_PROXIES` | *(unset)* | which peers those are: comma-separated addresses/CIDRs. **Required** when hops > 0; the service refuses to start otherwise |
 | `MYTHICAL_TELEMETRY_MIN_AGGREGATE_CELL` | `5` | small-cell floor for the public aggregate |
+| *(not configurable)* | 60s | how long a computed public aggregate is reused before recomputing |
 | `MYTHICAL_TELEMETRY_ACCEPT_V1` | `1` | accept v1 payloads (the compatibility window) |
 | `MYTHICAL_TELEMETRY_OPS_KEY` | *(unset)* | gates `/metrics`; unset means the route does not exist |
 

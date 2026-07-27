@@ -44,6 +44,7 @@ export const COUNTER_NAMES = [
   'read_stats_rate_limited',
   'read_stats_unknown',
   'read_aggregate_ok',
+  'read_aggregate_recomputed',
   // deletes
   'delete_ok',
   'delete_unauthorized',

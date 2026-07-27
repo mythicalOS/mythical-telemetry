@@ -41,15 +41,41 @@ describe('aggregate JSON', () => {
     expect(body.data_quality).toBe('untrusted-public-ingest');
   });
 
-  test('a product below the small-cell floor is withheld entirely, and only counted', async () => {
+  test('the response is served from cache, so a flood costs no database work', async () => {
+    const h = makeHarness({ minAggregateCell: 1 });
+    await seed(h, 'brokkr', 1);
+    for (let i = 0; i < 20; i++) {
+      expect((await h.handler(getReq('/v1/stats'))).status).toBe(200);
+      expect((await h.handler(getReq('/'))).status).toBe(200);
+    }
+    expect(h.counters.get('read_aggregate_ok')).toBe(40);
+    expect(h.counters.get('read_aggregate_recomputed')).toBe(1);
+
+    // ...and it does refresh once the window passes.
+    h.advanceMs(61_000);
+    await h.handler(getReq('/v1/stats'));
+    expect(h.counters.get('read_aggregate_recomputed')).toBe(2);
+  });
+
+  test('a product below the small-cell floor is withheld entirely — and so is the fact that it was', async () => {
+    // Publishing "1 product withheld" alongside the visible rows would name
+    // the withheld product and state that it is under the floor, announcing
+    // exactly the fact the suppression exists to hide.
     const h = makeHarness({ minAggregateCell: 3 });
     await seed(h, 'brokkr', 3);
     await seed(h, 'saga', 1);
 
-    const body = await (await h.handler(getReq('/v1/stats'))).json() as any;
+    const r = await h.handler(getReq('/v1/stats'));
+    const text = await r.text();
+    const body = JSON.parse(text);
     expect(body.products.map((p: any) => p.product)).toEqual(['brokkr']);
-    expect(body.suppressed_products).toBe(1);
-    expect(JSON.stringify(body)).not.toContain('saga');
+    expect(text).not.toContain('saga');
+    expect(text).not.toContain('suppressed');
+    expect(Object.hasOwn(body, 'suppressed_products')).toBe(false);
+
+    const page = await (await h.handler(getReq('/'))).text();
+    expect(page).not.toContain('saga');
+    expect(page).not.toMatch(/withheld: fewer|products? withheld/);
   });
 
   test('a sub-floor active count is withheld while the install count is published', async () => {
@@ -72,7 +98,7 @@ describe('aggregate JSON', () => {
     expect(r.status).toBe(200);
     const body = await r.json() as any;
     expect(body.products).toEqual([]);
-    expect(body.suppressed_products).toBe(0);
+    expect(body.family_total_installs).toBeNull();
   });
 
   test('the aggregate needs no credential', async () => {
@@ -121,12 +147,11 @@ describe('aggregate page', () => {
       active_window_days: 28,
       min_cell: 5,
       products: [{ product: 'brokkr', installs_seen: 40, installs_active: null, days_reported: 900 }],
-      suppressed_products: 2,
     });
     expect(page).toContain('&mdash;');
-    expect(page).toContain('2 products withheld');
     expect(page).toContain('40');
     expect(page).toContain('900');
+    expect(page).not.toMatch(/\d+ products? withheld/);
   });
 
   test('an empty population renders a page rather than an error', () => {
@@ -135,7 +160,6 @@ describe('aggregate page', () => {
       active_window_days: 28,
       min_cell: 5,
       products: [],
-      suppressed_products: 0,
     });
     expect(page).toContain('Nothing to report yet.');
   });
@@ -160,7 +184,6 @@ describe('the ONE escape function', () => {
       products: [
         { product: '<script>alert(2)</script>', installs_seen: 9, installs_active: 9, days_reported: 9 },
       ],
-      suppressed_products: 0,
     });
     expect(page).not.toContain('<script');
     expect(page).not.toContain('</script');

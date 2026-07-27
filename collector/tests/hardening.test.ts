@@ -291,10 +291,31 @@ describe('authenticated reads and deletes are throttled too', () => {
         src,
       );
     expect((await read()).status).toBe(200);
+    expect((await read()).status).toBe(200);
     const limited = await read();
     expect(limited.status).toBe(429);
     expect(await limited.json()).toEqual({ ok: false, error: 'rate_limited' });
     expect(h.counters.get('read_stats_rate_limited')).toBe(1);
+  });
+
+  test('a read flood does NOT deny heartbeat delivery from the same source', async () => {
+    // Anyone can mint a valid (secret, id) pair, so authenticated reads are
+    // cheap to produce. Sharing one bucket with ingest would let that flood
+    // stop every installation behind the same address from reporting.
+    const h = makeHarness({ rateLimitPerMin: 2 });
+    const src = h.serverFor('198.51.100.7');
+    const read = () =>
+      h.handler(
+        new Request(`http://telemetry.local/v1/instances/${INSTANCE_C}/stats?product=brokkr`, {
+          headers: { 'x-mythical-instance-secret': SECRET_C },
+        }),
+        src,
+      );
+    expect((await read()).status).toBe(404);
+    expect((await read()).status).toBe(404);
+    expect((await read()).status).toBe(429); // read budget spent
+    // ...and ingest from that same source is untouched.
+    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A), src)).status).toBe(202);
   });
 
   test('a flood of no-op deletes from one source exhausts its bucket', async () => {

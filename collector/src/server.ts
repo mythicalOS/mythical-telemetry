@@ -53,6 +53,18 @@ export const DEFAULT_RATE_LIMIT_PER_MIN = 60;
 export const DEFAULT_NEW_INSTANCE_PER_SOURCE_PER_HOUR = 20;
 export const DEFAULT_MIN_AGGREGATE_CELL = 5;
 export const DEFAULT_ACTIVE_WINDOW_DAYS = 28;
+/**
+ * How long a computed public aggregate is reused.
+ *
+ * The figures move at DAY granularity, so recomputing them per request is pure
+ * waste — and on a public, unauthenticated route that waste is an
+ * amplification lever: a flood of `GET /` would otherwise run a grouped count
+ * over the store for every request. With the cache the database work is
+ * bounded to once per window no matter how many requests arrive. Staleness of
+ * up to this long is immaterial for a population figure, and the page already
+ * says the numbers are an upper bound rather than a measurement.
+ */
+export const DEFAULT_AGGREGATE_CACHE_MS = 60_000;
 
 const DAY_WINDOW_DAYS = 30;
 const MINUTE_MS = 60_000;
@@ -108,6 +120,8 @@ export interface TelemetryServerConfig {
   acceptWireV1?: boolean;
   /** Small-cell floor for the public aggregate. */
   minAggregateCell?: number;
+  /** How long a computed aggregate is reused. 0 recomputes every request (tests). */
+  aggregateCacheMs?: number;
   /** Injected clock: current UTC day as YYYY-MM-DD. */
   nowUtcDay?: () => string;
   /** Injected clock: milliseconds (throttle refill). */
@@ -174,7 +188,17 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
   const nowMs = config.nowMs ?? Date.now;
   const counters = config.counters ?? new Counters();
 
-  const limiter = new TokenBucketLimiter(config.rateLimitPerMin ?? DEFAULT_RATE_LIMIT_PER_MIN, MINUTE_MS, nowMs);
+  const rateLimitPerMin = config.rateLimitPerMin ?? DEFAULT_RATE_LIMIT_PER_MIN;
+  const aggregateCacheMs = config.aggregateCacheMs ?? DEFAULT_AGGREGATE_CACHE_MS;
+  const limiter = new TokenBucketLimiter(rateLimitPerMin, MINUTE_MS, nowMs);
+  // Reads and deletes get their OWN budget rather than sharing the ingest one.
+  // Anyone can mint a valid (secret, id) pair, so a flood of authenticated
+  // reads is cheap to produce; sharing one bucket would let that flood deny
+  // HEARTBEAT DELIVERY for every installation behind the same address. It
+  // cannot fully isolate callers who share a source — that needs an upstream
+  // identity this service does not have, and it is documented as a residual —
+  // but it does keep the ingest path out of the blast radius.
+  const readLimiter = new TokenBucketLimiter(rateLimitPerMin, MINUTE_MS, nowMs);
   // Anomaly isolation: minting fresh identities is the expensive, poisoning
   // shape, and it is throttled SEPARATELY and far more tightly than ordinary
   // traffic. An established install is never touched by this budget, so a
@@ -418,7 +442,7 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
     // scarce one — without this, unlimited reads reach the store while costing
     // the caller nothing. Proving identity is a single hash and stays cheap,
     // so it is safe to do first.
-    if (!limiter.allow(resolveSourceKey(req, server, trustedProxyHops, trustedProxies))) {
+    if (!readLimiter.allow(resolveSourceKey(req, server, trustedProxyHops, trustedProxies))) {
       counters.inc('read_stats_rate_limited');
       return json(429, { ok: false, error: 'rate_limited' });
     }
@@ -462,7 +486,7 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
     // Same reasoning as the read route, and more pressing: every delete opens
     // a write transaction, so an unthrottled stream of no-op purges is lock
     // pressure on the whole service for the price of a hash per request.
-    if (!limiter.allow(resolveSourceKey(req, server, trustedProxyHops, trustedProxies))) {
+    if (!readLimiter.allow(resolveSourceKey(req, server, trustedProxyHops, trustedProxies))) {
       counters.inc('delete_rate_limited');
       return json(429, { ok: false, error: 'rate_limited' });
     }
@@ -492,26 +516,33 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
       });
     }
 
-    counters.inc('read_aggregate_ok');
+    counters.inc('read_aggregate_recomputed');
     return {
       generated_day: today,
       active_window_days: DEFAULT_ACTIVE_WINDOW_DAYS,
       min_cell: minCell,
       products,
-      suppressed_products: suppressed,
     };
   }
 
-  function handleAggregateJson(): Response {
+  /**
+   * The rendered aggregate, recomputed at most once per cache window.
+   *
+   * Both public routes serve precomputed bytes, so a request flood costs no
+   * database work — see DEFAULT_AGGREGATE_CACHE_MS.
+   */
+  let aggregateCache: { atMs: number; json: string; html: string } | null = null;
+  function aggregateSnapshot(): { json: string; html: string } {
+    const now = nowMs();
+    if (aggregateCache !== null && now - aggregateCache.atMs < aggregateCacheMs) return aggregateCache;
     const view = buildAggregate();
-    return json(200, {
+    const body = {
       ok: true,
       contract_version: 2,
       generated_day: view.generated_day,
       active_window_days: view.active_window_days,
       min_cell: view.min_cell,
       products: view.products,
-      suppressed_products: view.suppressed_products,
       // Stated in the payload, not only in prose, so a consumer cannot treat
       // these as measurements by accident.
       data_quality: 'untrusted-public-ingest',
@@ -519,14 +550,20 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
       // identity, so no family figure is computable without double-counting.
       // A null someone has to reason about is safer than a gap someone fills.
       family_total_installs: null,
-    });
+    };
+    aggregateCache = { atMs: now, json: JSON.stringify(body), html: renderAggregatePage(view) };
+    return aggregateCache;
   }
 
-  function handleMetrics(req: Request): Response | null {
+  function handleMetrics(req: Request, server?: ServerLike): Response | null {
     if (opsKey === null) return null; // route does not exist unless configured
     const presented = req.headers.get(OPS_KEY_HEADER);
     if (presented === null || !constantTimeStringEqual(presented, opsKey)) {
       return json(403, { ok: false, error: 'unauthorized' });
+    }
+    // Counting queries are not free; the key holder is trusted, not unlimited.
+    if (!readLimiter.allow(resolveSourceKey(req, server, trustedProxyHops, trustedProxies))) {
+      return json(429, { ok: false, error: 'rate_limited' });
     }
     return json(200, {
       ok: true,
@@ -542,6 +579,7 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
         trusted_proxy_hops: trustedProxyHops,
         trusted_proxies_configured: trustedProxies.length,
         rate_limit_keys: limiter.size(),
+        read_limit_keys: readLimiter.size(),
         new_instance_keys: newInstanceLimiter.size(),
       },
       migration: db.migration,
@@ -555,13 +593,22 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
       const path = url.pathname;
 
       if (path === '/healthz' && req.method === 'GET') return json(200, { ok: true });
-      if (path === '/' && req.method === 'GET') return html(200, renderAggregatePage(buildAggregate()));
-      if (path === '/v1/stats' && req.method === 'GET') return handleAggregateJson();
+      if (path === '/' && req.method === 'GET') {
+        counters.inc('read_aggregate_ok');
+        return html(200, aggregateSnapshot().html);
+      }
+      if (path === '/v1/stats' && req.method === 'GET') {
+        counters.inc('read_aggregate_ok');
+        return new Response(aggregateSnapshot().json, {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
       if (path === '/v1/schema' && req.method === 'GET' && schemaJson !== null) {
         return new Response(schemaJson, { status: 200, headers: { 'content-type': 'application/json' } });
       }
       if (path === '/metrics' && req.method === 'GET') {
-        const res = handleMetrics(req);
+        const res = handleMetrics(req, server);
         if (res) return res;
       }
       if (path === '/v1/ingest' && req.method === 'POST') return handleIngest(req, server);
