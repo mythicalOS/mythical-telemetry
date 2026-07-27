@@ -1,0 +1,269 @@
+// Storage + privacy posture. bun:sqlite (WAL), prepared statements ONLY —
+// never string interpolation of a value. Two tables:
+//
+//   instances (instance_id, product, first_seen_day, last_seen_day)
+//              PRIMARY KEY (instance_id, product)
+//   heartbeats(instance_id, product, day, schema_version, payload, received_day)
+//              PRIMARY KEY (instance_id, product, day)
+//
+// `product` is part of both keys (plan §11). Each product derives its OWN
+// identity, so the same id appearing under two products is not expected — but
+// without the column in the key, one product's heartbeat would overwrite
+// another's for the same day, and that is a data-loss bug, not a theoretical
+// one.
+//
+// `schema_version` records the version the payload arrived as ON THE WIRE
+// (1 or 2). `payload` is ALWAYS the normalized v2 document. That split is what
+// gives the read path one shape to handle while keeping durable evidence of
+// how many installs are still on v1 — which is the number the support-window
+// decision actually needs.
+//
+// Privacy properties, all schema-level rather than promises:
+//   • NO IP COLUMN ANYWHERE. The rate limiter's per-source state is in-memory
+//     and process-lifetime only; it is never written here.
+//   • No key material at rest. Authorization is recomputed per request from
+//     the presented secret; nothing derived from it is stored.
+//   • `received_day` is DAY granularity. An exact receive timestamp would
+//     fingerprint an installation's check-in cadence.
+//
+// Bounded growth: per-instance row cap via retention prune, plus admission
+// control on never-seen identities (see `admit`).
+
+import { Database, type Statement } from 'bun:sqlite';
+import { migrate, type MigrationReport } from './migrate';
+
+export const DEFAULT_RETENTION_DAYS = 400;
+export const DEFAULT_MAX_INSTANCES = 100_000;
+export const DEFAULT_NEW_INSTANCES_PER_DAY = 5_000;
+
+export interface TelemetryDbConfig {
+  /** SQLite file path, or ':memory:' for tests. */
+  path: string;
+  retentionDays?: number;
+  /** Absolute ceiling on distinct (instance_id, product) identities. */
+  maxInstances?: number;
+  /** Global budget on identities admitted for the FIRST time on one UTC day. */
+  newInstancesPerDay?: number;
+}
+
+export interface InstanceRow {
+  instance_id: string;
+  product: string;
+  first_seen_day: string;
+  last_seen_day: string;
+}
+
+export interface HeartbeatRow {
+  day: string;
+  schema_version: number;
+  payload: string;
+  received_day: string;
+}
+
+export interface ProductAggregate {
+  product: string;
+  installs_seen: number;
+  installs_active: number;
+  days_reported: number;
+}
+
+export type Admission =
+  | { ok: true; existing: boolean }
+  | { ok: false; reason: 'instance_capacity' | 'daily_admission_budget' };
+
+export class TelemetryDb {
+  private readonly db: Database;
+  readonly retentionDays: number;
+  readonly maxInstances: number;
+  readonly newInstancesPerDay: number;
+  /** What the boot-time migration did. Surfaced on the operator metrics route. */
+  readonly migration: MigrationReport;
+
+  private readonly stmtUpsertInstance: Statement;
+  private readonly stmtUpsertHeartbeat: Statement;
+  private readonly stmtGetInstance: Statement<InstanceRow, [string, string]>;
+  private readonly stmtCountInstances: Statement<{ n: number }, []>;
+  private readonly stmtCountNewToday: Statement<{ n: number }, [string]>;
+  private readonly stmtCountHeartbeats: Statement<{ n: number }, [string, string]>;
+  private readonly stmtHeartbeatsAsc: Statement<HeartbeatRow, [string, string]>;
+  private readonly stmtHeartbeatsRecent: Statement<HeartbeatRow, [string, string, number]>;
+  private readonly stmtDeleteHeartbeats: Statement;
+  private readonly stmtDeleteInstance: Statement;
+  private readonly stmtPrune: Statement;
+  private readonly stmtAggregate: Statement<ProductAggregate, [string]>;
+
+  constructor(config: TelemetryDbConfig) {
+    this.retentionDays = config.retentionDays ?? DEFAULT_RETENTION_DAYS;
+    this.maxInstances = config.maxInstances ?? DEFAULT_MAX_INSTANCES;
+    this.newInstancesPerDay = config.newInstancesPerDay ?? DEFAULT_NEW_INSTANCES_PER_DAY;
+    this.db = new Database(config.path, { create: true });
+    this.db.exec('PRAGMA journal_mode = WAL;');
+    this.db.exec('PRAGMA busy_timeout = 5000;');
+
+    // Every statement below is prepared AFTER the migration, because the
+    // migration drops and renames the tables they reference.
+    this.migration = migrate(this.db);
+
+    this.stmtUpsertInstance = this.db.query(`
+      INSERT INTO instances (instance_id, product, first_seen_day, last_seen_day)
+      VALUES (?1, ?2, ?3, ?3)
+      ON CONFLICT(instance_id, product) DO UPDATE SET
+        last_seen_day = MAX(instances.last_seen_day, excluded.last_seen_day)
+    `);
+    this.stmtUpsertHeartbeat = this.db.query(`
+      INSERT INTO heartbeats (instance_id, product, day, schema_version, payload, received_day)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      ON CONFLICT(instance_id, product, day) DO UPDATE SET
+        schema_version = excluded.schema_version,
+        payload = excluded.payload,
+        received_day = excluded.received_day
+    `);
+    this.stmtGetInstance = this.db.query(
+      'SELECT instance_id, product, first_seen_day, last_seen_day FROM instances WHERE instance_id = ?1 AND product = ?2',
+    );
+    this.stmtCountInstances = this.db.query('SELECT COUNT(*) AS n FROM instances');
+    this.stmtCountNewToday = this.db.query('SELECT COUNT(*) AS n FROM instances WHERE first_seen_day = ?1');
+    this.stmtCountHeartbeats = this.db.query(
+      'SELECT COUNT(*) AS n FROM heartbeats WHERE instance_id = ?1 AND product = ?2',
+    );
+    this.stmtHeartbeatsAsc = this.db.query(
+      'SELECT day, schema_version, payload, received_day FROM heartbeats WHERE instance_id = ?1 AND product = ?2 ORDER BY day ASC',
+    );
+    this.stmtHeartbeatsRecent = this.db.query(`
+      SELECT day, schema_version, payload, received_day FROM (
+        SELECT day, schema_version, payload, received_day
+        FROM heartbeats WHERE instance_id = ?1 AND product = ?2 ORDER BY day DESC LIMIT ?3
+      ) ORDER BY day ASC
+    `);
+    // Deletion is per IDENTITY, across every product. The secret proves
+    // ownership of the id itself, and erasure that left rows behind under some
+    // other product would be erasure in name only.
+    this.stmtDeleteHeartbeats = this.db.query('DELETE FROM heartbeats WHERE instance_id = ?1');
+    this.stmtDeleteInstance = this.db.query('DELETE FROM instances WHERE instance_id = ?1');
+    this.stmtPrune = this.db.query(`
+      DELETE FROM heartbeats WHERE (instance_id, product, day) IN (
+        SELECT instance_id, product, day FROM (
+          SELECT instance_id, product, day,
+                 ROW_NUMBER() OVER (PARTITION BY instance_id, product ORDER BY day DESC) AS rn
+          FROM heartbeats
+        ) WHERE rn > ?1
+      )
+    `);
+    this.stmtAggregate = this.db.query(`
+      SELECT i.product                                                AS product,
+             COUNT(*)                                                 AS installs_seen,
+             SUM(CASE WHEN i.last_seen_day >= ?1 THEN 1 ELSE 0 END)   AS installs_active,
+             COALESCE((SELECT COUNT(*) FROM heartbeats h WHERE h.product = i.product), 0) AS days_reported
+      FROM instances i
+      GROUP BY i.product
+      ORDER BY i.product ASC
+    `);
+  }
+
+  /** Current journal mode (test hook: file-backed databases must report 'wal'). */
+  journalMode(): string {
+    const row = this.db.query<{ journal_mode: string }, []>('PRAGMA journal_mode').get();
+    return row?.journal_mode ?? '';
+  }
+
+  /**
+   * Admission control for a heartbeat write.
+   *
+   * An identity that already exists is always admitted — established installs
+   * must never be throttled by a flood of fresh ones. A never-seen identity is
+   * admitted only while BOTH budgets hold:
+   *
+   *   • the absolute ceiling (`maxInstances`) — total storage bound;
+   *   • the daily budget (`newInstancesPerDay`) — how fast the ceiling may be
+   *     approached.
+   *
+   * The daily budget is derived from `first_seen_day` rather than kept in
+   * memory, so it survives a restart and is shared by every replica reading
+   * the same database. Its honest limit is stated in the README: it converts
+   * "one flood permanently exhausts the ceiling" into "one flood exhausts one
+   * day's budget". It does not remove the lever.
+   */
+  admit(instanceId: string, product: string, today: string): Admission {
+    if (this.stmtGetInstance.get(instanceId, product)) return { ok: true, existing: true };
+    if ((this.stmtCountInstances.get()?.n ?? 0) >= this.maxInstances) {
+      return { ok: false, reason: 'instance_capacity' };
+    }
+    if (this.newInstancesPerDay > 0 && (this.stmtCountNewToday.get(today)?.n ?? 0) >= this.newInstancesPerDay) {
+      return { ok: false, reason: 'daily_admission_budget' };
+    }
+    return { ok: true, existing: false };
+  }
+
+  /** True when this identity already has an instances row for that product. */
+  isKnownInstance(instanceId: string, product: string): boolean {
+    return this.stmtGetInstance.get(instanceId, product) !== null;
+  }
+
+  /** Upsert one heartbeat, last-write-wins per (instance_id, product, day). */
+  upsertHeartbeat(
+    instanceId: string,
+    product: string,
+    day: string,
+    wireVersion: number,
+    payloadJson: string,
+    receivedDay: string,
+  ): void {
+    const tx = this.db.transaction(() => {
+      this.stmtUpsertInstance.run(instanceId, product, receivedDay);
+      this.stmtUpsertHeartbeat.run(instanceId, product, day, wireVersion, payloadJson, receivedDay);
+    });
+    tx();
+  }
+
+  getInstance(instanceId: string, product: string): InstanceRow | null {
+    return this.stmtGetInstance.get(instanceId, product) ?? null;
+  }
+
+  countHeartbeats(instanceId: string, product: string): number {
+    return this.stmtCountHeartbeats.get(instanceId, product)?.n ?? 0;
+  }
+
+  countInstances(): number {
+    return this.stmtCountInstances.get()?.n ?? 0;
+  }
+
+  countNewInstancesOnDay(day: string): number {
+    return this.stmtCountNewToday.get(day)?.n ?? 0;
+  }
+
+  /** Day-ascending heartbeat rows; `recentDays` trims to the most recent N (still ascending). */
+  getHeartbeats(instanceId: string, product: string, recentDays?: number): HeartbeatRow[] {
+    if (recentDays !== undefined) return this.stmtHeartbeatsRecent.all(instanceId, product, recentDays);
+    return this.stmtHeartbeatsAsc.all(instanceId, product);
+  }
+
+  /** Idempotent purge of one identity across EVERY product. */
+  deleteInstance(instanceId: string): void {
+    const tx = this.db.transaction(() => {
+      this.stmtDeleteHeartbeats.run(instanceId);
+      this.stmtDeleteInstance.run(instanceId);
+    });
+    tx();
+  }
+
+  /** Per-(instance, product) row cap: drop everything older than the newest retentionDays rows. */
+  pruneRetention(): number {
+    return this.stmtPrune.run(this.retentionDays).changes;
+  }
+
+  /**
+   * Per-product aggregate counts for the public give-back page.
+   *
+   * Per product ONLY. There is no identifier joining an installation across
+   * products — each derives its own — so a family-wide figure cannot be
+   * computed without double-counting anyone running two products. This method
+   * deliberately offers no total; see `page.ts` and the README.
+   */
+  aggregates(activeSinceDay: string): ProductAggregate[] {
+    return this.stmtAggregate.all(activeSinceDay);
+  }
+
+  close(): void {
+    this.db.close();
+  }
+}

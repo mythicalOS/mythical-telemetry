@@ -1,0 +1,13 @@
+{
+  "name": "collector",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Heartbeat ingest service. Deployed, never published — see README.md.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "start": "bun run src/cli/server.ts",
+    "test": "bun test tests",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  }
+}
