@@ -30,7 +30,6 @@
 // control on never-seen identities (see `admit`).
 
 import { Database, type Statement } from 'bun:sqlite';
-import { shiftDay, todayUtc } from './day';
 import { migrate, type MigrationReport } from './migrate';
 
 export const DEFAULT_RETENTION_DAYS = 400;
@@ -46,8 +45,6 @@ export interface TelemetryDbConfig {
   maxInstances?: number;
   /** Global budget on identities admitted for the FIRST time on one UTC day. */
   newInstancesPerDay?: number;
-  /** Injected clock: current UTC day. Used for the retention cutoff. */
-  nowUtcDay?: () => string;
 }
 
 export interface InstanceRow {
@@ -80,7 +77,6 @@ export class TelemetryDb {
   readonly retentionDays: number;
   readonly maxInstances: number;
   readonly newInstancesPerDay: number;
-  private readonly nowUtcDay: () => string;
   /** What the boot-time migration did. Surfaced on the operator metrics route. */
   readonly migration: MigrationReport;
 
@@ -90,7 +86,6 @@ export class TelemetryDb {
   private readonly stmtCountInstances: Statement<{ n: number }, []>;
   private readonly stmtAdmittedOnDay: Statement<{ admitted: number }, [string]>;
   private readonly stmtBumpAdmissions: Statement;
-  private readonly stmtPruneAdmissions: Statement;
   private readonly stmtCountHeartbeats: Statement<{ n: number }, [string, string]>;
   private readonly stmtHeartbeatsAsc: Statement<HeartbeatRow, [string, string]>;
   private readonly stmtHeartbeatsRecent: Statement<HeartbeatRow, [string, string, number]>;
@@ -103,14 +98,12 @@ export class TelemetryDb {
     this.retentionDays = config.retentionDays ?? DEFAULT_RETENTION_DAYS;
     // A retention of zero is refused rather than honoured. `pruneRetention`
     // runs at boot and daily; at zero it would delete every heartbeat on the
-    // next tick, and would erase the current day from the admission ledger —
-    // handing the daily budget back on every restart. "Store nothing" is not a
-    // supported configuration, and silently doing it would be worse.
+    // next tick. "Store nothing" is not a supported configuration, and
+    // silently doing it would be worse than saying so.
     if (!Number.isInteger(this.retentionDays) || this.retentionDays < 1) {
       throw new Error(`retentionDays must be an integer of at least 1, got: ${String(config.retentionDays)}`);
     }
     this.maxInstances = config.maxInstances ?? DEFAULT_MAX_INSTANCES;
-    this.nowUtcDay = config.nowUtcDay ?? todayUtc;
     this.newInstancesPerDay = config.newInstancesPerDay ?? DEFAULT_NEW_INSTANCES_PER_DAY;
     this.db = new Database(config.path, { create: true });
     this.db.exec('PRAGMA journal_mode = WAL;');
@@ -143,11 +136,6 @@ export class TelemetryDb {
       INSERT INTO admissions (day, admitted) VALUES (?1, 1)
       ON CONFLICT(day) DO UPDATE SET admitted = admissions.admitted + 1
     `);
-    // Pruned by an explicit DATE CUTOFF, never by row count. A row-count trim
-    // can delete the current day's row whenever it is not among the newest N —
-    // including when N is small, or when a clock skew leaves a future-dated row
-    // ahead of it — and losing today's row hands back today's budget.
-    this.stmtPruneAdmissions = this.db.query('DELETE FROM admissions WHERE day < ?1');
     this.stmtCountHeartbeats = this.db.query(
       'SELECT COUNT(*) AS n FROM heartbeats WHERE instance_id = ?1 AND product = ?2',
     );
@@ -301,15 +289,19 @@ export class TelemetryDb {
 
   /**
    * Per-(instance, product) row cap: drop everything older than the newest
-   * retentionDays rows. Also trims the admission ledger to the same horizon —
-   * it is one row per day, but unbounded is still unbounded.
+   * retentionDays rows.
+   *
+   * THE ADMISSION LEDGER IS DELIBERATELY NOT PRUNED. It holds one small row per
+   * UTC day the service has ever seen — a few tens of kilobytes per decade,
+   * next to nothing beside the heartbeat rows — and deleting from it is the
+   * only operation that can hand back a spent budget. A prune driven by the
+   * system clock reintroduces exactly that: jump the clock forward past the
+   * horizon, let the prune drop a day, then move it back, and that day's budget
+   * is fresh again. Not pruning removes the whole class for a cost that does
+   * not matter.
    */
   pruneRetention(): number {
-    const pruned = this.stmtPrune.run(this.retentionDays).changes;
-    // Cutoff is strictly in the past, so the current day — and any
-    // future-dated row a clock skew produced — always survives.
-    this.stmtPruneAdmissions.run(shiftDay(this.nowUtcDay(), -this.retentionDays));
-    return pruned;
+    return this.stmtPrune.run(this.retentionDays).changes;
   }
 
   /**

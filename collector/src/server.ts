@@ -5,6 +5,9 @@
 //   POST   /v1/ingest                  secret + derived-identity (constant-time)
 //   GET    /v1/instances/:uuid/stats   secret + derived-identity  ← G6: reads are authenticated
 //   DELETE /v1/instances/:uuid         secret + derived-identity; purges EVERY product
+//
+// Every one of those three is per-source throttled, because anyone can mint a
+// valid (secret, id) pair — an authenticated request is not a scarce one here.
 //   GET    /v1/stats                   public, AGGREGATE ONLY
 //   GET    /                           public, aggregate give-back page
 //   GET    /v1/schema                  the published JSON Schema, when the operator wired one
@@ -393,7 +396,7 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
    * unauthenticated caller therefore cannot distinguish "this id exists" from
    * "this id does not", because neither answer is ever reached.
    */
-  function handleStats(uuid: string, url: URL, req: Request): Response {
+  function handleStats(uuid: string, url: URL, req: Request, server?: ServerLike): Response {
     if (!UUID_V4_RE.test(uuid)) {
       counters.inc('read_stats_unauthorized');
       return json(403, { ok: false, error: 'unauthorized' });
@@ -408,6 +411,16 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
     if (!authorizesInstance(readSecret(req), uuid)) {
       counters.inc('read_stats_unauthorized');
       return json(403, { ok: false, error: 'unauthorized' });
+    }
+
+    // Throttled AFTER the identity proof and BEFORE any database work. Anyone
+    // can mint valid (secret, id) pairs, so an authenticated request is not a
+    // scarce one — without this, unlimited reads reach the store while costing
+    // the caller nothing. Proving identity is a single hash and stays cheap,
+    // so it is safe to do first.
+    if (!limiter.allow(resolveSourceKey(req, server, trustedProxyHops, trustedProxies))) {
+      counters.inc('read_stats_rate_limited');
+      return json(429, { ok: false, error: 'rate_limited' });
     }
 
     let recentDays: number | undefined;
@@ -437,7 +450,7 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
    * reject, (2) stateless secret check with NO database read, (3) idempotent
    * purge ⇒ 204 whether rows existed or not.
    */
-  function handleDelete(uuid: string, req: Request): Response {
+  function handleDelete(uuid: string, req: Request, server?: ServerLike): Response {
     if (!UUID_V4_RE.test(uuid)) {
       counters.inc('delete_unauthorized');
       return json(403, { ok: false, error: 'unauthorized' });
@@ -445,6 +458,13 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
     if (!authorizesInstance(readSecret(req), uuid)) {
       counters.inc('delete_unauthorized');
       return json(403, { ok: false, error: 'unauthorized' });
+    }
+    // Same reasoning as the read route, and more pressing: every delete opens
+    // a write transaction, so an unthrottled stream of no-op purges is lock
+    // pressure on the whole service for the price of a hash per request.
+    if (!limiter.allow(resolveSourceKey(req, server, trustedProxyHops, trustedProxies))) {
+      counters.inc('delete_rate_limited');
+      return json(429, { ok: false, error: 'rate_limited' });
     }
     db.deleteInstance(uuid);
     counters.inc('delete_ok');
@@ -547,10 +567,10 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
       if (path === '/v1/ingest' && req.method === 'POST') return handleIngest(req, server);
 
       const statsMatch = /^\/v1\/instances\/([^/]+)\/stats$/.exec(path);
-      if (statsMatch && req.method === 'GET') return handleStats(statsMatch[1] ?? '', url, req);
+      if (statsMatch && req.method === 'GET') return handleStats(statsMatch[1] ?? '', url, req, server);
 
       const instanceMatch = /^\/v1\/instances\/([^/]+)$/.exec(path);
-      if (instanceMatch && req.method === 'DELETE') return handleDelete(instanceMatch[1] ?? '', req);
+      if (instanceMatch && req.method === 'DELETE') return handleDelete(instanceMatch[1] ?? '', req, server);
 
       return json(404, { ok: false, error: 'not_found' });
     } catch {

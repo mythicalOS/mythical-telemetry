@@ -274,6 +274,91 @@ describe('TokenBucketLimiter memory bound', () => {
   });
 });
 
+describe('authenticated reads and deletes are throttled too', () => {
+  // Anyone can mint a valid (secret, id) pair, so an authenticated request is
+  // not a scarce one. Without a per-source budget on these routes, unlimited
+  // reads and no-op purges reach the store for the price of a hash.
+  test('a flood of authenticated reads from one source exhausts its bucket', async () => {
+    const h = makeHarness({ rateLimitPerMin: 2 });
+    const src = h.serverFor('198.51.100.7');
+    await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A), src);
+
+    const read = () =>
+      h.handler(
+        new Request(`http://telemetry.local/v1/instances/${INSTANCE_A}/stats?product=brokkr`, {
+          headers: { 'x-mythical-instance-secret': SECRET_A },
+        }),
+        src,
+      );
+    expect((await read()).status).toBe(200);
+    const limited = await read();
+    expect(limited.status).toBe(429);
+    expect(await limited.json()).toEqual({ ok: false, error: 'rate_limited' });
+    expect(h.counters.get('read_stats_rate_limited')).toBe(1);
+  });
+
+  test('a flood of no-op deletes from one source exhausts its bucket', async () => {
+    const h = makeHarness({ rateLimitPerMin: 2 });
+    const src = h.serverFor('198.51.100.7');
+    const purge = () =>
+      h.handler(
+        new Request(`http://telemetry.local/v1/instances/${INSTANCE_C}`, {
+          method: 'DELETE',
+          headers: { 'x-mythical-instance-secret': SECRET_C },
+        }),
+        src,
+      );
+    expect((await purge()).status).toBe(204);
+    expect((await purge()).status).toBe(204);
+    const limited = await purge();
+    expect(limited.status).toBe(429);
+    expect(h.counters.get('delete_rate_limited')).toBe(1);
+  });
+
+  test('the throttle sits AFTER the identity proof, so it cannot mask a 403', async () => {
+    const h = makeHarness({ rateLimitPerMin: 1 });
+    const src = h.serverFor('198.51.100.7');
+    await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A), src); // spends the token
+    // An unauthenticated caller still gets 403, not 429 — the answer must not
+    // depend on someone else's traffic.
+    const r = await h.handler(
+      new Request(`http://telemetry.local/v1/instances/${INSTANCE_A}/stats?product=brokkr`),
+      src,
+    );
+    expect(r.status).toBe(403);
+    expect(h.counters.get('read_stats_unauthorized')).toBe(1);
+    expect(h.counters.get('read_stats_rate_limited')).toBe(0);
+  });
+
+  test('a different source is unaffected, and the bucket refills', async () => {
+    const h = makeHarness({ rateLimitPerMin: 1 });
+    const a = h.serverFor('198.51.100.7');
+    const b = h.serverFor('203.0.113.9');
+    const purge = (server: ReturnType<typeof h.serverFor>) =>
+      h.handler(
+        new Request(`http://telemetry.local/v1/instances/${INSTANCE_C}`, {
+          method: 'DELETE',
+          headers: { 'x-mythical-instance-secret': SECRET_C },
+        }),
+        server,
+      );
+    expect((await purge(a)).status).toBe(204);
+    expect((await purge(a)).status).toBe(429);
+    expect((await purge(b)).status).toBe(204);
+    h.advanceMs(61_000);
+    expect((await purge(a)).status).toBe(204);
+  });
+
+  test('the public aggregate is not throttled — it touches no per-installation data', async () => {
+    const h = makeHarness({ rateLimitPerMin: 1, minAggregateCell: 1 });
+    const src = h.serverFor('198.51.100.7');
+    for (let i = 0; i < 5; i++) {
+      expect((await h.handler(getReq('/v1/stats'), src)).status).toBe(200);
+      expect((await h.handler(getReq('/healthz'), src)).status).toBe(200);
+    }
+  });
+});
+
 describe('the operator metrics surface', () => {
   test('the route does not exist unless a key is configured', async () => {
     const h = makeHarness();

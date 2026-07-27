@@ -63,6 +63,37 @@ describe('parseIp', () => {
     expect(parseIp('fe80::1%a:b')).toBeNull();
   });
 
+  test('a leading-zero IPv4 octet is REJECTED, not normalized', () => {
+    // `010.0.0.1` is decimal here and OCTAL to some resolvers and C libraries,
+    // so the same text names two different hosts. An allowlist entry that
+    // means different things to different readers must not parse at all.
+    for (const bad of ['010.0.0.1', '10.00.0.1', '10.0.0.01', '0010.0.0.1', '192.168.010.1']) {
+      expect(parseIp(bad), bad).toBeNull();
+    }
+    // A bare zero octet is still fine.
+    expect(hex(parseIp('10.0.0.0'))).toBe('0a000000');
+    expect(hex(parseIp('0.0.0.0'))).toBe('00000000');
+  });
+
+  test('`::` must compress AT LEAST one group', () => {
+    // Otherwise malformed text quietly becomes a real address.
+    expect(parseIp('1:2:3:4:5:6:7:8::')).toBeNull();
+    expect(parseIp('::1:2:3:4:5:6:7:8')).toBeNull();
+    expect(parseIp('1:2:3:4::5:6:7:8')).toBeNull();
+    // Compressing exactly one group is legal.
+    expect(hex(parseIp('1:2:3:4:5:6:7::'))).toBe('00010002000300040005000600070000');
+    expect(hex(parseIp('::2:3:4:5:6:7:8'))).toBe('00000002000300040005000600070008');
+  });
+
+  test('a malformed allowlist entry cannot become an unintended trusted range', () => {
+    // This is the CRITICAL direction: a false positive here means
+    // X-Forwarded-For is believed from someone who is not a proxy.
+    for (const bad of ['010.0.0.0/8', '1:2:3:4:5:6:7:8::/64', '2001:db8:192.0.2.1::/48']) {
+      expect(parseCidr(bad), bad).toBeNull();
+      expect(() => parseTrustedProxies([bad]), bad).toThrow();
+    }
+  });
+
   test('trims surrounding whitespace', () => {
     expect(hex(parseIp('  10.0.0.1  '))).toBe('0a000001');
   });

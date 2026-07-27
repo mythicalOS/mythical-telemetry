@@ -265,37 +265,41 @@ describe('admission control — the decision and the write are one transaction',
     db.close();
   });
 
-  test('the ledger is trimmed by a DATE CUTOFF, and today always survives it', () => {
-    // A row-count trim could drop the current day's row and hand back the
-    // whole day's budget on the next prune.
-    const db = new TelemetryDb({
-      path: ':memory:',
-      retentionDays: 2,
-      nowUtcDay: () => '2026-07-04',
-    });
-    for (const day of ['2026-07-01', '2026-07-02', '2026-07-03', '2026-07-04']) {
-      db.recordHeartbeat(`id-${day}`, 'brokkr', day, 2, payload(day), day);
+  test('the ledger is NEVER pruned, so no clock movement can hand back a spent budget', () => {
+    // Pruning it is the only operation that can free budget, and a
+    // clock-driven prune is exactly the lever: jump forward past the horizon,
+    // let the prune drop a day, move back, and that day is fresh again.
+    const db = new TelemetryDb({ path: ':memory:', retentionDays: 1, newInstancesPerDay: 1 });
+    db.recordHeartbeat('id-1', 'brokkr', '2026-07-09', 2, payload('a'), '2026-07-09');
+    for (const day of ['2026-07-10', '2026-07-11', '2027-01-01', '2030-01-01']) {
+      db.recordHeartbeat(`id-${day}`, 'brokkr', day, 2, payload('a'), day);
     }
-    expect(db.admittedOnDay('2026-07-01')).toBe(1);
     db.pruneRetention();
-    expect(db.admittedOnDay('2026-07-01')).toBe(0); // older than the cutoff
-    expect(db.admittedOnDay('2026-07-02')).toBe(1); // exactly at the cutoff
-    expect(db.admittedOnDay('2026-07-04')).toBe(1); // today, always kept
+    db.pruneRetention();
+    // The original day's row is still there, however far the clock has moved.
+    expect(db.admittedOnDay('2026-07-09')).toBe(1);
+    expect(db.recordHeartbeat('id-2', 'brokkr', '2026-07-09', 2, payload('a'), '2026-07-09')).toEqual({
+      ok: false,
+      reason: 'daily_admission_budget',
+    });
     db.close();
   });
 
-  test('a future-dated row (clock skew) is not pruned either', () => {
-    const db = new TelemetryDb({ path: ':memory:', retentionDays: 1, nowUtcDay: () => '2026-07-04' });
-    db.recordHeartbeat('id-future', 'brokkr', '2026-07-04', 2, payload('x'), '2026-08-01');
-    db.pruneRetention();
-    expect(db.admittedOnDay('2026-08-01')).toBe(1);
+  test('heartbeat rows ARE pruned while the ledger stays', () => {
+    const db = new TelemetryDb({ path: ':memory:', retentionDays: 2 });
+    for (const day of ['2026-07-01', '2026-07-02', '2026-07-03', '2026-07-04']) {
+      db.recordHeartbeat('id-1', 'brokkr', day, 2, payload(day), day);
+    }
+    expect(db.pruneRetention()).toBe(2);
+    expect(db.getHeartbeats('id-1', 'brokkr').map((r) => r.day)).toEqual(['2026-07-03', '2026-07-04']);
+    expect(db.admittedOnDay('2026-07-01')).toBe(1);
     db.close();
   });
 
   test('a retention of zero is REFUSED, not honoured', () => {
-    // Honouring it would delete every heartbeat on the next prune and erase
-    // the current day from the ledger, handing back the daily budget on every
-    // restart.
+    // Honouring it would delete every heartbeat on the next prune — "store
+    // nothing" is not a supported configuration, and silently doing it would
+    // be worse than saying so.
     expect(() => new TelemetryDb({ path: ':memory:', retentionDays: 0 })).toThrow(/at least 1/);
     expect(() => new TelemetryDb({ path: ':memory:', retentionDays: -5 })).toThrow(/at least 1/);
     expect(() => new TelemetryDb({ path: ':memory:', retentionDays: 1.5 })).toThrow(/at least 1/);
@@ -306,7 +310,6 @@ describe('admission control — the decision and the write are one transaction',
       path: ':memory:',
       retentionDays: 1,
       newInstancesPerDay: 1,
-      nowUtcDay: () => '2026-07-09',
     });
     db.recordHeartbeat('id-1', 'brokkr', '2026-07-09', 2, payload('a'), '2026-07-09');
     db.pruneRetention(); // as the boot path does

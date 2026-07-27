@@ -41,11 +41,13 @@ export const COUNTER_NAMES = [
   // reads
   'read_stats_ok',
   'read_stats_unauthorized',
+  'read_stats_rate_limited',
   'read_stats_unknown',
   'read_aggregate_ok',
   // deletes
   'delete_ok',
   'delete_unauthorized',
+  'delete_rate_limited',
   // service
   'internal_error',
 ] as const;

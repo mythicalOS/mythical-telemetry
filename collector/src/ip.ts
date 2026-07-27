@@ -25,6 +25,12 @@ function parseIpv4(text: string): Uint8Array | null {
   for (let i = 0; i < 4; i++) {
     const part = parts[i];
     if (part === undefined || !/^\d{1,3}$/.test(part)) return null;
+    // A LEADING ZERO is rejected, not normalized. `010.0.0.1` is read as
+    // decimal here and as OCTAL by some resolvers and C libraries, so the same
+    // text can name two different hosts. In an allowlist that decides whether
+    // to believe a header, an address that means different things to different
+    // readers must not be accepted at all.
+    if (part.length > 1 && part.startsWith('0')) return null;
     const n = Number(part);
     if (n > 255) return null;
     out[i] = n;
@@ -112,7 +118,10 @@ export function parseIp(text: string): Uint8Array | null {
   let hextets: number[];
   if (doubleColon >= 0) {
     const fill = 8 - headValues.length - tailValues.length;
-    if (fill < 0) return null;
+    // `::` must compress AT LEAST ONE zero group. A `::` that expands to
+    // nothing (`1:2:3:4:5:6:7:8::`) is not a valid address, and accepting it
+    // would silently turn malformed text into a real one.
+    if (fill < 1) return null;
     hextets = [...headValues, ...new Array<number>(fill).fill(0), ...tailValues];
   } else {
     hextets = headValues;

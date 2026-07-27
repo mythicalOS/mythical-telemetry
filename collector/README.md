@@ -68,6 +68,11 @@ open to anyone holding the id, and the unauthenticated per-installation page tha
 | `/v1/ingest` | POST | instance secret | v1 and v2 accepted; 32 KB body cap; day window (≤ today UTC, ≥ today−30); upsert per (instance, product, day), last write wins; `202 {ok:true}` |
 | `/v1/instances/<uuid>/stats?product=<name>` | GET | instance secret | that installation's own days and totals; optional `&days=N` (1–400) |
 | `/v1/instances/<uuid>` | DELETE | instance secret | purges the identity across **every** product; idempotent `204` |
+
+All three authenticated routes share one per-source budget. Anyone can mint a valid (secret, id)
+pair, so an authenticated request is not a scarce one — an unthrottled read or no-op purge would
+reach the database for the price of a hash. The throttle sits **after** the identity proof, so a
+403 never depends on someone else's traffic.
 | `/v1/stats` | GET | none | per-product aggregate, small-cell suppressed |
 | `/` | GET | none | the aggregate give-back page |
 | `/v1/schema` | GET | none | the published JSON Schema, when the operator wired one; otherwise absent |
@@ -201,7 +206,13 @@ header, an implausible value — falls back to the peer address, never to a head
 An IPv4-mapped IPv6 peer (`::ffff:10.0.0.1`, which is what a dual-stack listener commonly reports)
 matches an IPv4 CIDR, so you do not have to write your ranges twice. Throttle buckets are keyed by
 an address's canonical bytes, so one source cannot spell itself two ways, and a value that does not
-parse as an address gets no bucket at all. A malformed entry in the list
+parse as an address gets no bucket at all.
+
+The address parser is deliberately strict, because in an allowlist a false positive means the
+header is believed from someone who is not a proxy. It **rejects** — rather than normalizes —
+leading-zero IPv4 octets (`010.0.0.1` is decimal here and octal to some resolvers, so the same text
+names two hosts), a `::` that compresses nothing, an embedded IPv4 anywhere but the final group, and
+a malformed or repeated zone id. Write your ranges in canonical form. A malformed entry in the list
 fails at boot with the offending text rather than being skipped — a silently dropped proxy means
 the header is ignored and your whole population shares one bucket, which looks like a capacity
 problem rather than a configuration one.
@@ -291,7 +302,7 @@ volumes:
 | `MYTHICAL_TELEMETRY_DB_PATH` | `/data/telemetry.db` | bun:sqlite database (WAL) |
 | `MYTHICAL_TELEMETRY_PORT` | `7910` | bind port |
 | `MYTHICAL_TELEMETRY_MAX_BODY` | `32768` | ingest body cap in bytes → `413` |
-| `MYTHICAL_TELEMETRY_RATE_LIMIT_PER_MIN` | `60` | per-source token bucket → `429` (in-memory only) |
+| `MYTHICAL_TELEMETRY_RATE_LIMIT_PER_MIN` | `60` | per-source token bucket across ingest, reads and deletes → `429` (in-memory only) |
 | `MYTHICAL_TELEMETRY_NEW_INSTANCE_PER_SOURCE_PER_HOUR` | `20` | per-source budget for FRESH identities |
 | `MYTHICAL_TELEMETRY_NEW_INSTANCES_PER_DAY` | `5000` | global daily budget for fresh identities (0 disables) |
 | `MYTHICAL_TELEMETRY_MAX_INSTANCES` | `100000` | absolute ceiling on stored identities |
@@ -327,10 +338,15 @@ Up to `MYTHICAL_TELEMETRY_RETENTION_DAYS` daily rows per (instance, product), pr
 whatever you configure in your privacy notice; it is a published property, not an implementation
 detail.
 
-The same prune trims the admission ledger, by a **date cutoff** rather than a row count: the
-current day's row must survive, or a restart would hand back that day's budget. A retention of `0`
-is refused at startup for the same reason — "store nothing" is not a supported configuration, and
-silently doing it would be worse than saying so.
+**The admission ledger is deliberately never pruned.** It is one small row per UTC day the service
+has ever seen — a few tens of kilobytes per decade, nothing beside the heartbeat rows — and
+deleting from it is the only operation that can hand back a spent budget. Any clock-driven prune
+reintroduces exactly that: jump the clock past the horizon, let the prune drop a day, move it back,
+and that day's budget is fresh. Not pruning removes the whole class for a cost that does not
+matter.
+
+A retention of `0` is refused at startup: "store nothing" is not a supported configuration, and
+silently deleting every heartbeat on the next prune would be worse than saying so.
 
 ## Deleting your data
 
