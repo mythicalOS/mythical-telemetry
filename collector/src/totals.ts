@@ -70,6 +70,11 @@ const SPECS: Readonly<Record<string, readonly TotalSpec[]>> = {
   skuld: SKULD_SPECS,
 };
 
+/** Sort key for a possibly-unrepresentable count: null outranks every number. */
+function rank(sessions: number | null): number {
+  return sessions === null ? Number.MAX_VALUE : sessions;
+}
+
 /** Walk a path without throwing on anything. */
 function dig(root: unknown, path: readonly string[]): unknown {
   let node: unknown = root;
@@ -106,7 +111,13 @@ function scalar(value: unknown): number | string | boolean | null {
   return null;
 }
 
-export type TotalsValue = number | string | boolean | null | Array<{ name: string; sessions: number }>;
+/** A model's share of the window. `sessions` is null when the sum is not representable. */
+export interface ModelTotal {
+  name: string;
+  sessions: number | null;
+}
+
+export type TotalsValue = number | string | boolean | null | ModelTotal[];
 
 /**
  * Fold a day-ascending window into that product's totals.
@@ -194,13 +205,20 @@ export function foldRates(product: string, rateDays: readonly unknown[]): Record
   return out;
 }
 
-/** Incremental mean — never forms the (possibly overflowing) total. */
+/**
+ * Incremental mean — never forms the (possibly overflowing) total.
+ *
+ * The division happens BEFORE the subtraction. The textbook `mean += (value -
+ * mean) / n` overflows on its own for mixed-sign inputs whose mean is
+ * perfectly representable, because `value - mean` can exceed the range even
+ * when the result would not.
+ */
 function runningMean(days: readonly unknown[], valueOf: (day: unknown) => number): number {
   let mean = 0;
   let n = 0;
   for (const day of days) {
     n += 1;
-    mean += (valueOf(day) - mean) / n;
+    mean += valueOf(day) / n - mean / n;
   }
   return mean;
 }
@@ -221,8 +239,12 @@ function foldSpineTokensSaved(days: readonly unknown[]): number {
   return saved;
 }
 
-/** Merge `metrics.models[]` across days into one name → sessions table, busiest first. */
-function foldModels(days: readonly unknown[]): Array<{ name: string; sessions: number }> {
+/**
+ * Merge `metrics.models[]` across days into one name → sessions table, busiest
+ * first. An unrepresentable sum is null, never 0 — "too large to state" and
+ * "no sessions" are opposite claims.
+ */
+function foldModels(days: readonly unknown[]): ModelTotal[] {
   const totals = new Map<string, number>();
   for (const day of days) {
     const models = dig(day, ['metrics', 'models']);
@@ -235,8 +257,10 @@ function foldModels(days: readonly unknown[]): Array<{ name: string; sessions: n
     }
   }
   return [...totals.entries()]
-    .map(([name, sessions]) => ({ name, sessions: Number.isFinite(sessions) ? sessions : 0 }))
-    .sort((a, b) => b.sessions - a.sessions || a.name.localeCompare(b.name));
+    .map(([name, sessions]) => ({ name, sessions: finite(sessions) }))
+    // Busiest first; an unrepresentable count sorts to the top, since it is
+    // larger than anything statable, and ties break by name for determinism.
+    .sort((a, b) => rank(b.sessions) - rank(a.sessions) || a.name.localeCompare(b.name));
 }
 
 /**

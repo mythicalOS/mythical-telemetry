@@ -464,6 +464,31 @@ describe('accumulated figures stay representable', () => {
     expect(rates['minutes']).toBe(4);
   });
 
+  test('an overflowing model count reports null, never 0', () => {
+    // "Too large to state" and "no sessions" are opposite claims.
+    const huge = { metrics: { models: [{ name: 'claude-sonnet-5', sessions: Number.MAX_VALUE }] } };
+    const models = foldTotals('brokkr', [huge, huge, huge])['models'] as any[];
+    expect(models).toEqual([{ name: 'claude-sonnet-5', sessions: null }]);
+  });
+
+  test('an unrepresentable model count sorts ahead of every statable one', () => {
+    const huge = { metrics: { models: [{ name: 'aaa', sessions: Number.MAX_VALUE }] } };
+    const small = { metrics: { models: [{ name: 'zzz', sessions: 9 }] } };
+    const models = foldTotals('brokkr', [huge, huge, huge, small])['models'] as any[];
+    expect(models.map((m) => m.name)).toEqual(['aaa', 'zzz']);
+  });
+
+  test('the running mean survives mixed-sign extremes whose mean IS representable', () => {
+    // The textbook `mean += (value - mean) / n` overflows here on its own,
+    // even though the answer is perfectly statable.
+    const at = (count: number) => ({ metrics: { sessions: { count } } });
+    const rates = foldRates('brokkr', [at(Number.MAX_VALUE), at(Number.MAX_VALUE), at(-Number.MAX_VALUE)])!;
+    const mean = rates['sessions'] as number;
+    expect(Number.isFinite(mean)).toBe(true);
+    // Within floating-point noise of the true mean, relatively speaking.
+    expect(Math.abs(mean - Number.MAX_VALUE / 3) / (Number.MAX_VALUE / 3)).toBeLessThan(1e-12);
+  });
+
   test('every emitted figure survives a JSON round trip as a number or an explicit null', () => {
     const days = [
       { metrics: { sessions: { count: 5, minutes: 50, failed: 1 }, spine: { tokens_before: 9, tokens_after: 4 } } },
@@ -472,6 +497,9 @@ describe('accumulated figures stay representable', () => {
     for (const value of Object.values(foldTotals('brokkr', days))) {
       expect(typeof value === 'number' || typeof value === 'boolean' || value === null || Array.isArray(value)).toBe(true);
       if (typeof value === 'number') expect(Number.isFinite(value)).toBe(true);
+      if (Array.isArray(value)) {
+        for (const m of value) expect(m.sessions === null || Number.isFinite(m.sessions)).toBe(true);
+      }
     }
     for (const value of Object.values(foldRates('brokkr', days)!)) {
       expect(value === null || Number.isFinite(value)).toBe(true);
