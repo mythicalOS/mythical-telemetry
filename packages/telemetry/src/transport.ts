@@ -401,7 +401,7 @@ export class Transport {
    * would be wrong in both directions: a destination absent from one day's records would look
    * "retired" and purge every other day's state for that kind.
    */
-  private async sendInternal(input: SendInput, opts: { fence: boolean }): Promise<SendReport> {
+  private async sendInternal(input: SendInput, opts: { fence: boolean; onlyExisting?: boolean }): Promise<SendReport> {
     assertDestinations(input);
 
     const centralDestination = normalizeDestinationUrl(input.central.url);
@@ -450,6 +450,7 @@ export class Transport {
             generation: centralGeneration,
             input: input.central,
             budget: budget.signal,
+            onlyExisting: opts.onlyExisting === true,
           }),
         ),
       ];
@@ -465,6 +466,7 @@ export class Transport {
               generation: copyGeneration,
               input: copyInput,
               budget: budget.signal,
+              onlyExisting: opts.onlyExisting === true,
             }),
           ),
         );
@@ -488,16 +490,33 @@ export class Transport {
    * midnight would never be revisited — the next tick sends the new day and the old record just
    * ages out of retention. Anything listed here still holds its payload and can be re-sent.
    */
-  unresolvedDays(input: { central: { url: string }; copy?: { url: string } | undefined; exceptDay?: string }): string[] {
+  unresolvedDays(input: {
+    central: { url: string };
+    copy?: { url: string } | undefined;
+    exceptDay?: string;
+    /** Only days that could actually be attempted right now. Default true. */
+    eligibleOnly?: boolean;
+  }): string[] {
     const wanted = new Map<DestinationKind, string>([["central", normalizeDestinationUrl(input.central.url)]]);
     if (input.copy !== undefined) wanted.set("copy", normalizeDestinationUrl(input.copy.url));
 
+    const state = this.load();
+    const now = this.opts.nowMs();
     const days = new Set<string>();
-    for (const rec of Object.values(this.load().records)) {
+    for (const rec of Object.values(state.records)) {
       if (rec.status !== "pending") continue;
       if (rec.day === input.exceptDay) continue;
       if (wanted.get(rec.kind) !== rec.destination) continue;
       if (rec.body === undefined) continue; // nothing to re-send; a rebuild is impossible
+      if (input.eligibleOnly !== false) {
+        // A day still in backoff, or behind an open breaker, cannot be attempted — and if it were
+        // counted anyway it would consume the drain cap on every tick, starving NEWER days that
+        // ARE eligible until they aged out of retention unsent. That is the same silent loss the
+        // drain exists to prevent, one level up.
+        if (rec.next_attempt_at !== null && Date.parse(rec.next_attempt_at) > now) continue;
+        const breaker = state.breakers[breakerKey(rec.kind, rec.destination)];
+        if (breaker?.open_until != null && Date.parse(breaker.open_until) > now) continue;
+      }
       days.add(rec.day);
     }
     return [...days].sort();
@@ -517,7 +536,35 @@ export class Transport {
     /** Cap on days drained per call, so a long outage does not turn one tick into a burst. */
     maxDays?: number;
   }): Promise<SendReport[]> {
-    if (!isSendPermitted(input.consent)) return [];
+    if (!isSendPermitted(input.consent)) {
+      // A drain is a send. Consent that does not permit sending fences everything, exactly as it
+      // would on the ordinary path — this must not depend on a caller having called send() first.
+      this.fenceAll("consent not granted");
+      return [];
+    }
+
+    // Drain FENCES FOR ITSELF rather than assuming a preceding send() did it. Without this, a
+    // record left pending under identity A could be re-sent, after a rotation, with B's secret
+    // authenticating A's stored body: the collector's derived-identity check rejects the mismatch,
+    // the attempt is burned, and the day can be exhausted. The fence purges those records instead,
+    // which is the correct outcome — a rotation is meant to orphan what came before it.
+    const centralDestination = normalizeDestinationUrl(input.central.url);
+    this.fenceDestination(
+      "central",
+      centralDestination,
+      destinationGeneration(input.consent, "central", centralDestination, input.central.identity.instance_secret),
+    );
+    if (input.copy === undefined) {
+      this.fenceDestination("copy", undefined, undefined);
+    } else {
+      const copyDestination = normalizeDestinationUrl(input.copy.url);
+      this.fenceDestination(
+        "copy",
+        copyDestination,
+        destinationGeneration(input.consent, "copy", copyDestination, input.copy.identity.instance_secret),
+      );
+    }
+
     const days = this.unresolvedDays({ central: input.central, copy: input.copy, exceptDay: input.exceptDay });
     const reports: SendReport[] = [];
     for (const day of days.slice(0, input.maxDays ?? 3)) {
@@ -535,7 +582,9 @@ export class Transport {
             central: { url: input.central.url, identity: input.central.identity, body: central?.body ?? "" },
             copy: input.copy === undefined ? undefined : { url: input.copy.url, identity: input.copy.identity, body: copy?.body ?? "" },
           },
-          { fence: false },
+          // Fenced once above, not once per day; and `onlyExisting` so draining one destination's
+          // backlog cannot mint a record for a destination that never had one for that day.
+          { fence: false, onlyExisting: true },
         ),
       );
     }
@@ -581,6 +630,7 @@ export class Transport {
     generation: string;
     input: DestinationInput;
     budget: AbortSignal;
+    onlyExisting: boolean;
   }): Promise<DestinationOutcome> {
     const key = recordKey(args.day, args.kind, args.destination);
 
@@ -609,6 +659,7 @@ export class Transport {
       generation: string;
       input: DestinationInput;
       budget: AbortSignal;
+      onlyExisting: boolean;
     },
     key: string,
   ): Promise<DestinationOutcome> {
@@ -617,6 +668,10 @@ export class Transport {
     const nowIso = new Date(now).toISOString();
 
     let rec = state.records[key];
+    // A drain re-sends what already exists; it must never CREATE a delivery. Otherwise draining
+    // one destination's backlog would mint a body-less record for a destination that simply had
+    // nothing for that day, and that record would immediately retire itself as unsendable.
+    if (rec === undefined && args.onlyExisting) return this.outcomeFor(args.day, args.kind, args.destination, null);
     if (rec === undefined) {
       rec = {
         day: args.day,

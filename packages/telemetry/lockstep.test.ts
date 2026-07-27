@@ -359,16 +359,28 @@ describe("amended contract: no leaf without a producer", () => {
   };
   const m = manifest as unknown as { metrics: Record<string, Record<string, unknown>> };
 
-  test("skuld carries NO events.deferrals — its producer is dead (validate-and-run, never deferred)", () => {
-    expect(v2.definitions.skuld_metrics!.required).not.toContain("events");
-    expect(Object.keys(v2.definitions.skuld_metrics!.properties)).not.toContain("events");
-    expect(Object.keys(m.metrics.skuld!).filter((k) => k.startsWith("events"))).toEqual([]);
-    // No leaf named `deferrals` anywhere in the body — the word survives only in the `gate`
-    // description, which records WHY it is absent so the next author does not re-add it.
+  test("skuld's events taxonomy is the four honestly-named leaves, and NOT `deferrals`", () => {
+    // `events.deferrals` was drafted against a producer that had been removed. It was dropped, and
+    // four leaves whose producers were verified durable were added in its place — an ADDITION, not
+    // a repointing: reusing the old name would have silently changed what a frozen field meant.
+    const events = v2.definitions.skuld_metrics!.properties.events!;
+    expect([...(events.required ?? [])].sort()).toEqual(["asks_delivered", "rate_limit_deferred", "route_errors", "runs_enqueued"]);
+    expect(Object.keys(events.properties ?? {})).not.toContain("deferrals");
+    expect(Object.keys(m.metrics.skuld!).filter((k) => k.startsWith("events.")).sort()).toEqual([
+      "events.asks_delivered",
+      "events.rate_limit_deferred",
+      "events.route_errors",
+      "events.runs_enqueued",
+    ]);
+    // No leaf named `deferrals` anywhere in the body — the word survives only in a description,
+    // which records WHY it is absent so the next author does not re-add it.
     for (const section of Object.values(v2.definitions.skuld_metrics!.properties)) {
       expect(Object.keys(section.properties ?? {})).not.toContain("deferrals");
     }
-    expect(validateHeartbeat({ ...skuldFixture(), metrics: { ...skuldFixture().metrics, events: { deferrals: 0 } } }).ok).toBe(false);
+    const smuggled = skuldFixture();
+    (smuggled.metrics.events as unknown as Record<string, number>).deferrals = 0;
+    expect(validateHeartbeat(smuggled).ok).toBe(false);
+    expect(schemaAccepts(smuggled)).toBe(false);
   });
 
   test("saga's advisories.by_severity is exactly {info, warn} — no `critical` exists upstream", () => {

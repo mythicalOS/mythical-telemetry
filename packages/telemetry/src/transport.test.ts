@@ -603,3 +603,91 @@ describe("unresolved days survive the day rolling over", () => {
     expect(attempts).toHaveLength(0);
   });
 });
+
+describe("drain fences for itself — it does not assume a preceding send() did", () => {
+  const CONSENT = userConsent(true, Date.parse("2026-01-01T00:00:00.000Z"));
+
+  test("a retained body is NEVER re-sent under a rotated identity", async () => {
+    const root = tmpRoot();
+    const first = harness(() => FAIL, { stateRoot: root });
+    await first.transport.send({ ...sendInput(CONSENT), copy: undefined });
+    expect(first.transport.record(DAY, "central", CENTRAL_URL)?.body).toBe('{"central":true}');
+
+    // The identity rotates. The stored body carries the OLD instance_id, so authenticating it with
+    // the NEW secret would fail the collector's derived-identity check, burn attempts and could
+    // exhaust the day. The fence purges it instead — a rotation is meant to orphan what came before.
+    const second = harness(() => OK, { stateRoot: root, nowMs: undefined });
+    const drained = await second.transport.drain({
+      product: "brokkr",
+      consent: CONSENT,
+      central: { url: CENTRAL_URL, identity: identity("z") },
+      exceptDay: "2026-07-28",
+    });
+
+    expect(drained).toEqual([]);
+    expect(second.attempts).toHaveLength(0);
+    expect(second.transport.record(DAY, "central", CENTRAL_URL)).toBeUndefined();
+  });
+
+  test("an opt-out reaching drain FIRST still fences everything", async () => {
+    const root = tmpRoot();
+    const first = harness(() => FAIL, { stateRoot: root });
+    await first.transport.send({ ...sendInput(CONSENT), copy: undefined });
+
+    const second = harness(() => OK, { stateRoot: root });
+    const drained = await second.transport.drain({
+      product: "brokkr",
+      consent: userConsent(false, Date.now()),
+      central: { url: CENTRAL_URL, identity: identity("a") },
+    });
+    expect(drained).toEqual([]);
+    expect(second.transport.record(DAY, "central", CENTRAL_URL)).toBeUndefined();
+  });
+
+  test("a drain never CREATES a delivery for a destination that had none that day", async () => {
+    const root = tmpRoot();
+    const first = harness(() => FAIL, { stateRoot: root });
+    await first.transport.send({ ...sendInput(CONSENT), copy: undefined }); // central only
+
+    // A copy is configured later. Draining central's backlog must not mint a body-less copy record
+    // for a day the copy was never configured for.
+    const second = harness(() => OK, { stateRoot: root, nowMs: undefined });
+    await second.transport.drain({
+      product: "brokkr",
+      consent: CONSENT,
+      central: { url: CENTRAL_URL, identity: identity("a") },
+      copy: { url: COPY_URL, identity: identity("b") },
+      exceptDay: "2026-07-28",
+    });
+    expect(second.transport.record(DAY, "copy", COPY_URL)).toBeUndefined();
+  });
+
+  test("days in backoff do not consume the drain cap and starve newer eligible days", async () => {
+    const root = tmpRoot();
+    const { transport, now } = harness(() => FAIL, { stateRoot: root, maxAttempts: 99 });
+
+    // Four consecutive days all fail. Each is left in backoff.
+    for (const day of ["2026-07-20", "2026-07-21", "2026-07-22", "2026-07-23"]) {
+      await transport.send({ ...sendInput(CONSENT), day, copy: undefined });
+    }
+    // Only the three OLDEST are still inside their backoff window; the newest is eligible.
+    const oldest = ["2026-07-20", "2026-07-21", "2026-07-22"];
+    for (const day of oldest) {
+      const rec = transport.record(day, "central", CENTRAL_URL)!;
+      rec.next_attempt_at = new Date(now.value + 10 * 24 * 3_600_000).toISOString();
+    }
+    now.value += 3_600_000;
+
+    const eligible = transport.unresolvedDays({ central: { url: CENTRAL_URL } });
+    // The blocked days are excluded, so the cap is spent on the day that can actually be sent.
+    expect(eligible).toEqual(["2026-07-23"]);
+  });
+
+  test("an open circuit breaker also keeps a day out of the drain cap", async () => {
+    const { transport, now } = harness(() => FAIL, { breakerThreshold: 1, breakerCooldownMs: 7 * 24 * 3_600_000 });
+    await transport.send({ ...sendInput(CONSENT), copy: undefined });
+    now.value += 24 * 3_600_000;
+    expect(transport.unresolvedDays({ central: { url: CENTRAL_URL } })).toEqual([]);
+    expect(transport.unresolvedDays({ central: { url: CENTRAL_URL }, eligibleOnly: false })).toEqual([DAY]);
+  });
+});

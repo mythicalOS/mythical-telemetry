@@ -157,21 +157,31 @@ export class HeartbeatEmitter<P extends ProductName> {
     const consent = this.deps.getConsent();
     const endpoints = this.deps.getEndpoints();
 
+    // CONSENT IS CHECKED FIRST, before any configuration objection. Ordering it after the
+    // destination check meant an install whose central URL had been removed returned
+    // "misconfigured" and never reached the fence — so an opt-out left pending payloads on disk
+    // for exactly the installs least able to send them.
+    if (!isSendPermitted(consent)) {
+      // The hard fence: cancel queued retries and purge pending payloads for EVERY destination.
+      this.deps.transport.fenceAll("telemetry disabled");
+      return { sent: false, reason: "opted_out", detail: `consent source=${consent.source} enabled=${consent.enabled}` };
+    }
+
     try {
       assertDestinations({
         central: endpoints.centralUrl === "" ? undefined : endpoints.centralUrl,
         copy: endpoints.copyUrl === "" ? undefined : endpoints.copyUrl,
       });
     } catch (err) {
+      // A destination that is no longer configured is a RETIRED destination: purge its queued
+      // deliveries and its retained payloads rather than leaving them for a URL that may never
+      // come back.
+      this.deps.transport.fenceDestination("central", undefined, undefined);
+      this.deps.transport.fenceDestination("copy", undefined, undefined);
+      if (this.deps.identity.currentCopyDestination() !== undefined) this.deps.identity.clearCopyIdentity();
       const detail = err instanceof TransportConfigError ? `${err.reason}: ${err.message}` : String(err);
       this.log(`heartbeat not sent — ${detail}`);
       return { sent: false, reason: "misconfigured", detail };
-    }
-
-    if (!isSendPermitted(consent)) {
-      // The hard fence: cancel queued retries and purge pending payloads for EVERY destination.
-      this.deps.transport.fenceAll("telemetry disabled");
-      return { sent: false, reason: "opted_out", detail: `consent source=${consent.source} enabled=${consent.enabled}` };
     }
 
     const central = this.deps.identity.centralIdentity();
@@ -259,7 +269,11 @@ export class HeartbeatEmitter<P extends ProductName> {
       return;
     }
     const endpoints = this.deps.getEndpoints();
-    if (endpoints.centralUrl !== "") {
+    if (endpoints.centralUrl === "") {
+      // Central was REMOVED. Same rule as the copy: retire the destination and purge what was
+      // queued for it. Skipping the fence here left pending payloads on disk indefinitely.
+      this.deps.transport.fenceDestination("central", undefined, undefined);
+    } else {
       const central = this.deps.identity.centralIdentity();
       const destination = normalizeDestinationUrl(endpoints.centralUrl);
       this.deps.transport.fenceDestination(

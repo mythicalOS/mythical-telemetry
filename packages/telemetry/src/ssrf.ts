@@ -361,14 +361,32 @@ const DEFAULT_MAX_RESPONSE_BYTES = 4096;
  */
 function sanitizeDetail(text: string, redact: readonly string[] = []): string | undefined {
   let cleaned = text.replace(/[^\x20-\x7e]+/g, " ");
+
   for (const secret of redact) {
-    if (secret.length >= 8) cleaned = cleaned.split(secret).join("[redacted]");
+    if (secret.length < 8) continue;
+    cleaned = cleaned.split(secret).join("[redacted]");
+    // The endpoint ALREADY HOLDS the key, so it can choose how to spell it back: eight 8-character
+    // chunks separated by spaces or hyphens is neither an exact substring nor a long hex run.
+    // Match the secret's characters with arbitrary separators allowed between them.
+    const spaced = new RegExp(secret.split("").map(escapeRegExp).join("[^0-9A-Za-z]{0,4}"), "gi");
+    cleaned = cleaned.replace(spaced, "[redacted]");
   }
-  cleaned = cleaned
-    .replace(/[0-9a-fA-F]{32,}/g, "[redacted]")
-    .trim()
-    .slice(0, 200);
+
+  cleaned = cleaned.replace(/[0-9a-fA-F]{32,}/g, "[redacted]");
+
+  // Last line of defence against a spelling nobody anticipated: if the text still contains a long
+  // hex run once every separator is removed, drop the excerpt entirely. The threshold sits above a
+  // UUID's 32 hex digits so a collector echoing an instance id keeps its actionable message.
+  if (/[0-9a-fA-F]{40,}/.test(cleaned.replace(/[^0-9A-Za-z]/g, ""))) {
+    return "[redacted — the response body contained key-like material]";
+  }
+
+  cleaned = cleaned.trim().slice(0, 200);
   return cleaned === "" ? undefined : cleaned;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**

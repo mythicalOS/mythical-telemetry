@@ -645,6 +645,7 @@
       "required": [
         "jobs",
         "runs",
+        "events",
         "gate",
         "sandbox",
         "detection_state",
@@ -732,6 +733,43 @@
             }
           }
         },
+        "events": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "runs_enqueued",
+            "asks_delivered",
+            "rate_limit_deferred",
+            "route_errors"
+          ],
+          "description": "CLOSED event taxonomy (delta). There is deliberately no `deferrals` member: a leaf of that name was drafted against a producer that had been removed, and these four are honestly-named NEW leaves rather than a repointing of it — reusing the old name would have silently changed a frozen field's meaning. Three further durable counters were considered and excluded: one has an uncorrectable restart bias, and two measure our own window tuning rather than product usage.",
+          "properties": {
+            "runs_enqueued": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000000,
+              "description": "Event fires that enqueued a run (delta)."
+            },
+            "asks_delivered": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000000,
+              "description": "Event asks delivered (delta)."
+            },
+            "rate_limit_deferred": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000000,
+              "description": "Fires deferred until the oldest in-window fire aged out (delta)."
+            },
+            "route_errors": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000000,
+              "description": "Rule matcher/resolver throws (delta). The error itself never leaves the host — only the fact that one happened."
+            }
+          }
+        },
         "gate": {
           "type": "object",
           "additionalProperties": false,
@@ -739,7 +777,6 @@
             "rejections",
             "approvals"
           ],
-          "description": "No `events.deferrals` leaf exists: it was drafted, found to have a dead producer (the event trigger arm validates-and-runs rather than validates-and-defers) and dropped before the freeze rather than shipped permanently zero. Adding it later is a NEW LEAF IN A NEW SCHEMA VERSION.",
           "properties": {
             "rejections": {
               "type": "integer",

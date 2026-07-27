@@ -29,6 +29,10 @@ export const SKULD_COUNTER_NAMES = [
   "runs_succeeded",
   "runs_failed",
   "chain_rejections",
+  "event_runs_enqueued",
+  "event_asks_delivered",
+  "rate_limit_merged",
+  "event_route_errors",
   "gate_rejections",
   "gate_approvals",
   "sandbox_pool_exhausted",
@@ -83,6 +87,14 @@ export function buildSkuldMetrics(input: SkuldBodyInput): SkuldMetrics {
       succeeded: d("runs_succeeded"),
       failed: d("runs_failed"),
       chain_rejections: d("chain_rejections"),
+    },
+    events: {
+      runs_enqueued: d("event_runs_enqueued"),
+      asks_delivered: d("event_asks_delivered"),
+      // The local counter name predates the wire name; `rate_limit_merged` is the genuine
+      // deferral signal, so the wire leaf says what it counts.
+      rate_limit_deferred: d("rate_limit_merged"),
+      route_errors: d("event_route_errors"),
     },
     gate: { rejections: d("gate_rejections"), approvals: d("gate_approvals") },
     sandbox: { pool_exhausted: d("sandbox_pool_exhausted"), uid_vends: d("sandbox_uid_vends") },

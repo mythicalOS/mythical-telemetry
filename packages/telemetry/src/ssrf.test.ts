@@ -465,3 +465,45 @@ describe("the surfaced detail never carries key material", () => {
     expect(result.detail).toContain("[redacted]");
   });
 });
+
+describe("redaction survives a hostile endpoint choosing how to spell the key back", () => {
+  const SECRET = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+
+  test("the key echoed in separated chunks is still redacted", async () => {
+    const chunked = SECRET.match(/.{1,8}/g)!.join("-");
+    const { port } = await serve((_req, res) => {
+      res.writeHead(401, { "content-type": "text/plain" });
+      res.end(`rejected: ${chunked}`);
+    });
+    const result = await postPinned({
+      endpoint: await pinnedTo(port),
+      body: "{}",
+      headers: { "X-Mythical-Write-Key": SECRET },
+      timeoutMs: 2000,
+      redactFromDetail: [SECRET],
+    });
+    expect(result.detail ?? "").not.toContain(chunked);
+    expect((result.detail ?? "").replace(/[^0-9A-Za-z]/g, "")).not.toContain(SECRET);
+  });
+
+  test("and when spelled with spaces, in a form nobody named", async () => {
+    const spaced = SECRET.match(/.{1,4}/g)!.join(" ");
+    const { port } = await serve((_req, res) => {
+      res.writeHead(400, { "content-type": "text/plain" });
+      res.end(`bad key ${spaced} sorry`);
+    });
+    // Not passed as a known secret: the last-resort collapsed-hex guard has to catch it.
+    const result = await postPinned({ endpoint: await pinnedTo(port), body: "{}", headers: {}, timeoutMs: 2000 });
+    expect((result.detail ?? "").replace(/[^0-9A-Za-z]/g, "")).not.toContain(SECRET);
+    expect(result.detail).toContain("[redacted");
+  });
+
+  test("a legitimate error that merely quotes an instance id keeps its actionable message", async () => {
+    const { port } = await serve((_req, res) => {
+      res.writeHead(409, { "content-type": "text/plain" });
+      res.end("instance 60e05bd1-b195-4f2f-9411-2fa7197a5c88 already has a row for that day");
+    });
+    const result = await postPinned({ endpoint: await pinnedTo(port), body: "{}", headers: {}, timeoutMs: 2000 });
+    expect(result.detail).toContain("already has a row for that day");
+  });
+});

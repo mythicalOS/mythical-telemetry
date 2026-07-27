@@ -70,6 +70,7 @@ export function skuldFixture(): SkuldHeartbeat {
     metrics: {
       jobs: { created_by_type: { script: 12, ai: 5, report: 2, agent_send: 1, distill: 3 } },
       runs: { total: 23, succeeded: 20, failed: 2, chain_rejections: 1 },
+      events: { runs_enqueued: 9, asks_delivered: 4, rate_limit_deferred: 1, route_errors: 0 },
       gate: { rejections: 2, approvals: 7 },
       sandbox: { pool_exhausted: 0, uid_vends: 23 },
       detection_state: "detected",

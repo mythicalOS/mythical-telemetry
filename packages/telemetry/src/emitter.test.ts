@@ -332,3 +332,48 @@ describe("a day whose retry crossed midnight is not lost", () => {
     expect(result.sent && result.drained).toEqual([]);
   });
 });
+
+describe("a removed endpoint does not escape the purge fences", () => {
+  test("opting out with NO central configured still purges pending payloads", async () => {
+    const root = tmpRoot();
+    const failing = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, respond: () => ({ status: 503, ok: false, detail: "down" }) });
+    await failing.emitter.emit("2026-07-26");
+    expect(failing.emitter.status("2026-07-26")!.central.attempts).toBe(1);
+
+    // Consent is withdrawn AND the endpoint is gone. Checking the configuration first meant this
+    // returned "misconfigured" and never reached the fence, leaving the payload on disk.
+    const off = makeEmitter({ root, endpoints: { centralUrl: "" }, consent: userConsent(false, Date.now()) });
+    const result = await off.emitter.emit("2026-07-26");
+    expect(result).toMatchObject({ sent: false, reason: "opted_out" });
+
+    const check = makeEmitter({ root, endpoints: { centralUrl: CENTRAL } });
+    expect(check.emitter.status("2026-07-26")!.central.attempts).toBe(0);
+  });
+
+  test("REMOVING central retires it — its queued deliveries and payloads are purged", async () => {
+    const root = tmpRoot();
+    const failing = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, respond: () => ({ status: 503, ok: false, detail: "down" }) });
+    await failing.emitter.emit("2026-07-26");
+
+    // Consent is unchanged; only the endpoint was removed. Both the emit path and the explicit
+    // config-change path must fence it.
+    const removed = makeEmitter({ root, endpoints: { centralUrl: "" } });
+    const result = await removed.emitter.emit("2026-07-26");
+    expect(result).toMatchObject({ sent: false, reason: "misconfigured" });
+
+    const check = makeEmitter({ root, endpoints: { centralUrl: CENTRAL } });
+    expect(check.emitter.status("2026-07-26")!.central.attempts).toBe(0);
+  });
+
+  test("applyConfigChange fences a removed central too", async () => {
+    const root = tmpRoot();
+    const failing = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, respond: () => ({ status: 503, ok: false, detail: "down" }) });
+    await failing.emitter.emit("2026-07-26");
+
+    const removed = makeEmitter({ root, endpoints: { centralUrl: "" } });
+    removed.emitter.applyConfigChange();
+
+    const check = makeEmitter({ root, endpoints: { centralUrl: CENTRAL } });
+    expect(check.emitter.status("2026-07-26")!.central.attempts).toBe(0);
+  });
+});

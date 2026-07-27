@@ -76,6 +76,12 @@ export interface SagaMetrics {
 export interface SkuldMetrics {
   jobs: { created_by_type: { script: number; ai: number; report: number; agent_send: number; distill: number } };
   runs: { total: number; succeeded: number; failed: number; chain_rejections: number };
+  /**
+   * Four honestly-named event counters. There is deliberately no `deferrals` member: a leaf of
+   * that name was drafted against a producer that had been removed, and reusing it here would
+   * have silently redefined a frozen field rather than adding new ones.
+   */
+  events: { runs_enqueued: number; asks_delivered: number; rate_limit_deferred: number; route_errors: number };
   /** `approvals` counts gate ADMISSIONS — the symmetric partner of `rejections`, not grants. */
   gate: { rejections: number; approvals: number };
   /** `uid_vends` is counted at the uid POOL BOUNDARY; the pool has more than one consumer. */
@@ -83,9 +89,9 @@ export interface SkuldMetrics {
   detection_state: DetectionState;
   uptime_bucket: UptimeBucket;
 }
-// There is deliberately NO `events.deferrals`: it was drafted, found to have a dead producer, and
-// dropped BEFORE the freeze rather than shipped permanently zero. Adding it back is a new leaf in
-// a new schema version, not an edit here.
+// There is deliberately NO `events.deferrals`: it was drafted, found to have a dead producer, and dropped
+// BEFORE the freeze. The four `events.*` leaves above are new leaves with honest names, NOT a
+// repointing of it — reusing the name would have silently changed what a frozen field meant.
 
 export interface HeartbeatEnvelope<P extends ProductName, M> {
   schema_version: typeof SCHEMA_VERSION;
@@ -373,7 +379,7 @@ function validateSaga(c: Checker, raw: unknown): void {
 }
 
 function validateSkuld(c: Checker, raw: unknown): void {
-  const m = c.object(raw, "metrics", ["jobs", "runs", "gate", "sandbox", "detection_state", "uptime_bucket"]);
+  const m = c.object(raw, "metrics", ["jobs", "runs", "events", "gate", "sandbox", "detection_state", "uptime_bucket"]);
   if (m === undefined) return;
 
   const jobs = c.object(m.jobs, "metrics.jobs", ["created_by_type"]);
@@ -394,6 +400,13 @@ function validateSkuld(c: Checker, raw: unknown): void {
   // reject a correct payload and lose that day silently, which is worse than not checking.
   counts(c, m.runs as Record<string, unknown> | undefined, "metrics.runs", ["total", "succeeded", "failed", "chain_rejections"], MAX.count);
 
+  counts(
+    c,
+    m.events as Record<string, unknown> | undefined,
+    "metrics.events",
+    ["runs_enqueued", "asks_delivered", "rate_limit_deferred", "route_errors"],
+    MAX.count,
+  );
   counts(c, m.gate as Record<string, unknown> | undefined, "metrics.gate", ["rejections", "approvals"], MAX.count);
   counts(c, m.sandbox as Record<string, unknown> | undefined, "metrics.sandbox", ["pool_exhausted", "uid_vends"], MAX.count);
 

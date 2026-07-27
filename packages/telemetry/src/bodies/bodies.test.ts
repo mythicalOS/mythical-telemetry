@@ -179,11 +179,13 @@ describe("buildSagaMetrics", () => {
 describe("buildSkuldMetrics", () => {
   test("shapes deltas into a valid body and normalises the hyphenated job-type key", () => {
     const body = buildSkuldMetrics({
-      deltas: { "jobs_created_by_type.agent-send": 4, runs_total: 9, gate_approvals: 2 },
+      deltas: { "jobs_created_by_type.agent-send": 4, runs_total: 9, gate_approvals: 2, rate_limit_merged: 6, event_runs_enqueued: 11 },
       detectionState: 1,
       uptimeSeconds: 40 * 86_400,
     });
     expect(body.jobs.created_by_type.agent_send).toBe(4);
+    // The local counter name predates the wire name; the wire leaf says what it counts.
+    expect(body.events).toEqual({ runs_enqueued: 11, asks_delivered: 0, rate_limit_deferred: 6, route_errors: 0 });
     expect(body.detection_state).toBe("detected");
     expect(body.uptime_bucket).toBe("30d+");
     expect(validateHeartbeat(wrap("skuld", body)).ok).toBe(true);
