@@ -1,0 +1,731 @@
+// Dual-send transport: always central, optionally ALSO an operator copy.
+//
+// THE RULES, AND WHY EACH ONE EXISTS
+//
+// Copy-without-central is not a valid configuration and is rejected at the type/validation
+// boundary, not tolerated at runtime. A copy supplements central; it never replaces it.
+//
+// DELIVERY IS NOT ATOMIC AND MUST NOT BE COUPLED. Two HTTP calls cannot be atomic, and coupling
+// them means a flaky operator endpoint suppresses central data while a central outage suppresses
+// the operator's copy. The two run independently and one's failure never gates the other.
+//
+// PER-DESTINATION DURABLE STATE. A single per-day "sent" marker is wrong the moment there are two
+// destinations: mark on first success and the copy never retries; leave it unmarked and central is
+// re-sent on every copy retry, duplicating at a non-idempotent operator collector. So each
+// (day, destination) carries its own attempt count, last attempt, next attempt and terminal status.
+//
+// BOUNDED ATTEMPTS WITH JITTER. A fixed retry interval turns a fleet into a thundering herd the
+// moment an outage ends — every install retries in the same second. Backoff is exponential and
+// jittered, and attempts are capped so a permanently broken endpoint stops rather than spins.
+//
+// SINGLE-FLIGHT per (day, destination), plus an idempotency key so an operator collector that
+// does dedupe can, and one that does not at least sees the same key twice.
+//
+// OPT-OUT IS A HARD FENCE. Disabling telemetry, or changing an endpoint or credential, cancels
+// queued retries and purges pending state — otherwise a scheduled retry fires AFTER the user opted
+// out, to an endpoint they just removed. The fence is PER DESTINATION: changing only the copy URL
+// must not cancel an unresolved central delivery whose consent and configuration are unchanged.
+// Only a global opt-out fences both.
+//
+// PARTIAL STATE IS EXPOSED, NOT HIDDEN. "central delivered, copy unresolved" is a real and common
+// state; a surface that reports only "sent" or nothing at all is lying by omission.
+
+import { createHash } from "node:crypto";
+import { atomicWriteFileSync, readJsonSync } from "./atomic.ts";
+import { normalizeDestinationUrl, telemetryDirPath, type InstanceIdentity } from "./identity.ts";
+import { consentGeneration, isSendPermitted, type ConsentState } from "./optout.ts";
+import { EndpointRejected, postPinned, resolveAndPin, type EndpointPolicy, type PinnedEndpoint, type PostResult } from "./ssrf.ts";
+import type { ProductName } from "./envelope.ts";
+import path from "node:path";
+
+export type DestinationKind = "central" | "copy";
+
+export type DeliveryStatus =
+  /** Accepted by the destination. Terminal, and never re-sent for that day. */
+  | "delivered"
+  /** Not yet delivered and still eligible — a retry is scheduled. */
+  | "pending"
+  /** Attempts exhausted, or the destination is rejected outright. Terminal until config changes. */
+  | "exhausted";
+
+export interface DeliveryRecord {
+  day: string;
+  kind: DestinationKind;
+  /** Normalised destination URL — the identity of the endpoint, not the raw config string. */
+  destination: string;
+  /** Fences this record to one (consent decision, endpoint, credential) triple. */
+  generation: string;
+  idempotency_key: string;
+  attempts: number;
+  first_attempt_at: string | null;
+  last_attempt_at: string | null;
+  /** ISO time before which no further attempt is made. */
+  next_attempt_at: string | null;
+  status: DeliveryStatus;
+  last_error: string | null;
+  last_http_status: number | null;
+}
+
+interface BreakerState {
+  consecutive_failures: number;
+  /** ISO time until which the destination is not contacted at all. */
+  open_until: string | null;
+}
+
+interface DeliveryStateFile {
+  version: 1;
+  records: Record<string, DeliveryRecord>;
+  breakers: Record<string, BreakerState>;
+}
+
+export interface DestinationOutcome {
+  kind: DestinationKind;
+  destination: string;
+  status: DeliveryStatus;
+  attempts: number;
+  next_attempt_at: string | null;
+  last_error: string | null;
+  last_http_status: number | null;
+  /** Why nothing was attempted this round, when nothing was. */
+  skipped_because: "backoff" | "circuit_open" | "in_flight" | "budget_exhausted" | "opted_out" | null;
+}
+
+export interface SendReport {
+  day: string;
+  central: DestinationOutcome;
+  copy: DestinationOutcome | null;
+  /** True when the destinations disagree — the state a "sent/not sent" surface would hide. */
+  partial: boolean;
+}
+
+export class TransportConfigError extends Error {
+  constructor(
+    readonly reason: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "TransportConfigError";
+  }
+}
+
+export interface DestinationInput {
+  url: string;
+  identity: InstanceIdentity;
+  /** The exact wire bytes for THIS destination — the bodies differ (different instance_id). */
+  body: string;
+}
+
+export interface SendInput {
+  day: string;
+  product: ProductName;
+  consent: ConsentState;
+  /** Always required. There is no copy-only configuration. */
+  central: DestinationInput;
+  copy?: DestinationInput | undefined;
+}
+
+export interface TransportOptions {
+  stateRoot: string;
+  /** Hard per-attempt deadline. Default 5s — the single-send path's existing abort, preserved. */
+  perAttemptTimeoutMs?: number;
+  /** Ceiling on the whole fan-out, so two slow destinations cannot serialise into a long stall. */
+  overallBudgetMs?: number;
+  maxAttempts?: number;
+  baseBackoffMs?: number;
+  maxBackoffMs?: number;
+  breakerThreshold?: number;
+  breakerCooldownMs?: number;
+  /** Concurrent destinations in flight. Bounded so a future fan-out cannot open N sockets. */
+  maxConcurrency?: number;
+  /** Days of delivery state kept before pruning. */
+  retentionDays?: number;
+  policy?: EndpointPolicy;
+  nowMs?: () => number;
+  random?: () => number;
+  log?: (line: string) => void;
+  /** Seams for tests — production uses the pinned, policy-checked implementations. */
+  resolveImpl?: (url: string, policy: EndpointPolicy) => Promise<PinnedEndpoint>;
+  postImpl?: (args: {
+    endpoint: PinnedEndpoint;
+    body: string;
+    headers: Record<string, string>;
+    timeoutMs: number;
+    signal: AbortSignal;
+  }) => Promise<PostResult>;
+}
+
+const DEFAULTS = {
+  perAttemptTimeoutMs: 5_000,
+  overallBudgetMs: 20_000,
+  maxAttempts: 6,
+  baseBackoffMs: 60_000,
+  maxBackoffMs: 6 * 60 * 60_000,
+  breakerThreshold: 5,
+  breakerCooldownMs: 30 * 60_000,
+  maxConcurrency: 2,
+  retentionDays: 35,
+} as const;
+
+export function deliveryStateFilePath(stateRoot: string): string {
+  return path.join(telemetryDirPath(stateRoot), "delivery.json");
+}
+
+/** `<endpoint>/v1/ingest`, preserving any query string the operator configured. */
+export function ingestUrlFor(normalizedDestination: string): string {
+  const url = new URL(normalizedDestination);
+  url.pathname = `${url.pathname.replace(/\/+$/, "")}/v1/ingest`;
+  return url.toString();
+}
+
+function recordKey(day: string, kind: DestinationKind, destination: string): string {
+  return `${day}|${kind}|${destination}`;
+}
+
+function breakerKey(kind: DestinationKind, destination: string): string {
+  return `${kind}|${destination}`;
+}
+
+function sha256Hex(input: string): string {
+  return createHash("sha256").update(input, "utf8").digest("hex");
+}
+
+/**
+ * The fence generation for one destination. Any change to the consent decision, the endpoint or
+ * the credential produces a different value, which invalidates retries authorised under the old
+ * one. The secret is HASHED here, never stored in the delivery state.
+ */
+export function destinationGeneration(consent: ConsentState, kind: DestinationKind, destination: string, secret: string): string {
+  return sha256Hex(`${consentGeneration(consent)}|${kind}|${destination}|${secret}`).slice(0, 32);
+}
+
+/** Rejects the one configuration that is not allowed to exist. */
+export function assertDestinations(input: { central?: unknown; copy?: unknown }): void {
+  if (input.central === undefined || input.central === null) {
+    if (input.copy !== undefined && input.copy !== null) {
+      throw new TransportConfigError(
+        "copy_without_central",
+        "a copy destination without a central destination is not a valid configuration — a copy supplements central, it never replaces it",
+      );
+    }
+    throw new TransportConfigError("central_required", "a central destination is required");
+  }
+}
+
+export class Transport {
+  private readonly opts: Required<Omit<TransportOptions, "policy" | "resolveImpl" | "postImpl" | "log">> & {
+    policy: EndpointPolicy;
+    resolveImpl: NonNullable<TransportOptions["resolveImpl"]>;
+    postImpl: NonNullable<TransportOptions["postImpl"]>;
+    log: (line: string) => void;
+  };
+  private state: DeliveryStateFile | undefined;
+  private readonly inflight = new Map<string, Promise<DestinationOutcome>>();
+  /** Aborters for in-flight attempts, so a fence can cancel them mid-request. */
+  private readonly aborters = new Map<string, AbortController>();
+
+  constructor(options: TransportOptions) {
+    this.opts = {
+      stateRoot: options.stateRoot,
+      perAttemptTimeoutMs: options.perAttemptTimeoutMs ?? DEFAULTS.perAttemptTimeoutMs,
+      overallBudgetMs: options.overallBudgetMs ?? DEFAULTS.overallBudgetMs,
+      maxAttempts: options.maxAttempts ?? DEFAULTS.maxAttempts,
+      baseBackoffMs: options.baseBackoffMs ?? DEFAULTS.baseBackoffMs,
+      maxBackoffMs: options.maxBackoffMs ?? DEFAULTS.maxBackoffMs,
+      breakerThreshold: options.breakerThreshold ?? DEFAULTS.breakerThreshold,
+      breakerCooldownMs: options.breakerCooldownMs ?? DEFAULTS.breakerCooldownMs,
+      maxConcurrency: options.maxConcurrency ?? DEFAULTS.maxConcurrency,
+      retentionDays: options.retentionDays ?? DEFAULTS.retentionDays,
+      nowMs: options.nowMs ?? Date.now,
+      random: options.random ?? Math.random,
+      policy: options.policy ?? {},
+      log: options.log ?? ((): void => {}),
+      resolveImpl: options.resolveImpl ?? ((url, policy): Promise<PinnedEndpoint> => resolveAndPin(url, policy)),
+      postImpl:
+        options.postImpl ??
+        ((args): Promise<PostResult> =>
+          postPinned({
+            endpoint: args.endpoint,
+            body: args.body,
+            headers: args.headers,
+            timeoutMs: args.timeoutMs,
+            signal: args.signal,
+          })),
+    };
+  }
+
+  // ── durable state ────────────────────────────────────────────────────────────────────────
+
+  private load(): DeliveryStateFile {
+    if (this.state !== undefined) return this.state;
+    const raw = readJsonSync(deliveryStateFilePath(this.opts.stateRoot));
+    const empty: DeliveryStateFile = { version: 1, records: {}, breakers: {} };
+    if (raw === null || typeof raw !== "object") {
+      this.state = empty;
+      return empty;
+    }
+    const doc = raw as Record<string, unknown>;
+    const records: Record<string, DeliveryRecord> = {};
+    if (doc.records !== null && typeof doc.records === "object") {
+      for (const [key, value] of Object.entries(doc.records as Record<string, unknown>)) {
+        const rec = parseRecord(value);
+        if (rec !== undefined) records[key] = rec;
+      }
+    }
+    const breakers: Record<string, BreakerState> = {};
+    if (doc.breakers !== null && typeof doc.breakers === "object") {
+      for (const [key, value] of Object.entries(doc.breakers as Record<string, unknown>)) {
+        if (value === null || typeof value !== "object") continue;
+        const b = value as Record<string, unknown>;
+        breakers[key] = {
+          consecutive_failures: typeof b.consecutive_failures === "number" ? b.consecutive_failures : 0,
+          open_until: typeof b.open_until === "string" ? b.open_until : null,
+        };
+      }
+    }
+    this.state = { version: 1, records, breakers };
+    return this.state;
+  }
+
+  private persist(): void {
+    const state = this.load();
+    this.prune(state);
+    try {
+      atomicWriteFileSync(deliveryStateFilePath(this.opts.stateRoot), JSON.stringify(state, null, 2));
+    } catch (err) {
+      // A delivery-state write that fails must not take the product down. The consequence is a
+      // possible duplicate send after a restart, which the idempotency key exists to absorb.
+      this.opts.log(`delivery state persist failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private prune(state: DeliveryStateFile): void {
+    const cutoff = new Date(this.opts.nowMs() - this.opts.retentionDays * 86_400_000).toISOString().slice(0, 10);
+    for (const [key, rec] of Object.entries(state.records)) {
+      if (rec.day < cutoff) delete state.records[key];
+    }
+  }
+
+  /** The durable record for one (day, destination), or undefined. */
+  record(day: string, kind: DestinationKind, destinationUrl: string): DeliveryRecord | undefined {
+    const destination = normalizeDestinationUrl(destinationUrl);
+    return this.load().records[recordKey(day, kind, destination)];
+  }
+
+  // ── fences ───────────────────────────────────────────────────────────────────────────────
+
+  /**
+   * The GLOBAL fence. Telemetry was turned off: every unresolved delivery is cancelled and purged,
+   * in flight or queued, for every destination. A delivered record is left alone — it is a record
+   * of something that already happened, not a pending payload.
+   */
+  fenceAll(reason = "opt-out"): void {
+    for (const [key, controller] of this.aborters) {
+      controller.abort();
+      this.aborters.delete(key);
+    }
+    const state = this.load();
+    for (const [key, rec] of Object.entries(state.records)) {
+      if (rec.status !== "delivered") delete state.records[key];
+    }
+    state.breakers = {};
+    this.opts.log(`telemetry delivery fenced (${reason}): queued retries cancelled, pending payloads purged`);
+    this.persist();
+  }
+
+  /**
+   * The PER-DESTINATION fence. Only records for `kind` are touched: changing the operator URL must
+   * not cancel an unresolved central delivery whose consent and configuration are unchanged.
+   * Purges records pointing at a retired destination, and pending records whose generation no
+   * longer matches (endpoint or credential changed under them).
+   */
+  fenceDestination(kind: DestinationKind, destination: string | undefined, generation: string | undefined): void {
+    const state = this.load();
+    let changed = false;
+    for (const [key, rec] of Object.entries(state.records)) {
+      if (rec.kind !== kind) continue;
+      const retired = destination === undefined || rec.destination !== destination;
+      const stale = !retired && generation !== undefined && rec.generation !== generation && rec.status !== "delivered";
+      if (retired || stale) {
+        const controller = this.aborters.get(key);
+        if (controller !== undefined) {
+          controller.abort();
+          this.aborters.delete(key);
+        }
+        delete state.records[key];
+        changed = true;
+      }
+    }
+    for (const key of Object.keys(state.breakers)) {
+      if (key.startsWith(`${kind}|`) && (destination === undefined || key !== breakerKey(kind, destination))) {
+        delete state.breakers[key];
+        changed = true;
+      }
+    }
+    if (changed) this.persist();
+  }
+
+  // ── sending ──────────────────────────────────────────────────────────────────────────────
+
+  /** Read-only view of a day's per-destination state. Never sends. */
+  status(input: { day: string; central: { url: string }; copy?: { url: string } | undefined }): SendReport {
+    assertDestinations(input);
+    const central = this.outcomeFor(input.day, "central", normalizeDestinationUrl(input.central.url), null);
+    const copy = input.copy === undefined ? null : this.outcomeFor(input.day, "copy", normalizeDestinationUrl(input.copy.url), null);
+    return { day: input.day, central, copy, partial: isPartial(central, copy) };
+  }
+
+  /**
+   * Send one day to every configured destination. Independent per destination: an operator
+   * endpoint that hangs, 500s or fails validation never suppresses central, and a central outage
+   * never suppresses the copy.
+   */
+  async send(input: SendInput): Promise<SendReport> {
+    assertDestinations(input);
+
+    const centralDestination = normalizeDestinationUrl(input.central.url);
+    const copyDestination = input.copy === undefined ? undefined : normalizeDestinationUrl(input.copy.url);
+    if (copyDestination !== undefined && copyDestination === centralDestination) {
+      throw new TransportConfigError(
+        "copy_equals_central",
+        "the copy destination must differ from central — the same endpoint would receive two identities for one install",
+      );
+    }
+
+    if (!isSendPermitted(input.consent)) {
+      // Opt-out is a hard fence, applied on the path that would otherwise have sent.
+      this.fenceAll("consent not granted");
+      return {
+        day: input.day,
+        central: skippedOutcome("central", centralDestination, "opted_out"),
+        copy: copyDestination === undefined ? null : skippedOutcome("copy", copyDestination, "opted_out"),
+        partial: false,
+      };
+    }
+
+    const centralGeneration = destinationGeneration(input.consent, "central", centralDestination, input.central.identity.instance_secret);
+    this.fenceDestination("central", centralDestination, centralGeneration);
+    const copyGeneration =
+      input.copy === undefined || copyDestination === undefined
+        ? undefined
+        : destinationGeneration(input.consent, "copy", copyDestination, input.copy.identity.instance_secret);
+    this.fenceDestination("copy", copyDestination, copyGeneration);
+
+    // One budget for the whole fan-out, on top of each attempt's own deadline.
+    const budget = new AbortController();
+    const budgetTimer = setTimeout(() => budget.abort(), this.opts.overallBudgetMs);
+
+    try {
+      const semaphore = new Semaphore(this.opts.maxConcurrency);
+      const tasks: Array<Promise<DestinationOutcome>> = [
+        semaphore.run(() =>
+          this.deliver({
+            day: input.day,
+            product: input.product,
+            kind: "central",
+            destination: centralDestination,
+            generation: centralGeneration,
+            input: input.central,
+            budget: budget.signal,
+          }),
+        ),
+      ];
+      const copyInput = input.copy;
+      if (copyInput !== undefined && copyDestination !== undefined && copyGeneration !== undefined) {
+        tasks.push(
+          semaphore.run(() =>
+            this.deliver({
+              day: input.day,
+              product: input.product,
+              kind: "copy",
+              destination: copyDestination,
+              generation: copyGeneration,
+              input: copyInput,
+              budget: budget.signal,
+            }),
+          ),
+        );
+      }
+
+      // allSettled, never all: coupling the two is exactly the defect this design exists to avoid.
+      const settled = await Promise.allSettled(tasks);
+      const central = unwrap(settled[0], "central", centralDestination);
+      const copy = settled.length > 1 ? unwrap(settled[1], "copy", copyDestination ?? "") : null;
+      return { day: input.day, central, copy, partial: isPartial(central, copy) };
+    } finally {
+      clearTimeout(budgetTimer);
+    }
+  }
+
+  private outcomeFor(
+    day: string,
+    kind: DestinationKind,
+    destination: string,
+    skipped: DestinationOutcome["skipped_because"],
+  ): DestinationOutcome {
+    const rec = this.load().records[recordKey(day, kind, destination)];
+    if (rec === undefined) {
+      return {
+        kind,
+        destination,
+        status: "pending",
+        attempts: 0,
+        next_attempt_at: null,
+        last_error: null,
+        last_http_status: null,
+        skipped_because: skipped,
+      };
+    }
+    return {
+      kind,
+      destination,
+      status: rec.status,
+      attempts: rec.attempts,
+      next_attempt_at: rec.next_attempt_at,
+      last_error: rec.last_error,
+      last_http_status: rec.last_http_status,
+      skipped_because: skipped,
+    };
+  }
+
+  private async deliver(args: {
+    day: string;
+    product: ProductName;
+    kind: DestinationKind;
+    destination: string;
+    generation: string;
+    input: DestinationInput;
+    budget: AbortSignal;
+  }): Promise<DestinationOutcome> {
+    const key = recordKey(args.day, args.kind, args.destination);
+
+    // Single-flight: a concurrent tick joins the attempt already running rather than opening a
+    // second socket to the same destination for the same day.
+    const running = this.inflight.get(key);
+    if (running !== undefined) {
+      const outcome = await running;
+      return { ...outcome, skipped_because: "in_flight" };
+    }
+
+    const task = this.deliverOnce(args, key).finally(() => {
+      this.inflight.delete(key);
+      this.aborters.delete(key);
+    });
+    this.inflight.set(key, task);
+    return task;
+  }
+
+  private async deliverOnce(
+    args: {
+      day: string;
+      product: ProductName;
+      kind: DestinationKind;
+      destination: string;
+      generation: string;
+      input: DestinationInput;
+      budget: AbortSignal;
+    },
+    key: string,
+  ): Promise<DestinationOutcome> {
+    const state = this.load();
+    const now = this.opts.nowMs();
+    const nowIso = new Date(now).toISOString();
+
+    let rec = state.records[key];
+    if (rec === undefined) {
+      rec = {
+        day: args.day,
+        kind: args.kind,
+        destination: args.destination,
+        generation: args.generation,
+        idempotency_key: sha256Hex(`${args.input.identity.instance_id}|${args.product}|${args.day}|${args.generation}`),
+        attempts: 0,
+        first_attempt_at: null,
+        last_attempt_at: null,
+        next_attempt_at: null,
+        status: "pending",
+        last_error: null,
+        last_http_status: null,
+      };
+      state.records[key] = rec;
+    }
+
+    if (rec.status === "delivered") return this.outcomeFor(args.day, args.kind, args.destination, null);
+    if (rec.status === "exhausted") return this.outcomeFor(args.day, args.kind, args.destination, null);
+
+    if (rec.next_attempt_at !== null && Date.parse(rec.next_attempt_at) > now) {
+      return this.outcomeFor(args.day, args.kind, args.destination, "backoff");
+    }
+
+    const bKey = breakerKey(args.kind, args.destination);
+    const breaker = state.breakers[bKey];
+    if (breaker?.open_until != null && Date.parse(breaker.open_until) > now) {
+      return this.outcomeFor(args.day, args.kind, args.destination, "circuit_open");
+    }
+
+    if (args.budget.aborted) return this.outcomeFor(args.day, args.kind, args.destination, "budget_exhausted");
+
+    // Record the attempt BEFORE the request, and persist it. A crash mid-request must not look
+    // like an attempt that never happened, or a restart loop retries without bound.
+    rec.attempts += 1;
+    rec.last_attempt_at = nowIso;
+    if (rec.first_attempt_at === null) rec.first_attempt_at = nowIso;
+    rec.next_attempt_at = new Date(now + this.backoffFor(rec.attempts)).toISOString();
+    this.persist();
+
+    const attemptAborter = new AbortController();
+    this.aborters.set(key, attemptAborter);
+    const onBudget = (): void => attemptAborter.abort();
+    args.budget.addEventListener("abort", onBudget, { once: true });
+
+    try {
+      const endpoint = await this.opts.resolveImpl(ingestUrlFor(args.destination), this.opts.policy);
+      const result = await this.opts.postImpl({
+        endpoint,
+        body: args.input.body,
+        headers: {
+          "content-type": "application/json",
+          // Write auth rides the header, never the payload.
+          "X-Mythical-Write-Key": args.input.identity.instance_secret,
+          // Lets an operator collector dedupe a retry it already accepted.
+          "Idempotency-Key": rec.idempotency_key,
+        },
+        timeoutMs: this.opts.perAttemptTimeoutMs,
+        signal: attemptAborter.signal,
+      });
+
+      if (result.ok) {
+        rec.status = "delivered";
+        rec.next_attempt_at = null;
+        rec.last_error = null;
+        rec.last_http_status = result.status;
+        state.breakers[bKey] = { consecutive_failures: 0, open_until: null };
+        this.persist();
+        return this.outcomeFor(args.day, args.kind, args.destination, null);
+      }
+
+      const detail = result.detail === undefined ? "" : ` — ${result.detail}`;
+      this.recordFailure(rec, state, bKey, `HTTP ${result.status}${detail}`, result.status);
+      return this.outcomeFor(args.day, args.kind, args.destination, null);
+    } catch (err) {
+      const reason = err instanceof EndpointRejected ? `${err.reason}: ${err.message}` : err instanceof Error ? err.message : String(err);
+      this.recordFailure(rec, state, bKey, reason, null);
+      return this.outcomeFor(args.day, args.kind, args.destination, null);
+    } finally {
+      args.budget.removeEventListener("abort", onBudget);
+      this.aborters.delete(key);
+    }
+  }
+
+  private recordFailure(rec: DeliveryRecord, state: DeliveryStateFile, bKey: string, error: string, httpStatus: number | null): void {
+    rec.last_error = error;
+    rec.last_http_status = httpStatus;
+    if (rec.attempts >= this.opts.maxAttempts) {
+      rec.status = "exhausted";
+      rec.next_attempt_at = null;
+    }
+    const breaker = state.breakers[bKey] ?? { consecutive_failures: 0, open_until: null };
+    breaker.consecutive_failures += 1;
+    if (breaker.consecutive_failures >= this.opts.breakerThreshold) {
+      breaker.open_until = new Date(this.opts.nowMs() + this.opts.breakerCooldownMs).toISOString();
+      breaker.consecutive_failures = 0;
+    }
+    state.breakers[bKey] = breaker;
+    this.persist();
+  }
+
+  /**
+   * Exponential backoff with jitter. The jitter is the point: without it every install in a fleet
+   * retries at the same instant after an outage and the collector is hit by the whole population
+   * at once. Half the window is fixed so the spacing never collapses to zero.
+   */
+  private backoffFor(attempts: number): number {
+    const capped = Math.min(this.opts.baseBackoffMs * 2 ** Math.max(0, attempts - 1), this.opts.maxBackoffMs);
+    return Math.round(capped * (0.5 + 0.5 * this.opts.random()));
+  }
+}
+
+function parseRecord(value: unknown): DeliveryRecord | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const d = value as Record<string, unknown>;
+  if (typeof d.day !== "string" || typeof d.destination !== "string") return undefined;
+  if (d.kind !== "central" && d.kind !== "copy") return undefined;
+  const status = d.status === "delivered" || d.status === "exhausted" ? d.status : "pending";
+  return {
+    day: d.day,
+    kind: d.kind,
+    destination: d.destination,
+    generation: typeof d.generation === "string" ? d.generation : "",
+    idempotency_key: typeof d.idempotency_key === "string" ? d.idempotency_key : "",
+    attempts: typeof d.attempts === "number" && Number.isFinite(d.attempts) ? Math.max(0, Math.floor(d.attempts)) : 0,
+    first_attempt_at: typeof d.first_attempt_at === "string" ? d.first_attempt_at : null,
+    last_attempt_at: typeof d.last_attempt_at === "string" ? d.last_attempt_at : null,
+    next_attempt_at: typeof d.next_attempt_at === "string" ? d.next_attempt_at : null,
+    status,
+    last_error: typeof d.last_error === "string" ? d.last_error : null,
+    last_http_status: typeof d.last_http_status === "number" ? d.last_http_status : null,
+  };
+}
+
+function skippedOutcome(kind: DestinationKind, destination: string, why: DestinationOutcome["skipped_because"]): DestinationOutcome {
+  return {
+    kind,
+    destination,
+    status: "pending",
+    attempts: 0,
+    next_attempt_at: null,
+    last_error: null,
+    last_http_status: null,
+    skipped_because: why,
+  };
+}
+
+function unwrap(settled: PromiseSettledResult<DestinationOutcome> | undefined, kind: DestinationKind, destination: string): DestinationOutcome {
+  if (settled === undefined) return skippedOutcome(kind, destination, null);
+  if (settled.status === "fulfilled") return settled.value;
+  return {
+    kind,
+    destination,
+    status: "pending",
+    attempts: 0,
+    next_attempt_at: null,
+    last_error: settled.reason instanceof Error ? settled.reason.message : String(settled.reason),
+    last_http_status: null,
+    skipped_because: null,
+  };
+}
+
+function isPartial(central: DestinationOutcome, copy: DestinationOutcome | null): boolean {
+  if (copy === null) return false;
+  return (central.status === "delivered") !== (copy.status === "delivered");
+}
+
+/** A one-line human summary — the surface that must never say "sent" when only one destination was. */
+export function describeSendReport(report: SendReport): string {
+  const one = (o: DestinationOutcome): string => {
+    const suffix = o.skipped_because !== null ? ` (${o.skipped_because})` : o.last_error !== null ? ` (${o.last_error})` : "";
+    return `${o.kind} ${o.status}${suffix}`;
+  };
+  return report.copy === null ? `${report.day}: ${one(report.central)}` : `${report.day}: ${one(report.central)}, ${one(report.copy)}`;
+}
+
+/** Bounded concurrency. Two destinations today; the bound exists so a wider fan-out stays bounded. */
+class Semaphore {
+  private active = 0;
+  private readonly queue: Array<() => void> = [];
+
+  constructor(private readonly limit: number) {}
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.active >= this.limit) {
+      await new Promise<void>((resolve) => this.queue.push(resolve));
+    }
+    this.active += 1;
+    try {
+      return await fn();
+    } finally {
+      this.active -= 1;
+      const next = this.queue.shift();
+      if (next !== undefined) next();
+    }
+  }
+}

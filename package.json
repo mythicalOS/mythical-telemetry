@@ -16,8 +16,7 @@
     "url": "git+https://github.com/mythicalOS/mythical-telemetry.git"
   },
   "workspaces": [
-    "packages/*",
-    "collector"
+    "packages/*"
   ],
   "devDependencies": {
     "bun-types": "^1.3.14",

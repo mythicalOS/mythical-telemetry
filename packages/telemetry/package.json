@@ -1,0 +1,50 @@
+{
+  "name": "@mythicalos/telemetry",
+  "version": "0.1.0",
+  "description": "The shared mythicalOS heartbeat client: the frozen v2 envelope and per-product bodies, the canonical runtime validator, derived instance identity, consent state with provenance, and an SSRF-isolated dual-send transport. Pseudonymous by design and honest about it. Apache-2.0.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mythicalOS/mythical-telemetry.git",
+    "directory": "packages/telemetry"
+  },
+  "homepage": "https://github.com/mythicalOS/mythical-telemetry#readme",
+  "keywords": [
+    "telemetry",
+    "heartbeat",
+    "privacy",
+    "opt-out",
+    "mythicalos"
+  ],
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./schema/heartbeat.v2.json": "./schema/heartbeat.v2.json",
+    "./schema/heartbeat.v1.json": "./schema/heartbeat.v1.json",
+    "./schema/field-classes.json": "./schema/field-classes.json"
+  },
+  "files": [
+    "src",
+    "schema",
+    "README.md",
+    "NOTICE",
+    "!src/**/*.test.ts",
+    "!src/test-fixtures.ts"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "check:manifest": "bun run scripts/check-field-classes.ts",
+    "prepublishOnly": "bun run check:manifest && bun test && bun run typecheck"
+  },
+  "devDependencies": {
+    "ajv": "^8.20.0",
+    "typescript": "^7.0.2"
+  }
+}
