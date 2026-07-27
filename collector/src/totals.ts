@@ -133,6 +133,47 @@ export function foldTotals(product: string, days: readonly unknown[]): Record<st
 }
 
 /**
+ * Per-day means over a window from which the first-report day has ALREADY been
+ * removed by the caller.
+ *
+ * WHY THAT DAY IS EXCLUDED. The emitter produces per-day deltas by diffing
+ * against a stored prior snapshot. A counter with NO prior snapshot emits its
+ * current LIFETIME value — so an installation that ran for months before
+ * telemetry was switched on reports months of accumulation as a single day.
+ * That is not an edge case: it happens once for every installation at
+ * activation, and again for any leaf added later. Averaging that row in
+ * produces a one-time spike at every activation and then permanently
+ * overstates the per-day rate, because the inflated row never ages out of a
+ * lifetime mean.
+ *
+ * The row itself is real and is kept — it is the only occasion on which a
+ * genuine lifetime total is available. It simply is not a representative day.
+ *
+ * ONLY `delta` leaves get a rate. A gauge is a snapshot, so a mean of gauges
+ * is not a rate of anything, and the derived model table is a breakdown rather
+ * than a quantity per day.
+ *
+ * Returns null when the window has no representative day left, rather than
+ * zeros — "no data to average" and "averaged to zero" are different claims.
+ */
+export function foldRates(product: string, rateDays: readonly unknown[]): Record<string, number> | null {
+  const specs = SPECS[product];
+  if (!specs || rateDays.length === 0) return null;
+
+  const out: Record<string, number> = {};
+  for (const spec of specs) {
+    if (spec.mode !== 'sum') continue;
+    let acc = 0;
+    for (const day of rateDays) acc += num(dig(day, spec.path));
+    out[spec.key] = acc / rateDays.length;
+  }
+  if (product === 'brokkr') {
+    out['spine_tokens_saved'] = foldSpineTokensSaved(rateDays) / rateDays.length;
+  }
+  return out;
+}
+
+/**
  * Sum of the per-day spine saving, each floored at zero.
  *
  * Flooring per day rather than on the total is deliberate: a single day where

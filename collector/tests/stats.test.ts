@@ -270,3 +270,136 @@ describe('service plumbing', () => {
     }
   });
 });
+
+describe('the FIRST heartbeat is not a one-day delta, and is excluded from every rate', () => {
+  // The emitter diffs against a stored prior snapshot; a counter with no prior
+  // snapshot emits its whole LIFETIME value. An installation that ran for
+  // months before telemetry was switched on therefore reports months of
+  // accumulation as a single day — once, for every installation, at
+  // activation. Averaging that row in produces a spike at every activation and
+  // then permanently overstates the per-day rate, because it never ages out.
+
+  async function seedActivation(h: ReturnType<typeof makeHarness>) {
+    // Day 1: the lifetime dump. Days 2 and 3: real daily deltas.
+    const first = makeV2('brokkr', INSTANCE_A, '2026-07-07');
+    first['metrics'].sessions = { count: 900, minutes: 9000, failed: 0 };
+    const second = makeV2('brokkr', INSTANCE_A, '2026-07-08');
+    second['metrics'].sessions = { count: 10, minutes: 100, failed: 0 };
+    const third = makeV2('brokkr', INSTANCE_A, '2026-07-09');
+    third['metrics'].sessions = { count: 20, minutes: 200, failed: 0 };
+    for (const d of [first, second, third]) {
+      expect((await h.handler(ingestReq(d, SECRET_A))).status).toBe(202);
+    }
+  }
+
+  test('the first-report day is recorded, surfaced, and named as the excluded one', async () => {
+    const h = makeHarness();
+    await seedActivation(h);
+    const body = await statsFor(h, 'brokkr');
+    expect(body.instance.first_report_day).toBe('2026-07-07');
+    expect(body.rates.excluded_day).toBe('2026-07-07');
+    expect(body.rates.excluded_reason).toBe('first_report_is_not_a_daily_delta');
+    expect(body.rates.days_counted).toBe(2);
+  });
+
+  test('the row is STORED and still counts in the lifetime total', async () => {
+    const h = makeHarness();
+    await seedActivation(h);
+    const body = await statsFor(h, 'brokkr');
+    // It is real data, and the only occasion a genuine lifetime total exists.
+    expect(body.days.map((d: any) => d.day)).toEqual(['2026-07-07', '2026-07-08', '2026-07-09']);
+    expect(body.instance.days_reported).toBe(3);
+    expect(body.totals.sessions).toBe(930);
+  });
+
+  test('the rate is computed WITHOUT it — the naive division is the bug being avoided', async () => {
+    const h = makeHarness();
+    await seedActivation(h);
+    const body = await statsFor(h, 'brokkr');
+    expect(body.rates.per_day.sessions).toBe(15); // (10 + 20) / 2
+    expect(body.rates.per_day.minutes).toBe(150);
+    // What a consumer would have got by dividing the total by the day count:
+    expect(body.totals.sessions / body.days.length).toBe(310);
+  });
+
+  test('the exclusion holds as the window grows — it does not age out', async () => {
+    const h = makeHarness({ today: '2026-07-09' });
+    await seedActivation(h);
+    // Trimming to the most recent 2 days drops the first-report day anyway...
+    const trimmed = await statsFor(h, 'brokkr', '2');
+    expect(trimmed.rates.days_counted).toBe(2);
+    expect(trimmed.rates.excluded_day).toBeNull(); // it was not in this window
+    expect(trimmed.rates.per_day.sessions).toBe(15);
+    // ...while the full window still excludes it.
+    const full = await statsFor(h, 'brokkr');
+    expect(full.rates.excluded_day).toBe('2026-07-07');
+    expect(full.rates.per_day.sessions).toBe(15);
+  });
+
+  test('a window containing ONLY the first-report day yields no rate at all', async () => {
+    // Not zeros: "nothing representative to average" and "averaged to zero"
+    // are different claims, and the second one is a lie.
+    const h = makeHarness();
+    const first = makeV2('brokkr', INSTANCE_A, '2026-07-09');
+    first['metrics'].sessions = { count: 900, minutes: 9000, failed: 0 };
+    await h.handler(ingestReq(first, SECRET_A));
+    const body = await statsFor(h, 'brokkr');
+    expect(body.rates.days_counted).toBe(0);
+    expect(body.rates.per_day).toBeNull();
+    expect(body.rates.excluded_day).toBe('2026-07-09');
+    expect(body.totals.sessions).toBe(900); // the total is still reported
+  });
+
+  test('the first-report day is the FIRST heartbeat received, not the earliest day sent later', async () => {
+    // A backfilled earlier day is an ordinary delta; the lifetime dump was the
+    // first emission, whatever day it covered.
+    const h = makeHarness({ today: '2026-07-09' });
+    const first = makeV2('brokkr', INSTANCE_A, '2026-07-09');
+    first['metrics'].sessions = { count: 900, minutes: 9000, failed: 0 };
+    await h.handler(ingestReq(first, SECRET_A));
+    const earlier = makeV2('brokkr', INSTANCE_A, '2026-07-05');
+    earlier['metrics'].sessions = { count: 4, minutes: 40, failed: 0 };
+    await h.handler(ingestReq(earlier, SECRET_A));
+
+    const body = await statsFor(h, 'brokkr');
+    expect(body.instance.first_report_day).toBe('2026-07-09');
+    expect(body.rates.excluded_day).toBe('2026-07-09');
+    expect(body.rates.days_counted).toBe(1);
+    expect(body.rates.per_day.sessions).toBe(4);
+  });
+
+  test('re-sending the first day does not move the marker', async () => {
+    const h = makeHarness();
+    await seedActivation(h);
+    const resent = makeV2('brokkr', INSTANCE_A, '2026-07-07');
+    resent['metrics'].sessions = { count: 950, minutes: 9500, failed: 0 };
+    await h.handler(ingestReq(resent, SECRET_A));
+    const body = await statsFor(h, 'brokkr');
+    expect(body.instance.first_report_day).toBe('2026-07-07');
+    expect(body.rates.per_day.sessions).toBe(15);
+  });
+
+  test('each (instance, product) has its OWN first-report day', async () => {
+    const h = makeHarness();
+    await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-07'), SECRET_A));
+    await h.handler(ingestReq(makeV2('saga', INSTANCE_A, '2026-07-09'), SECRET_A));
+    expect((await statsFor(h, 'brokkr')).instance.first_report_day).toBe('2026-07-07');
+    expect((await statsFor(h, 'saga')).instance.first_report_day).toBe('2026-07-09');
+  });
+
+  test('gauges are not rated, and neither is the model breakdown', async () => {
+    const h = makeHarness();
+    await h.handler(ingestReq(makeV2('saga', INSTANCE_A, '2026-07-08'), SECRET_A));
+    await h.handler(ingestReq(makeV2('saga', INSTANCE_A, '2026-07-09'), SECRET_A));
+    const body = await statsFor(h, 'saga');
+    // A mean of snapshots is not a rate of anything.
+    expect(body.rates.per_day.connections_total).toBeUndefined();
+    expect(body.rates.per_day.uptime_bucket).toBeUndefined();
+    expect(body.totals.connections_total).toBe(4);
+    // ...and brokkr's model table is a breakdown, not a quantity per day.
+    const b = makeHarness();
+    await b.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-08'), SECRET_A));
+    await b.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-09'), SECRET_A));
+    expect((await statsFor(b, 'brokkr')).rates.per_day.models).toBeUndefined();
+  });
+});

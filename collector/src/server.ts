@@ -43,7 +43,7 @@ import { parseTrustedProxies } from './ip';
 import { normalizeToV2 } from './normalize';
 import { renderAggregatePage, type AggregateProductView, type AggregateView } from './page';
 import { resolveSourceKey, TokenBucketLimiter, type ServerLike } from './throttle';
-import { decorateDay, foldTotals, type TotalsValue } from './totals';
+import { decorateDay, foldRates, foldTotals, type TotalsValue } from './totals';
 import { safeValidate, type HeartbeatValidator } from './validator';
 
 export type { ServerLike } from './throttle';
@@ -157,10 +157,27 @@ interface StatsBody {
     product: string;
     first_seen_day: string;
     last_seen_day: string;
+    /** The day that is NOT a one-day delta. See `rates`. */
+    first_report_day: string | null;
     days_reported: number;
   };
   days: unknown[];
+  /** Sums and gauges over the WHOLE window, first-report day included. */
   totals: Record<string, TotalsValue>;
+  /**
+   * Per-day rates, over the window MINUS the first-report day.
+   *
+   * Exposed as its own object — rather than left for a consumer to compute as
+   * `totals.x / days.length` — precisely because that computation is the bug:
+   * it averages in a row that carries an installation's entire pre-telemetry
+   * history.
+   */
+  rates: {
+    days_counted: number;
+    excluded_day: string | null;
+    excluded_reason: 'first_report_is_not_a_daily_delta' | null;
+    per_day: Record<string, number> | null;
+  };
 }
 
 export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
@@ -396,6 +413,16 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
       return payload;
     });
 
+    // The first heartbeat from an identity is not a one-day delta: a counter
+    // with no prior snapshot emits its LIFETIME value, so an install that ran
+    // for months before telemetry was enabled reports months as one day. It is
+    // stored (the total is real and useful) but excluded from every rate.
+    const firstReportDay = inst.first_report_day;
+    const rateDays = firstReportDay === null
+      ? days
+      : days.filter((d) => d['day'] !== firstReportDay);
+    const excluded = firstReportDay !== null && rateDays.length !== days.length;
+
     return {
       ok: true,
       contract_version: 2,
@@ -405,10 +432,17 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
         product,
         first_seen_day: inst.first_seen_day,
         last_seen_day: inst.last_seen_day,
+        first_report_day: firstReportDay,
         days_reported: db.countHeartbeats(uuid, product),
       },
       days,
       totals: foldTotals(product, days),
+      rates: {
+        days_counted: rateDays.length,
+        excluded_day: excluded ? firstReportDay : null,
+        excluded_reason: excluded ? 'first_report_is_not_a_daily_delta' : null,
+        per_day: foldRates(product, rateDays),
+      },
     };
   }
 
@@ -593,16 +627,17 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
       const path = url.pathname;
 
       if (path === '/healthz' && req.method === 'GET') return json(200, { ok: true });
+      // The counter is incremented only AFTER the snapshot is in hand: a
+      // failed cache build must not be recorded as a served aggregate.
       if (path === '/' && req.method === 'GET') {
+        const page = aggregateSnapshot().html;
         counters.inc('read_aggregate_ok');
-        return html(200, aggregateSnapshot().html);
+        return html(200, page);
       }
       if (path === '/v1/stats' && req.method === 'GET') {
+        const body = aggregateSnapshot().json;
         counters.inc('read_aggregate_ok');
-        return new Response(aggregateSnapshot().json, {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
+        return new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
       }
       if (path === '/v1/schema' && req.method === 'GET' && schemaJson !== null) {
         return new Response(schemaJson, { status: 200, headers: { 'content-type': 'application/json' } });

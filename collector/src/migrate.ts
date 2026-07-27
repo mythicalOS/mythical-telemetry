@@ -21,7 +21,10 @@
 //   • state is detected from the actual table shape INSIDE that transaction,
 //     never from `PRAGMA user_version` alone, so re-running is a no-op and a
 //     hand-edited version marker cannot skip a rebuild that is genuinely
-//     needed.
+//     needed;
+//   • the PAYLOAD pass has its own durable marker, separate from the shape
+//     version, so a database whose tables were converted by other means still
+//     gets its stored v1 documents normalized.
 //
 // Nothing is dropped. A payload that cannot be parsed is carried over verbatim
 // and counted, never discarded.
@@ -29,8 +32,37 @@
 import type { Database } from 'bun:sqlite';
 import { v1ToV2 } from './normalize';
 
-/** Bumped only when a further rebuild is required. */
-export const SCHEMA_USER_VERSION = 1;
+/** Bumped when the table shape changes. */
+export const SCHEMA_USER_VERSION = 2;
+
+/**
+ * Bumped when stored payloads need a further rewrite.
+ *
+ * Tracked SEPARATELY from the shape version, in a table only this code writes.
+ * Conflating the two means a database whose tables already carry `product` —
+ * a hand-completed or partially-scripted upgrade — but whose payloads are
+ * still raw v1 gets its normalization pass skipped, because the shape marker
+ * already says "done". The read path then folds zeros out of documents it
+ * cannot see into: wrong numbers, no error, nobody notices.
+ */
+export const NORMALIZATION_PASS = 1;
+
+/** Key under which the completed normalization pass is recorded. */
+const NORMALIZATION_KEY = 'normalization_pass';
+
+/**
+ * Bumped when `instances.first_report_day` needs (re)deriving for existing rows.
+ *
+ * That column records the day of an identity's FIRST heartbeat, which is the
+ * one day that is not a one-day delta: a counter with no prior snapshot emits
+ * its whole lifetime value, so an install that ran for months before telemetry
+ * was switched on reports months of accumulation as a single day. The read
+ * path must not average that row in — see `foldRates` — and it can only do so
+ * if the day is recorded durably. Deriving it from whatever happens to be in
+ * the window would break the moment retention pruned the real first day.
+ */
+export const FIRST_REPORT_BACKFILL = 1;
+const FIRST_REPORT_KEY = 'first_report_backfill';
 
 /** The product every pre-product row is backfilled as. */
 export const LEGACY_PRODUCT = 'brokkr';
@@ -55,6 +87,12 @@ export interface MigrationReport {
   payloadsUnparseable: number;
   /** The admission ledger was created and back-filled from existing rows. */
   admissionsSeeded: boolean;
+  /** The stored-payload normalization pass ran (rather than being skipped as already done). */
+  normalizationPassRan: boolean;
+  /** `instances.first_report_day` was added to an existing table. */
+  addedFirstReportColumn: boolean;
+  /** Rows whose first-report day was derived from surviving heartbeats. */
+  firstReportBackfilled: number;
 }
 
 const HEARTBEATS_DDL = `
@@ -69,12 +107,18 @@ const HEARTBEATS_DDL = `
   );
 `;
 
+// `first_report_day` is NULLABLE on purpose: a row carried over from a
+// pre-column database whose heartbeats have all been pruned has no derivable
+// first day, and NULL says "unknown" honestly. It is never filled in later
+// from a subsequent heartbeat — that would mark an ordinary day as the
+// first-report day and wrongly exclude it from every rate.
 const INSTANCES_DDL = `
   CREATE TABLE IF NOT EXISTS instances (
-    instance_id    TEXT NOT NULL,
-    product        TEXT NOT NULL,
-    first_seen_day TEXT NOT NULL,
-    last_seen_day  TEXT NOT NULL,
+    instance_id      TEXT NOT NULL,
+    product          TEXT NOT NULL,
+    first_seen_day   TEXT NOT NULL,
+    last_seen_day    TEXT NOT NULL,
+    first_report_day TEXT,
     PRIMARY KEY (instance_id, product)
   );
 `;
@@ -89,6 +133,15 @@ const ADMISSIONS_DDL = `
   CREATE TABLE IF NOT EXISTS admissions (
     day      TEXT PRIMARY KEY,
     admitted INTEGER NOT NULL
+  );
+`;
+
+// Durable markers this code owns. Separate from `PRAGMA user_version`, which
+// an operator or an older script may have set by hand.
+const META_DDL = `
+  CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
   );
 `;
 
@@ -112,6 +165,19 @@ function columnNames(db: Database, table: string): string[] {
   return rows.map((r) => r.name);
 }
 
+/** A meta marker as an integer; 0 when absent or unreadable. */
+function readMetaInt(db: Database, key: string): number {
+  if (!tableExists(db, 'meta')) return 0;
+  const row = db.query<{ value: string }, [string]>('SELECT value FROM meta WHERE key = ?1').get(key);
+  const n = Number(row?.value);
+  return Number.isInteger(n) && n > 0 ? n : 0;
+}
+
+function writeMeta(db: Database, key: string, value: string): void {
+  db.query('INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+    .run(key, value);
+}
+
 function userVersion(db: Database): number {
   return db.query<{ user_version: number }, []>('PRAGMA user_version').get()?.user_version ?? 0;
 }
@@ -131,6 +197,9 @@ export function migrate(db: Database): MigrationReport {
     payloadsNormalized: 0,
     payloadsUnparseable: 0,
     admissionsSeeded: false,
+    normalizationPassRan: false,
+    addedFirstReportColumn: false,
+    firstReportBackfilled: 0,
   };
 
   // IMMEDIATE takes the write lock up front, so a second process booting on
@@ -139,7 +208,6 @@ export function migrate(db: Database): MigrationReport {
   db.exec('BEGIN IMMEDIATE');
   try {
     // Detection happens INSIDE the transaction — see above.
-    const versionInTx = userVersion(db);
     const hasHeartbeats = tableExists(db, 'heartbeats');
     const hasInstances = tableExists(db, 'instances');
     const heartbeatsNeedsProduct = hasHeartbeats && !columnNames(db, 'heartbeats').includes('product');
@@ -162,6 +230,14 @@ export function migrate(db: Database): MigrationReport {
     db.exec(HEARTBEATS_DDL);
     db.exec(INSTANCES_DDL);
     db.exec(ADMISSIONS_DDL);
+    db.exec(META_DDL);
+
+    // Additive column for a database that already has `product` but predates
+    // the first-report rule. ADD COLUMN is cheap and does not rewrite rows.
+    if (!columnNames(db, 'instances').includes('first_report_day')) {
+      db.exec('ALTER TABLE instances ADD COLUMN first_report_day TEXT');
+      report.addedFirstReportColumn = true;
+    }
     db.exec(INDEX_DDL);
 
     // Seed the ledger from what is already stored, so upgrading does not hand
@@ -174,14 +250,32 @@ export function migrate(db: Database): MigrationReport {
       report.admissionsSeeded = true;
     }
 
-    // The payload pass is O(rows) and must not run on every boot. It runs when
-    // a rebuild just happened, or when the version marker says this database
-    // has not been through it yet.
-    if (report.rebuiltHeartbeats || versionInTx < SCHEMA_USER_VERSION) {
+    // The payload pass is O(rows) and must not run on every boot — but the
+    // thing that decides is the marker for THIS pass, written only by the code
+    // below, never the table-shape version. See NORMALIZATION_PASS.
+    const passDone = readMetaInt(db, NORMALIZATION_KEY);
+    if (report.rebuiltHeartbeats || passDone < NORMALIZATION_PASS) {
       const pass = normalizeStoredV1Payloads(db);
       report.payloadsNormalized = pass.normalized;
       report.payloadsUnparseable = pass.unparseable;
+      report.normalizationPassRan = true;
     }
+    writeMeta(db, NORMALIZATION_KEY, String(NORMALIZATION_PASS));
+
+    // Derive the first-report day for rows that predate the column. MIN(day)
+    // over the surviving heartbeats is the best evidence available; where no
+    // heartbeat survives, the value stays NULL rather than being guessed.
+    if (readMetaInt(db, FIRST_REPORT_KEY) < FIRST_REPORT_BACKFILL) {
+      report.firstReportBackfilled = db
+        .query(`
+          UPDATE instances SET first_report_day = (
+            SELECT MIN(h.day) FROM heartbeats h
+            WHERE h.instance_id = instances.instance_id AND h.product = instances.product
+          ) WHERE first_report_day IS NULL
+        `)
+        .run().changes;
+    }
+    writeMeta(db, FIRST_REPORT_KEY, String(FIRST_REPORT_BACKFILL));
 
     db.exec(`PRAGMA user_version = ${SCHEMA_USER_VERSION}`);
     db.exec('COMMIT');
@@ -238,10 +332,11 @@ function rebuildInstances(db: Database): number {
   db.exec('DROP TABLE IF EXISTS instances_migration_tmp');
   db.exec(`
     CREATE TABLE instances_migration_tmp (
-      instance_id    TEXT NOT NULL,
-      product        TEXT NOT NULL,
-      first_seen_day TEXT NOT NULL,
-      last_seen_day  TEXT NOT NULL,
+      instance_id      TEXT NOT NULL,
+      product          TEXT NOT NULL,
+      first_seen_day   TEXT NOT NULL,
+      last_seen_day    TEXT NOT NULL,
+      first_report_day TEXT,
       PRIMARY KEY (instance_id, product)
     );
   `);

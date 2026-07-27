@@ -43,6 +43,7 @@ describe('TelemetryDb basics', () => {
         'instances.product',
         'instances.first_seen_day',
         'instances.last_seen_day',
+        'instances.first_report_day',
         'heartbeats.instance_id',
         'heartbeats.product',
         'heartbeats.day',

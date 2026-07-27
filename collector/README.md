@@ -13,7 +13,7 @@ canonical schema declares — counts, buckets, booleans, closed enums and versio
 
 | Table | Columns |
 |---|---|
-| `instances` | `instance_id`, `product`, `first_seen_day`, `last_seen_day` — PK `(instance_id, product)` |
+| `instances` | `instance_id`, `product`, `first_seen_day`, `last_seen_day`, `first_report_day` — PK `(instance_id, product)` |
 | `heartbeats` | `instance_id`, `product`, `day`, `schema_version`, `payload`, `received_day` — PK `(instance_id, product, day)` |
 | `admissions` | `day`, `admitted` — the append-only admission ledger; counts only, no identities |
 
@@ -66,7 +66,7 @@ open to anyone holding the id, and the unauthenticated per-installation page tha
 | Route | Method | Auth | Notes |
 |---|---|---|---|
 | `/v1/ingest` | POST | instance secret | v1 and v2 accepted; 32 KB body cap; day window (≤ today UTC, ≥ today−30); upsert per (instance, product, day), last write wins; `202 {ok:true}` |
-| `/v1/instances/<uuid>/stats?product=<name>` | GET | instance secret | that installation's own days and totals; optional `&days=N` (1–400) |
+| `/v1/instances/<uuid>/stats?product=<name>` | GET | instance secret | that installation's own days, totals and per-day rates; optional `&days=N` (1–400) |
 | `/v1/instances/<uuid>` | DELETE | instance secret | purges the identity across **every** product; idempotent `204` |
 
 Every authenticated route is per-source throttled. Anyone can mint a valid (secret, id) pair, so an
@@ -91,6 +91,53 @@ fine-grained breakdown from `/metrics`, callers do not.
 `/metrics` is gated because live rejection counts are a feedback channel for tuning an attack, and
 the population figures are commercially sensitive. The operator key is **not** a write or read
 credential: it cannot ingest, and it cannot read any installation's data.
+
+## The first heartbeat from an installation is not a one-day delta
+
+**Read this before deriving any per-day figure from this data, including in a collector of your
+own.** It is invisible until the numbers look wrong months later.
+
+The client emits per-day deltas by diffing each counter against a stored prior snapshot. A counter
+with **no** prior snapshot emits its **current lifetime value**. On a fresh installation that is
+roughly a day's activity. On an installation that has been running for months before telemetry was
+switched on, it is **months of accumulation arriving as a single day's row**.
+
+This is not an edge case that might occur — **it happens once for every installation**, at
+activation, because no installation has a prior snapshot the first time. It recurs for any leaf
+added later: that leaf's first heartbeat on an existing installation carries its whole history.
+
+The emitter deliberately does not paper over this by sending `0` for an unseen counter — that would
+discard real activity and throw away a genuinely useful total on the one occasion it is available.
+So the rule belongs to the collector:
+
+> **Exclude each `(instance_id, product)`'s first observed day from every per-day rate statistic.**
+> Store the row — it is real data and its total is meaningful — but do not average it in, and do not
+> present it as a representative day.
+
+A collector that skips this reports a large one-time spike at every installation's activation and
+then **overstates per-day rates permanently**, because the inflated row never ages out of a lifetime
+average.
+
+How this collector implements it:
+
+- `instances.first_report_day` records the `day` of that identity's **first** heartbeat, written
+  once on insert and never moved — not derived from whatever happens to be in the query window,
+  which would break the moment retention pruned the real first day.
+- The authenticated read returns `instance.first_report_day`, and a separate `rates` object whose
+  `per_day` figures are computed over the window **minus** that day. `rates.days_counted` and
+  `rates.excluded_day` say exactly what was used.
+- `totals` still covers the whole window, first-report row included. It is a lifetime total, and
+  that row belongs in it.
+- **`totals.x / days.length` is the bug.** The `rates` object exists so the correct figure is the
+  easy one to reach.
+- When the window holds only the first-report day, `rates.per_day` is `null` rather than zeros —
+  "nothing representative to average" and "averaged to zero" are different claims.
+- Gauges get no rate (a mean of snapshots is not a rate of anything), and neither does the model
+  breakdown.
+- Upgrading an existing volume derives `first_report_day` from the earliest surviving heartbeat.
+  Where no heartbeat survives it stays `NULL`, meaning *unknown* — it is never filled in from a
+  later heartbeat, which would stamp an ordinary day as the first and exclude it from every rate
+  from then on.
 
 ## Statistics, and why there is no family total
 
@@ -340,12 +387,17 @@ collector ships a **transactional rebuild** that runs at boot:
 - every existing row is carried over and backfilled as product `brokkr`;
 - the admission ledger is created and seeded from the identities already stored, so upgrading does
   not hand today's budget back in full;
+- `instances.first_report_day` is added and derived from the earliest surviving heartbeat (see
+  above);
 - stored v1 payloads are normalized to v2 **at rest**, so the read path has one shape — leaving
   them would not crash, it would silently fold zeros into every historical total;
 - the whole thing is one `IMMEDIATE` transaction: it lands completely or not at all, and a second
   process booting on the same file waits rather than racing;
 - the shape is detected from the actual tables, not from a version marker, so re-running is a
   no-op and a hand-edited marker cannot skip a rebuild that is genuinely needed;
+- the payload pass has its **own** durable marker, separate from the shape version, so a database
+  whose tables were converted by other means still gets its stored v1 documents normalized rather
+  than silently folding zeros into every historical total;
 - nothing is dropped. A payload that will not parse is carried over verbatim and counted.
 
 The report is logged at boot and served on `/metrics`. **Back up the volume first anyway** — this

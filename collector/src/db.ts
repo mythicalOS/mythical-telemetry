@@ -52,6 +52,13 @@ export interface InstanceRow {
   product: string;
   first_seen_day: string;
   last_seen_day: string;
+  /**
+   * The `day` of this identity's FIRST heartbeat — the one day that is not a
+   * one-day delta, because a counter with no prior snapshot emits its whole
+   * lifetime value. NULL only for rows carried over from a database that
+   * predates the column and whose heartbeats have all been pruned.
+   */
+  first_report_day: string | null;
 }
 
 export interface HeartbeatRow {
@@ -113,9 +120,12 @@ export class TelemetryDb {
     // migration drops and renames the tables they reference.
     this.migration = migrate(this.db);
 
+    // `first_report_day` is written ONLY on insert. Filling it in later from
+    // a subsequent heartbeat would stamp an ordinary day as the first-report
+    // day and exclude it from every rate for the rest of that install's life.
     this.stmtUpsertInstance = this.db.query(`
-      INSERT INTO instances (instance_id, product, first_seen_day, last_seen_day)
-      VALUES (?1, ?2, ?3, ?3)
+      INSERT INTO instances (instance_id, product, first_seen_day, last_seen_day, first_report_day)
+      VALUES (?1, ?2, ?3, ?3, ?4)
       ON CONFLICT(instance_id, product) DO UPDATE SET
         last_seen_day = MAX(instances.last_seen_day, excluded.last_seen_day)
     `);
@@ -128,7 +138,7 @@ export class TelemetryDb {
         received_day = excluded.received_day
     `);
     this.stmtGetInstance = this.db.query(
-      'SELECT instance_id, product, first_seen_day, last_seen_day FROM instances WHERE instance_id = ?1 AND product = ?2',
+      'SELECT instance_id, product, first_seen_day, last_seen_day, first_report_day FROM instances WHERE instance_id = ?1 AND product = ?2',
     );
     this.stmtCountInstances = this.db.query('SELECT COUNT(*) AS n FROM instances');
     this.stmtAdmittedOnDay = this.db.query('SELECT admitted FROM admissions WHERE day = ?1');
@@ -229,7 +239,7 @@ export class TelemetryDb {
         }
         this.stmtBumpAdmissions.run(receivedDay);
       }
-      this.stmtUpsertInstance.run(instanceId, product, receivedDay);
+      this.stmtUpsertInstance.run(instanceId, product, receivedDay, day);
       this.stmtUpsertHeartbeat.run(instanceId, product, day, wireVersion, payloadJson, receivedDay);
       this.db.exec('COMMIT');
       return { ok: true, existing };

@@ -181,6 +181,7 @@ describe('migration against a REAL old-schema database', () => {
       expect(second.migration.rebuiltHeartbeats).toBe(false);
       expect(second.migration.rebuiltInstances).toBe(false);
       expect(second.migration.payloadsNormalized).toBe(0);
+      expect(second.migration.normalizationPassRan).toBe(false);
       expect(second.migration.fromUserVersion).toBe(SCHEMA_USER_VERSION);
       // Byte-identical: a second pass must not re-transform an already
       // normalized document.
@@ -270,6 +271,60 @@ describe('migration against a REAL old-schema database', () => {
     }
   });
 
+  test('a database converted by OTHER means still gets its stored v1 payloads normalized', () => {
+    // The silent-miss this closes: tables already carry `product` and
+    // user_version already says 1, but the payloads are raw v1. Gating the
+    // payload pass on the SHAPE marker would skip it, and every historical
+    // total would then quietly fold zeros out of documents it cannot see into.
+    const path = tempDbPath();
+    seedOldDatabase(path, [
+      { instanceId: INSTANCE_A, day: '2026-07-07', payload: JSON.stringify(makeV1(INSTANCE_A, '2026-07-07')) },
+    ]);
+    const raw = new Database(path);
+    raw.exec(`
+      CREATE TABLE hb2 (
+        instance_id TEXT NOT NULL, product TEXT NOT NULL, day TEXT NOT NULL,
+        schema_version INTEGER NOT NULL, payload TEXT NOT NULL, received_day TEXT NOT NULL,
+        PRIMARY KEY (instance_id, product, day)
+      );
+      INSERT INTO hb2 SELECT instance_id, 'brokkr', day, schema_version, payload, received_day FROM heartbeats;
+      DROP TABLE heartbeats;
+      ALTER TABLE hb2 RENAME TO heartbeats;
+      CREATE TABLE inst2 (
+        instance_id TEXT NOT NULL, product TEXT NOT NULL,
+        first_seen_day TEXT NOT NULL, last_seen_day TEXT NOT NULL,
+        PRIMARY KEY (instance_id, product)
+      );
+      INSERT INTO inst2 SELECT instance_id, 'brokkr', first_seen_day, last_seen_day FROM instances;
+      DROP TABLE instances;
+      ALTER TABLE inst2 RENAME TO instances;
+    `);
+    raw.exec(`PRAGMA user_version = ${SCHEMA_USER_VERSION}`);
+    raw.close();
+
+    const db = new TelemetryDb({ path });
+    try {
+      expect(db.migration.rebuiltHeartbeats).toBe(false);
+      expect(db.migration.rebuiltInstances).toBe(false);
+      expect(db.migration.normalizationPassRan).toBe(true);
+      expect(db.migration.payloadsNormalized).toBe(1);
+      const doc = JSON.parse(db.getHeartbeats(INSTANCE_A, LEGACY_PRODUCT)[0]!.payload);
+      expect(doc.schema_version).toBe(2);
+      expect(doc.metrics.sessions.count).toBe(12);
+    } finally {
+      db.close();
+    }
+
+    // ...and it is a no-op the next time.
+    const again = new TelemetryDb({ path });
+    try {
+      expect(again.migration.normalizationPassRan).toBe(false);
+      expect(again.migration.payloadsNormalized).toBe(0);
+    } finally {
+      again.close();
+    }
+  });
+
   test('an unparseable stored payload is carried over verbatim and counted, never dropped', () => {
     const path = tempDbPath();
     seedOldDatabase(path, [
@@ -302,6 +357,57 @@ describe('migration against a REAL old-schema database', () => {
     try {
       expect(db.migration.payloadsNormalized).toBe(0);
       expect(db.getHeartbeats(INSTANCE_A, LEGACY_PRODUCT)[0]!.payload).toBe(v2Doc);
+    } finally {
+      db.close();
+    }
+  });
+
+  test('an upgraded database gets first_report_day derived from its surviving heartbeats', () => {
+    // Rows written before the column existed have no recorded first day. The
+    // best evidence available is the earliest heartbeat that survives.
+    const path = tempDbPath();
+    seedOldDatabase(path, [
+      { instanceId: INSTANCE_A, day: '2026-07-07', payload: JSON.stringify(makeV1(INSTANCE_A, '2026-07-07')) },
+      { instanceId: INSTANCE_A, day: '2026-07-09', payload: JSON.stringify(makeV1(INSTANCE_A, '2026-07-09')) },
+      { instanceId: INSTANCE_B, day: '2026-07-08', payload: JSON.stringify(makeV1(INSTANCE_B, '2026-07-08')) },
+    ]);
+
+    const db = new TelemetryDb({ path });
+    try {
+      expect(db.getInstance(INSTANCE_A, LEGACY_PRODUCT)?.first_report_day).toBe('2026-07-07');
+      expect(db.getInstance(INSTANCE_B, LEGACY_PRODUCT)?.first_report_day).toBe('2026-07-08');
+    } finally {
+      db.close();
+    }
+
+    // Re-running does not re-derive it.
+    const again = new TelemetryDb({ path });
+    try {
+      expect(again.migration.firstReportBackfilled).toBe(0);
+      expect(again.getInstance(INSTANCE_A, LEGACY_PRODUCT)?.first_report_day).toBe('2026-07-07');
+    } finally {
+      again.close();
+    }
+  });
+
+  test('an instance whose heartbeats have all been pruned keeps a NULL first-report day', () => {
+    // NULL says "unknown" honestly. Filling it in from a later heartbeat would
+    // stamp an ordinary day as the first-report day and exclude it from every
+    // rate for the rest of that installation's life.
+    const path = tempDbPath();
+    seedOldDatabase(path, [
+      { instanceId: INSTANCE_A, day: '2026-07-07', payload: JSON.stringify(makeV1(INSTANCE_A, '2026-07-07')) },
+    ]);
+    const raw = new Database(path);
+    raw.exec('DELETE FROM heartbeats');
+    raw.close();
+
+    const db = new TelemetryDb({ path });
+    try {
+      expect(db.getInstance(INSTANCE_A, LEGACY_PRODUCT)?.first_report_day).toBeNull();
+      // A later heartbeat does NOT claim the marker.
+      db.recordHeartbeat(INSTANCE_A, LEGACY_PRODUCT, '2026-08-01', 2, '{}', '2026-08-01');
+      expect(db.getInstance(INSTANCE_A, LEGACY_PRODUCT)?.first_report_day).toBeNull();
     } finally {
       db.close();
     }
