@@ -345,3 +345,52 @@ describe("fixtures stay representative", () => {
     expect(Object.keys(skuldFixture().metrics)).toContain("detection_state");
   });
 });
+
+// ── the two contract amendments, pinned ────────────────────────────────────────────────────
+//
+// Both were the same defect class: a leaf drafted from prose that no producer actually emits.
+// Rule 4 of the field contract forbids freezing such a leaf, because it ships zero forever and
+// nobody can tell that from "this install has none". These assertions exist so a well-meaning
+// "the plan says three severities" edit fails the build instead of the review.
+
+describe("amended contract: no leaf without a producer", () => {
+  const v2 = v2Schema as unknown as {
+    definitions: Record<string, { required: string[]; properties: Record<string, { required?: string[]; properties?: Record<string, unknown> }> }>;
+  };
+  const m = manifest as unknown as { metrics: Record<string, Record<string, unknown>> };
+
+  test("skuld carries NO events.deferrals — its producer is dead (validate-and-run, never deferred)", () => {
+    expect(v2.definitions.skuld_metrics!.required).not.toContain("events");
+    expect(Object.keys(v2.definitions.skuld_metrics!.properties)).not.toContain("events");
+    expect(Object.keys(m.metrics.skuld!).filter((k) => k.startsWith("events"))).toEqual([]);
+    // No leaf named `deferrals` anywhere in the body — the word survives only in the `gate`
+    // description, which records WHY it is absent so the next author does not re-add it.
+    for (const section of Object.values(v2.definitions.skuld_metrics!.properties)) {
+      expect(Object.keys(section.properties ?? {})).not.toContain("deferrals");
+    }
+    expect(validateHeartbeat({ ...skuldFixture(), metrics: { ...skuldFixture().metrics, events: { deferrals: 0 } } }).ok).toBe(false);
+  });
+
+  test("saga's advisories.by_severity is exactly {info, warn} — no `critical` exists upstream", () => {
+    const bySeverity = v2.definitions.saga_metrics!.properties.advisories!.properties!.by_severity as { required: string[] };
+    expect([...bySeverity.required].sort()).toEqual(["info", "warn"]);
+    expect(Object.keys(m.metrics.saga!).filter((k) => k.startsWith("advisories.by_severity")).sort()).toEqual([
+      "advisories.by_severity.info",
+      "advisories.by_severity.warn",
+    ]);
+    const withCritical = sagaFixture();
+    (withCritical.metrics.advisories.by_severity as unknown as Record<string, number>).critical = 0;
+    expect(validateHeartbeat(withCritical).ok).toBe(false);
+    expect(schemaAccepts(withCritical)).toBe(false);
+  });
+
+  test("detection_state distinguishes `unknown` (never probed) from `not_detected`", () => {
+    expect([...DETECTION_STATES]).toEqual(["unknown", "not_detected", "detected"]);
+    for (const state of DETECTION_STATES) {
+      const fixture = skuldFixture();
+      fixture.metrics.detection_state = state;
+      expect(validateHeartbeat(fixture).ok).toBe(true);
+      expect(schemaAccepts(fixture)).toBe(true);
+    }
+  });
+});

@@ -516,10 +516,9 @@
               "additionalProperties": false,
               "required": [
                 "info",
-                "warn",
-                "critical"
+                "warn"
               ],
-              "description": "CLOSED severity taxonomy — grows only by schema-version bump, never free keys. No cross-field relation to advisories.fired is asserted: the two are separate counters, so a mis-instrumented call site would make an otherwise correct day structurally invalid and lose it silently.",
+              "description": "CLOSED severity taxonomy — TWO members, matching the advisor severity type exactly. A third severity was drafted and struck: it does not exist in the source, and freezing it would ship a permanently-zero leaf with no producer. Grows only by schema-version bump, never free keys. No cross-field relation to advisories.fired is asserted: the two are separate counters, so a mis-instrumented call site would make an otherwise correct day structurally invalid and lose it silently.",
               "properties": {
                 "info": {
                   "type": "integer",
@@ -527,11 +526,6 @@
                   "maximum": 1000000000
                 },
                 "warn": {
-                  "type": "integer",
-                  "minimum": 0,
-                  "maximum": 1000000000
-                },
-                "critical": {
                   "type": "integer",
                   "minimum": 0,
                   "maximum": 1000000000
@@ -651,7 +645,6 @@
       "required": [
         "jobs",
         "runs",
-        "events",
         "gate",
         "sandbox",
         "detection_state",
@@ -739,20 +732,6 @@
             }
           }
         },
-        "events": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "deferrals"
-          ],
-          "properties": {
-            "deferrals": {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 1000000000
-            }
-          }
-        },
         "gate": {
           "type": "object",
           "additionalProperties": false,
@@ -760,16 +739,19 @@
             "rejections",
             "approvals"
           ],
+          "description": "No `events.deferrals` leaf exists: it was drafted, found to have a dead producer (the event trigger arm validates-and-runs rather than validates-and-defers) and dropped before the freeze rather than shipped permanently zero. Adding it later is a NEW LEAF IN A NEW SCHEMA VERSION.",
           "properties": {
             "rejections": {
               "type": "integer",
               "minimum": 0,
-              "maximum": 1000000000
+              "maximum": 1000000000,
+              "description": "Gate refusals (delta)."
             },
             "approvals": {
               "type": "integer",
               "minimum": 0,
-              "maximum": 1000000000
+              "maximum": 1000000000,
+              "description": "Gate ADMISSIONS (delta) — the symmetric partner of rejections; together, the gate's throughput. A recurring job approved once bumps this on every run."
             }
           }
         },
@@ -789,7 +771,8 @@
             "uid_vends": {
               "type": "integer",
               "minimum": 0,
-              "maximum": 1000000000
+              "maximum": 1000000000,
+              "description": "Uid vends (delta), counted at the uid POOL BOUNDARY — the pool has more than one consumer, so per-caller counting under-reports."
             }
           }
         },
@@ -797,10 +780,10 @@
           "type": "string",
           "enum": [
             "unknown",
-            "detected",
-            "not_detected"
+            "not_detected",
+            "detected"
           ],
-          "description": "Whether a sibling product was detected on the shared network (gauge). A CLOSED enum, never the raw integer the local counter holds, and never a peer address, name or version."
+          "description": "Whether a sibling product was detected on the shared network (gauge). A CLOSED enum, never the raw integer the local gauge holds, and never a peer address, name or version. `unknown` (never probed) is a REAL state, distinct from `not_detected` — the prior flat payload collapsed the two into 0."
         },
         "uptime_bucket": {
           "type": "string",

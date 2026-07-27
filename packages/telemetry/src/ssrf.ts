@@ -43,7 +43,20 @@ export interface EndpointPolicy {
   allowPrivateAddresses?: boolean;
   /** DNS resolver seam (tests). Defaults to `dns.promises.lookup`. */
   lookup?: (hostname: string) => Promise<Array<{ address: string; family: number }>>;
+  /**
+   * Hard deadline on NAME RESOLUTION. Without it a hostile or broken resolver hangs the attempt
+   * before `postPinned` ever arms its own timeout, so neither the per-attempt deadline nor the
+   * fan-out budget applies and the single-flight slot is held forever. Default 5s.
+   */
+  resolveTimeoutMs?: number;
+  /**
+   * Cancels resolution. The opt-out fence and the overall budget must be able to reach a request
+   * that is still waiting on DNS, not only one that has reached the socket.
+   */
+  signal?: AbortSignal;
 }
+
+const DEFAULT_RESOLVE_TIMEOUT_MS = 5_000;
 
 export class EndpointRejected extends Error {
   constructor(
@@ -269,10 +282,41 @@ async function resolveAll(host: string, policy: EndpointPolicy): Promise<Array<{
       const results = await dns.promises.lookup(h, { all: true, verbatim: true });
       return results.map((r) => ({ address: r.address, family: r.family }));
     });
+
+  // Checked BEFORE the lookup starts, not only raced against it: an already-settled lookup wins a
+  // Promise.race against a synchronously-rejecting arm, so a pre-aborted attempt would still
+  // resolve and go on to send.
+  if (policy.signal?.aborted === true) throw new EndpointRejected("aborted", "resolution aborted before it started");
+
+  // Resolution gets its own deadline and its own abort hook. Without them a resolver that never
+  // answers hangs BEFORE postPinned arms anything, so neither the per-attempt timeout nor the
+  // fan-out budget applies — and the caller's single-flight slot is held indefinitely, so every
+  // later tick joins the stuck promise instead of retrying.
+  const timeoutMs = policy.resolveTimeoutMs ?? DEFAULT_RESOLVE_TIMEOUT_MS;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+
   try {
-    return await lookup(host);
+    return await Promise.race([
+      lookup(host),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new EndpointRejected("dns_timeout", `resolving ${host} exceeded ${timeoutMs}ms`)), timeoutMs);
+        if (policy.signal !== undefined) {
+          if (policy.signal.aborted) {
+            reject(new EndpointRejected("aborted", "resolution aborted"));
+            return;
+          }
+          onAbort = (): void => reject(new EndpointRejected("aborted", "resolution aborted"));
+          policy.signal.addEventListener("abort", onAbort, { once: true });
+        }
+      }),
+    ]);
   } catch (err) {
+    if (err instanceof EndpointRejected) throw err;
     throw new EndpointRejected("dns_failed", `could not resolve ${host}: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    if (onAbort !== undefined) policy.signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -293,6 +337,11 @@ export interface PostOptions {
   timeoutMs: number;
   /** Cap on the response bytes read. Anything beyond is discarded and the socket destroyed. */
   maxResponseBytes?: number;
+  /**
+   * Values to redact from any surfaced response excerpt. Pass every secret the request carried —
+   * a hostile endpoint can echo the write key back in its error body, and the excerpt is persisted.
+   */
+  redactFromDetail?: readonly string[];
   /** Aborts the attempt from outside (opt-out fence, overall budget). */
   signal?: AbortSignal;
   /** TLS trust seam for tests; production uses the system trust store. */
@@ -301,10 +350,22 @@ export interface PostOptions {
 
 const DEFAULT_MAX_RESPONSE_BYTES = 4096;
 
-/** Strip a response excerpt to short printable ASCII — it is only ever shown as a status detail. */
-function sanitizeDetail(text: string): string | undefined {
-  const cleaned = text
-    .replace(/[^\x20-\x7e]+/g, " ")
+/**
+ * Strip a response excerpt to a short printable-ASCII status detail — AND redact anything that
+ * looks like key material.
+ *
+ * The endpoint is attacker-controlled, so it can echo the write key it just received back in an
+ * error body. Without this, that key would be written into the durable delivery state and shown
+ * on the status surface: a secret that was header-only on the wire would end up at rest on disk.
+ * Any long hex run is redacted, so this holds even for a secret the caller did not name.
+ */
+function sanitizeDetail(text: string, redact: readonly string[] = []): string | undefined {
+  let cleaned = text.replace(/[^\x20-\x7e]+/g, " ");
+  for (const secret of redact) {
+    if (secret.length >= 8) cleaned = cleaned.split(secret).join("[redacted]");
+  }
+  cleaned = cleaned
+    .replace(/[0-9a-fA-F]{32,}/g, "[redacted]")
     .trim()
     .slice(0, 200);
   return cleaned === "" ? undefined : cleaned;
@@ -418,12 +479,12 @@ export function postPinned(opts: PostOptions): Promise<PostResult> {
         res.on("aborted", () => {
           // Truncated by our own cap after a usable status line — that is a complete answer.
           finish(() =>
-            resolve({ status, ok: status >= 200 && status < 300, detail: sanitizeDetail(Buffer.concat(chunks).toString("utf8")) }),
+            resolve({ status, ok: status >= 200 && status < 300, detail: sanitizeDetail(Buffer.concat(chunks).toString("utf8"), opts.redactFromDetail) }),
           );
         });
         res.on("end", () => {
           const text = Buffer.concat(chunks).toString("utf8");
-          finish(() => resolve({ status, ok: status >= 200 && status < 300, detail: status >= 200 && status < 300 ? undefined : sanitizeDetail(text) }));
+          finish(() => resolve({ status, ok: status >= 200 && status < 300, detail: status >= 200 && status < 300 ? undefined : sanitizeDetail(text, opts.redactFromDetail) }));
         });
         res.on("error", (err) => failWith("response_error", err.message));
       });

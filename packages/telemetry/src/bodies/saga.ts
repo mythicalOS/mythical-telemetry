@@ -24,9 +24,11 @@ export const SAGA_COUNTER_NAMES = [
   "mcp_tool_calls_total",
   "mcp_refusals_total",
   "advisories_fired_total",
-  "advisories_info_total",
-  "advisories_warn_total",
-  "advisories_critical_total",
+  // TWO severities, matching the advisor's severity type exactly. A third was drafted and struck
+  // before the freeze — it does not exist in the source, and a leaf with no producer is one that
+  // ships zero forever. Adding one later is a new leaf in a new schema version.
+  "advisories_fired_info_total",
+  "advisories_fired_warn_total",
   "probe_ok_total",
   "probe_auth_failed_total",
   "probe_unreachable_total",
@@ -73,11 +75,7 @@ export function buildSagaMetrics(input: SagaBodyInput): SagaMetrics {
     mcp: { tool_calls: d("mcp_tool_calls_total"), refusals: d("mcp_refusals_total") },
     advisories: {
       fired: d("advisories_fired_total"),
-      by_severity: {
-        info: d("advisories_info_total"),
-        warn: d("advisories_warn_total"),
-        critical: d("advisories_critical_total"),
-      },
+      by_severity: { info: d("advisories_fired_info_total"), warn: d("advisories_fired_warn_total") },
     },
     connections: {
       by_engine: { postgres: byEngine.postgres, mysql: byEngine.mysql, sqlite: byEngine.sqlite },

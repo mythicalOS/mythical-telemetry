@@ -158,6 +158,13 @@ can, which is why this belongs at the emitter.
   legal temporal value; there is no `opaque-id` value class.
 - `scripts/check-field-classes.ts` — the CI gate.
 
+**Two leaves were struck from the draft before the freeze, both for the same reason: no producer
+emitted them.** skuld's `events.deferrals` was drafted against a counter whose code path had been
+removed, and saga's `advisories.by_severity.critical` names a severity the advisor does not have.
+Freezing either would have shipped a field that reads zero forever, which nobody can distinguish
+from "this install has none". Re-adding one is a **new leaf in a new schema version**, not an edit
+to v2 — `lockstep.test.ts` pins both absences so the build fails rather than the review.
+
 > **The check enforces SHAPE, not privacy.** It cannot distinguish `database_oid: integer` from a
 > legitimate count. Any new or reclassified leaf needs a **named human privacy review recorded in
 > the pull request**. Do not describe this check as enforcing privacy.

@@ -388,3 +388,80 @@ describe("postPinned", () => {
     expect(seenUrl).toBe("/v1/ingest?tenant=7");
   });
 });
+
+describe("resolution has its own deadline and its own abort hook", () => {
+  test("a resolver that never answers is cut off — it must not slip past postPinned's timeout", async () => {
+    const started = Date.now();
+    let reason = "";
+    try {
+      await resolveAndPin("https://slow-dns.example.com/x", {
+        resolveTimeoutMs: 120,
+        lookup: () => new Promise(() => {}), // never settles
+      });
+    } catch (err) {
+      reason = err instanceof EndpointRejected ? err.reason : String(err);
+    }
+    expect(reason).toBe("dns_timeout");
+    expect(Date.now() - started).toBeLessThan(3000);
+  });
+
+  test("an abort during resolution ends it — a fence must reach a request still waiting on DNS", async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 30);
+    let reason = "";
+    try {
+      await resolveAndPin("https://slow-dns.example.com/x", {
+        resolveTimeoutMs: 30_000,
+        signal: controller.signal,
+        lookup: () => new Promise(() => {}),
+      });
+    } catch (err) {
+      reason = err instanceof EndpointRejected ? err.reason : String(err);
+    }
+    expect(reason).toBe("aborted");
+  });
+
+  test("an already-aborted signal never starts resolving", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let reason = "";
+    try {
+      await resolveAndPin("https://x.example.com", { signal: controller.signal, lookup: async () => [{ address: "1.1.1.1", family: 4 }] });
+    } catch (err) {
+      reason = err instanceof EndpointRejected ? err.reason : String(err);
+    }
+    expect(reason).toBe("aborted");
+  });
+});
+
+describe("the surfaced detail never carries key material", () => {
+  const SECRET = "a".repeat(64);
+
+  test("an endpoint that ECHOES the write key back gets it redacted", async () => {
+    const { port } = await serve((req, res) => {
+      res.writeHead(401, { "content-type": "text/plain" });
+      res.end(`rejected key ${String(req.headers["x-mythical-write-key"] ?? "")} is unknown`);
+    });
+    const result = await postPinned({
+      endpoint: await pinnedTo(port),
+      body: "{}",
+      headers: { "X-Mythical-Write-Key": SECRET },
+      timeoutMs: 2000,
+      redactFromDetail: [SECRET],
+    });
+    expect(result.status).toBe(401);
+    expect(result.detail).not.toContain(SECRET);
+    expect(result.detail).toContain("[redacted]");
+  });
+
+  test("a long hex run is redacted even when the caller did not name it", async () => {
+    const other = "b".repeat(48);
+    const { port } = await serve((_req, res) => {
+      res.writeHead(400, { "content-type": "text/plain" });
+      res.end(`token ${other} rejected`);
+    });
+    const result = await postPinned({ endpoint: await pinnedTo(port), body: "{}", headers: {}, timeoutMs: 2000 });
+    expect(result.detail).not.toContain(other);
+    expect(result.detail).toContain("[redacted]");
+  });
+});

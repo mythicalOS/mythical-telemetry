@@ -22,7 +22,7 @@ export type ProductName = (typeof PRODUCT_NAMES)[number];
 export const PLATFORM_OS = ["darwin", "linux", "win32", "other"] as const;
 export const PLATFORM_ARCH = ["arm64", "x64", "other"] as const;
 export const UPTIME_BUCKETS = ["<1h", "1h-1d", "1d-7d", "7d-30d", "30d+"] as const;
-export const DETECTION_STATES = ["unknown", "detected", "not_detected"] as const;
+export const DETECTION_STATES = ["unknown", "not_detected", "detected"] as const;
 
 export type UptimeBucket = (typeof UPTIME_BUCKETS)[number];
 export type DetectionState = (typeof DETECTION_STATES)[number];
@@ -62,7 +62,12 @@ export interface SagaMetrics {
   collect: { runs: number; errors: number };
   refusals: number;
   mcp: { tool_calls: number; refusals: number };
-  advisories: { fired: number; by_severity: { info: number; warn: number; critical: number } };
+  /**
+   * `by_severity` carries exactly `{info, warn}` — the advisor's severity type has no third
+   * member. A `critical` key was drafted and struck before the freeze: it would have been a
+   * permanently-zero leaf with no producer.
+   */
+  advisories: { fired: number; by_severity: { info: number; warn: number } };
   connections: { by_engine: { postgres: number; mysql: number; sqlite: number }; total: number };
   probe: { outcomes: { ok: number; auth_failed: number; unreachable: number; timeout: number; other: number } };
   uptime_bucket: UptimeBucket;
@@ -71,12 +76,16 @@ export interface SagaMetrics {
 export interface SkuldMetrics {
   jobs: { created_by_type: { script: number; ai: number; report: number; agent_send: number; distill: number } };
   runs: { total: number; succeeded: number; failed: number; chain_rejections: number };
-  events: { deferrals: number };
+  /** `approvals` counts gate ADMISSIONS — the symmetric partner of `rejections`, not grants. */
   gate: { rejections: number; approvals: number };
+  /** `uid_vends` is counted at the uid POOL BOUNDARY; the pool has more than one consumer. */
   sandbox: { pool_exhausted: number; uid_vends: number };
   detection_state: DetectionState;
   uptime_bucket: UptimeBucket;
 }
+// There is deliberately NO `events.deferrals`: it was drafted, found to have a dead producer, and
+// dropped BEFORE the freeze rather than shipped permanently zero. Adding it back is a new leaf in
+// a new schema version, not an edit here.
 
 export interface HeartbeatEnvelope<P extends ProductName, M> {
   schema_version: typeof SCHEMA_VERSION;
@@ -328,7 +337,7 @@ function validateSaga(c: Checker, raw: unknown): void {
       c,
       advisories.by_severity as Record<string, unknown> | undefined,
       "metrics.advisories.by_severity",
-      ["info", "warn", "critical"],
+      ["info", "warn"],
       MAX.count,
     );
   }
@@ -364,7 +373,7 @@ function validateSaga(c: Checker, raw: unknown): void {
 }
 
 function validateSkuld(c: Checker, raw: unknown): void {
-  const m = c.object(raw, "metrics", ["jobs", "runs", "events", "gate", "sandbox", "detection_state", "uptime_bucket"]);
+  const m = c.object(raw, "metrics", ["jobs", "runs", "gate", "sandbox", "detection_state", "uptime_bucket"]);
   if (m === undefined) return;
 
   const jobs = c.object(m.jobs, "metrics.jobs", ["created_by_type"]);
@@ -385,7 +394,6 @@ function validateSkuld(c: Checker, raw: unknown): void {
   // reject a correct payload and lose that day silently, which is worse than not checking.
   counts(c, m.runs as Record<string, unknown> | undefined, "metrics.runs", ["total", "succeeded", "failed", "chain_rejections"], MAX.count);
 
-  counts(c, m.events as Record<string, unknown> | undefined, "metrics.events", ["deferrals"], MAX.count);
   counts(c, m.gate as Record<string, unknown> | undefined, "metrics.gate", ["rejections", "approvals"], MAX.count);
   counts(c, m.sandbox as Record<string, unknown> | undefined, "metrics.sandbox", ["pool_exhausted", "uid_vends"], MAX.count);
 

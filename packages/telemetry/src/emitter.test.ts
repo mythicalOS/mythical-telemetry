@@ -43,6 +43,7 @@ function makeEmitter(opts: {
   respond?: (sent: Sent) => PostResult;
   buildMetrics?: (day: string) => BrokkrMetrics;
   root?: string;
+  nowMs?: number;
 }): {
   emitter: HeartbeatEmitter<"brokkr">;
   sent: Sent[];
@@ -50,11 +51,12 @@ function makeEmitter(opts: {
   root: string;
 } {
   const root = opts.root ?? tmpRoot();
+  const now = opts.nowMs ?? Date.parse("2026-07-27T06:00:00.000Z");
   const sent: Sent[] = [];
   const identity = new IdentityStore({ stateRoot: root });
   const transport = new Transport({
     stateRoot: root,
-    nowMs: () => Date.parse("2026-07-27T06:00:00.000Z"),
+    nowMs: () => now,
     random: () => 0.5,
     resolveImpl: async (url): Promise<PinnedEndpoint> => ({ url: new URL(url), address: "93.184.216.34", family: 4, literal: false }),
     postImpl: async (args): Promise<PostResult> => {
@@ -76,7 +78,7 @@ function makeEmitter(opts: {
     getEndpoints: () => opts.endpoints ?? { centralUrl: CENTRAL, copyUrl: COPY },
     buildMetrics: opts.buildMetrics ?? ((): BrokkrMetrics => buildBrokkrMetrics({ rollup: undefined, config: CONFIG })),
     platform: { os: "linux", arch: "x64" },
-    nowMs: () => Date.parse("2026-07-27T06:00:00.000Z"),
+    nowMs: () => now,
   });
   return { emitter, sent, identity, root };
 }
@@ -289,5 +291,44 @@ describe("all three products assemble a valid document", () => {
       platform: { os: "darwin", arch: "arm64" },
     });
     expect(validateHeartbeat(emitter.buildPayload("2026-07-26", "60e05bd1-b195-4f2f-9411-2fa7197a5c88")).ok).toBe(true);
+  });
+});
+
+describe("a day whose retry crossed midnight is not lost", () => {
+  test("emit() re-attempts an earlier unresolved day alongside the current one", async () => {
+    const root = tmpRoot();
+    let fail = true;
+    const failing = makeEmitter({
+      root,
+      endpoints: { centralUrl: CENTRAL },
+      respond: () => (fail ? { status: 503, ok: false, detail: "down" } : { status: 202, ok: true, detail: undefined }),
+    });
+    // Day 2026-07-26 fails.
+    await failing.emitter.emit("2026-07-26");
+    expect(failing.emitter.status("2026-07-26")!.central.status).toBe("pending");
+
+    // The next day the emitter's candidate has rolled forward. Without a drain the 26th would
+    // never be revisited and would age out of retention unsent.
+    fail = false;
+    // The clock moves past midnight AND past the failed attempt's backoff window.
+    const next = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, nowMs: Date.parse("2026-07-28T06:00:00.000Z") });
+    const result = await next.emitter.emit("2026-07-27");
+
+    expect(result.sent).toBe(true);
+    if (result.sent) {
+      expect(result.report.day).toBe("2026-07-27");
+      expect(result.drained.map((r) => r.day)).toEqual(["2026-07-26"]);
+      expect(result.drained[0]!.central.status).toBe("delivered");
+    }
+    expect(next.emitter.status("2026-07-26")!.central.status).toBe("delivered");
+  });
+
+  test("nothing is drained when every earlier day is already resolved", async () => {
+    const root = tmpRoot();
+    const first = makeEmitter({ root, endpoints: { centralUrl: CENTRAL } });
+    await first.emitter.emit("2026-07-26");
+    const second = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, nowMs: Date.parse("2026-07-28T06:00:00.000Z") });
+    const result = await second.emitter.emit("2026-07-27");
+    expect(result.sent && result.drained).toEqual([]);
   });
 });

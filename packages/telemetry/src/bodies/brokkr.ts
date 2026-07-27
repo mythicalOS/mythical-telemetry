@@ -25,6 +25,24 @@ function closedEnum<T extends string>(value: unknown, allowed: readonly T[], fal
   return typeof value === "string" && (allowed as readonly string[]).includes(value) ? (value as T) : fallback;
 }
 
+/**
+ * Spend `budget` across `values` in order, so their sum can never exceed it.
+ *
+ * Several brokkr leaves must sum to at most `sessions.count`. Clamping each of them independently
+ * against its own ceiling does NOT preserve that: at the ceiling, two buckets of 100 000 each
+ * survive their own clamp and then breach a `sessions.count` that clamped to 100 000. The document
+ * would be rejected and the whole day lost — so the sum is reconciled here, at the producer, where
+ * a self-consistent approximation is strictly better than a dropped day.
+ */
+function spendBudget(values: readonly number[], budget: number): number[] {
+  let remaining = Math.max(0, budget);
+  return values.map((value) => {
+    const spend = Math.min(Math.max(0, value), remaining);
+    remaining -= spend;
+    return spend;
+  });
+}
+
 /** The day's completed-session fold, as the product's rollup produces it. */
 export interface BrokkrDayRollup {
   sessions: { count: number; minutes: number; failed: number };
@@ -67,21 +85,41 @@ export function buildBrokkrMetrics(input: { rollup?: BrokkrDayRollup | undefined
   const data = input.rollup ?? zeroBrokkrRollup();
   const cfg = input.config;
 
-  const count = clampInt(data.sessions.count, MAX_SESSIONS);
-  // The cross-field invariants are satisfied HERE, by construction, not hoped for at the collector.
+  // ── the cross-field invariants are satisfied HERE, by construction ──────────────────────
+  // Every one of them is enforced by the collector, so a body that breaches one is not "slightly
+  // off" — it is a day silently dropped on ingest. They are therefore reconciled at the producer.
+
+  // mode_split partitions sessions.count exactly, so the split is authoritative and the count is
+  // derived from it. The two come from the same fold and agree in practice; they can only diverge
+  // when a value hits the ceiling, and then the split is the more informative half to keep.
+  const [normal, spine] = spendBudget([clampInt(data.mode_split.normal, MAX_SESSIONS), clampInt(data.mode_split.spine, MAX_SESSIONS)], MAX_SESSIONS) as [
+    number,
+    number,
+  ];
+  const rawCount = clampInt(data.sessions.count, MAX_SESSIONS);
+  const count = normal + spine === rawCount ? rawCount : normal + spine;
+
   const failed = Math.min(clampInt(data.sessions.failed, MAX_SESSIONS), count);
-  const histogram = Array.from({ length: 10 }, (_, i) => clampInt(data.fill.histogram[i], MAX_HISTOGRAM));
+  // sum(peak_histogram) <= sessions.count — spawn failures carry no fill.
+  const histogram = spendBudget(
+    Array.from({ length: 10 }, (_, i) => clampInt(data.fill.histogram[i], MAX_HISTOGRAM)),
+    count,
+  );
   const bearing = clampInt(data.fill.bearing, MAX_SESSIONS);
   const avgMean = bearing > 0 ? Math.round(Math.min(100, Math.max(0, data.fill.avg_sum / bearing)) * 10) / 10 : null;
 
-  const models = Object.entries(data.models)
+  // sum(models[].sessions) <= sessions.count. Sorted descending first, so the budget is spent on
+  // the models that actually dominated the day rather than on whichever hashed first.
+  const ranked = Object.entries(data.models)
     .map(([name, sessions]) => ({ name: normalizeModelId(name) as string, sessions: clampInt(sessions, MAX_SESSIONS) }))
     .filter((m) => m.sessions > 0)
     .sort((a, b) => b.sessions - a.sessions || (a.name < b.name ? -1 : 1))
     .slice(0, MODELS_MAX);
-
-  const normal = clampInt(data.mode_split.normal, MAX_SESSIONS);
-  const spine = clampInt(data.mode_split.spine, MAX_SESSIONS);
+  const modelBudget = spendBudget(
+    ranked.map((m) => m.sessions),
+    count,
+  );
+  const models = ranked.map((m, i) => ({ name: m.name, sessions: modelBudget[i] ?? 0 })).filter((m) => m.sessions > 0);
 
   return {
     config: {

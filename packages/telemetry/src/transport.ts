@@ -64,6 +64,16 @@ export interface DeliveryRecord {
   status: DeliveryStatus;
   last_error: string | null;
   last_http_status: number | null;
+  /**
+   * The exact wire bytes this delivery is for, held ONLY while it is unresolved.
+   *
+   * Without it, an unresolved day can never be retried after midnight: the emitter reports the most
+   * recent completed day, and a delta-normalising producer cannot rebuild an older day at all —
+   * its snapshot has already moved on. So a day whose retry window crossed midnight would be
+   * silently lost. Cleared the moment the delivery reaches a terminal state, and purged by every
+   * fence, so an opt-out really does purge the pending payload rather than leaving it on disk.
+   */
+  body?: string;
 }
 
 interface BreakerState {
@@ -151,6 +161,7 @@ export interface TransportOptions {
     headers: Record<string, string>;
     timeoutMs: number;
     signal: AbortSignal;
+    redactFromDetail?: readonly string[];
   }) => Promise<PostResult>;
 }
 
@@ -249,6 +260,7 @@ export class Transport {
             headers: args.headers,
             timeoutMs: args.timeoutMs,
             signal: args.signal,
+            redactFromDetail: args.redactFromDetail,
           })),
     };
   }
@@ -380,6 +392,16 @@ export class Transport {
    * never suppresses the copy.
    */
   async send(input: SendInput): Promise<SendReport> {
+    return this.sendInternal(input, { fence: true });
+  }
+
+  /**
+   * `fence: false` is used only by {@link drain}, which re-attempts EARLIER days under a
+   * configuration the caller has already fenced for the current day. Re-fencing per drained day
+   * would be wrong in both directions: a destination absent from one day's records would look
+   * "retired" and purge every other day's state for that kind.
+   */
+  private async sendInternal(input: SendInput, opts: { fence: boolean }): Promise<SendReport> {
     assertDestinations(input);
 
     const centralDestination = normalizeDestinationUrl(input.central.url);
@@ -403,12 +425,14 @@ export class Transport {
     }
 
     const centralGeneration = destinationGeneration(input.consent, "central", centralDestination, input.central.identity.instance_secret);
-    this.fenceDestination("central", centralDestination, centralGeneration);
     const copyGeneration =
       input.copy === undefined || copyDestination === undefined
         ? undefined
         : destinationGeneration(input.consent, "copy", copyDestination, input.copy.identity.instance_secret);
-    this.fenceDestination("copy", copyDestination, copyGeneration);
+    if (opts.fence) {
+      this.fenceDestination("central", centralDestination, centralGeneration);
+      this.fenceDestination("copy", copyDestination, copyGeneration);
+    }
 
     // One budget for the whole fan-out, on top of each attempt's own deadline.
     const budget = new AbortController();
@@ -454,6 +478,68 @@ export class Transport {
     } finally {
       clearTimeout(budgetTimer);
     }
+  }
+
+  /**
+   * Days that are still unresolved for a configured destination, oldest first.
+   *
+   * This exists because "durable delivery state" is a lie without a way to act on it: the emitter
+   * reports the most recent COMPLETED day, so a day that failed and whose retry window crossed
+   * midnight would never be revisited — the next tick sends the new day and the old record just
+   * ages out of retention. Anything listed here still holds its payload and can be re-sent.
+   */
+  unresolvedDays(input: { central: { url: string }; copy?: { url: string } | undefined; exceptDay?: string }): string[] {
+    const wanted = new Map<DestinationKind, string>([["central", normalizeDestinationUrl(input.central.url)]]);
+    if (input.copy !== undefined) wanted.set("copy", normalizeDestinationUrl(input.copy.url));
+
+    const days = new Set<string>();
+    for (const rec of Object.values(this.load().records)) {
+      if (rec.status !== "pending") continue;
+      if (rec.day === input.exceptDay) continue;
+      if (wanted.get(rec.kind) !== rec.destination) continue;
+      if (rec.body === undefined) continue; // nothing to re-send; a rebuild is impossible
+      days.add(rec.day);
+    }
+    return [...days].sort();
+  }
+
+  /**
+   * Re-attempt every unresolved earlier day, oldest first. Uses each record's STORED payload — a
+   * delta-normalising producer cannot rebuild an older day, and rebuilding would in any case
+   * change the bytes behind an idempotency key the collector may already have seen.
+   */
+  async drain(input: {
+    product: ProductName;
+    consent: ConsentState;
+    central: { url: string; identity: InstanceIdentity };
+    copy?: { url: string; identity: InstanceIdentity } | undefined;
+    exceptDay?: string;
+    /** Cap on days drained per call, so a long outage does not turn one tick into a burst. */
+    maxDays?: number;
+  }): Promise<SendReport[]> {
+    if (!isSendPermitted(input.consent)) return [];
+    const days = this.unresolvedDays({ central: input.central, copy: input.copy, exceptDay: input.exceptDay });
+    const reports: SendReport[] = [];
+    for (const day of days.slice(0, input.maxDays ?? 3)) {
+      const central = this.record(day, "central", input.central.url);
+      const copy = input.copy === undefined ? undefined : this.record(day, "copy", input.copy.url);
+      // The stored body wins inside deliverOnce; these are only the record-creation fallback. A
+      // destination with no stored body for this day is one that already reached a terminal state,
+      // and an empty body is refused rather than posted (see deliverOnce).
+      reports.push(
+        await this.sendInternal(
+          {
+            day,
+            product: input.product,
+            consent: input.consent,
+            central: { url: input.central.url, identity: input.central.identity, body: central?.body ?? "" },
+            copy: input.copy === undefined ? undefined : { url: input.copy.url, identity: input.copy.identity, body: copy?.body ?? "" },
+          },
+          { fence: false },
+        ),
+      );
+    }
+    return reports;
   }
 
   private outcomeFor(
@@ -564,24 +650,49 @@ export class Transport {
 
     if (args.budget.aborted) return this.outcomeFor(args.day, args.kind, args.destination, "budget_exhausted");
 
+    // An empty body means the payload was never stored or has already been released. Posting empty
+    // bytes would be a guaranteed rejection that still burns an attempt and looks like an outage.
+    if ((rec.body ?? args.input.body) === "") {
+      rec.status = "exhausted";
+      rec.next_attempt_at = null;
+      rec.last_error = "payload not retained — this day can no longer be re-sent";
+      this.persist();
+      return this.outcomeFor(args.day, args.kind, args.destination, null);
+    }
+
     // Record the attempt BEFORE the request, and persist it. A crash mid-request must not look
     // like an attempt that never happened, or a restart loop retries without bound.
     rec.attempts += 1;
     rec.last_attempt_at = nowIso;
     if (rec.first_attempt_at === null) rec.first_attempt_at = nowIso;
     rec.next_attempt_at = new Date(now + this.backoffFor(rec.attempts)).toISOString();
+    if (rec.body === undefined) rec.body = args.input.body;
     this.persist();
 
+    // The aborter is registered BEFORE resolution, not after it. Registering it only around the
+    // POST left a window in which a fence (opt-out, endpoint change) or the overall budget had
+    // nothing to cancel while DNS was pending — the lookup would later succeed and the request
+    // would go out, WITH ITS WRITE SECRET, after the user had already said no.
     const attemptAborter = new AbortController();
     this.aborters.set(key, attemptAborter);
     const onBudget = (): void => attemptAborter.abort();
     args.budget.addEventListener("abort", onBudget, { once: true });
 
+    // Re-send the bytes the record was created with. The idempotency key is derived from the same
+    // (identity, product, day, generation) tuple, so a retry must carry the same document, or a
+    // deduping collector would silently keep the first version of a day it later re-received.
+    const body = rec.body ?? args.input.body;
+
     try {
-      const endpoint = await this.opts.resolveImpl(ingestUrlFor(args.destination), this.opts.policy);
+      const endpoint = await this.opts.resolveImpl(ingestUrlFor(args.destination), {
+        ...this.opts.policy,
+        signal: attemptAborter.signal,
+      });
+      // Resolution can take time; a fence during it must still stop the send.
+      if (attemptAborter.signal.aborted) throw new EndpointRejected("aborted", "attempt aborted during resolution");
       const result = await this.opts.postImpl({
         endpoint,
-        body: args.input.body,
+        body,
         headers: {
           "content-type": "application/json",
           // Write auth rides the header, never the payload.
@@ -591,6 +702,9 @@ export class Transport {
         },
         timeoutMs: this.opts.perAttemptTimeoutMs,
         signal: attemptAborter.signal,
+        // A hostile endpoint can echo the write key back in its error body, and that excerpt is
+        // persisted in the delivery state and shown on the status surface.
+        redactFromDetail: [args.input.identity.instance_secret],
       });
 
       if (result.ok) {
@@ -598,6 +712,7 @@ export class Transport {
         rec.next_attempt_at = null;
         rec.last_error = null;
         rec.last_http_status = result.status;
+        delete rec.body; // terminal — the retained payload has no further purpose
         state.breakers[bKey] = { consecutive_failures: 0, open_until: null };
         this.persist();
         return this.outcomeFor(args.day, args.kind, args.destination, null);
@@ -622,6 +737,7 @@ export class Transport {
     if (rec.attempts >= this.opts.maxAttempts) {
       rec.status = "exhausted";
       rec.next_attempt_at = null;
+      delete rec.body; // terminal — do not retain a payload that will never be sent
     }
     const breaker = state.breakers[bKey] ?? { consecutive_failures: 0, open_until: null };
     breaker.consecutive_failures += 1;
@@ -663,6 +779,7 @@ function parseRecord(value: unknown): DeliveryRecord | undefined {
     status,
     last_error: typeof d.last_error === "string" ? d.last_error : null,
     last_http_status: typeof d.last_http_status === "number" ? d.last_http_status : null,
+    ...(typeof d.body === "string" ? { body: d.body } : {}),
   };
 }
 

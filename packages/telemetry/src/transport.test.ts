@@ -431,3 +431,175 @@ describe("status()", () => {
     expect(report.copy).toBeNull();
   });
 });
+
+describe("the fence reaches a request that is still resolving DNS", () => {
+  test("an opt-out during a stalled lookup means the request is NEVER posted", async () => {
+    let releaseResolve: (() => void) | undefined;
+    const resolving = new Promise<void>((resolve) => {
+      releaseResolve = resolve;
+    });
+    const { transport, attempts } = harness(() => OK, {
+      resolveImpl: async (url, policy): Promise<PinnedEndpoint> => {
+        // Stall here, exactly where DNS would, and honour the signal the transport handed us.
+        await Promise.race([
+          resolving,
+          new Promise<void>((_r, reject) => {
+            policy.signal?.addEventListener("abort", () => reject(new EndpointRejected("aborted", "resolution aborted")), { once: true });
+          }),
+        ]);
+        return { url: new URL(url), address: "93.184.216.34", family: 4, literal: false };
+      },
+    });
+
+    const inFlight = transport.send({ ...sendInput(), copy: undefined });
+    await Bun.sleep(20);
+    transport.fenceAll("user opted out");
+    releaseResolve!();
+    const report = await inFlight;
+
+    // The POST never happened: the fence cancelled a request the old code could only cancel once
+    // it had already reached the socket.
+    expect(attempts).toHaveLength(0);
+    expect(report.central.status).toBe("pending");
+    // ...and the fence purged the pending record along with its payload.
+    expect(transport.record(DAY, "central", CENTRAL_URL)).toBeUndefined();
+  });
+
+  test("the resolver is handed the attempt's abort signal", async () => {
+    let seenSignal: AbortSignal | undefined;
+    const { transport } = harness(() => OK, {
+      resolveImpl: async (url, policy): Promise<PinnedEndpoint> => {
+        seenSignal = policy.signal;
+        return { url: new URL(url), address: "93.184.216.34", family: 4, literal: false };
+      },
+    });
+    await transport.send({ ...sendInput(), copy: undefined });
+    expect(seenSignal).toBeDefined();
+  });
+});
+
+describe("unresolved days survive the day rolling over", () => {
+  test("a day that fails on the 27th is RE-SENT on the 28th, not silently lost", async () => {
+    const root = tmpRoot();
+    let fail = true;
+    const { transport, attempts, now } = harness(() => (fail ? FAIL : OK), { stateRoot: root });
+
+    await transport.send({ ...sendInput(), copy: undefined }); // day = 2026-07-26, fails
+    expect(transport.record(DAY, "central", CENTRAL_URL)?.status).toBe("pending");
+
+    // Midnight passes: the emitter's candidate day is now 2026-07-27 and nothing would ever
+    // revisit the 26th without an explicit drain.
+    now.value += 24 * 3_600_000;
+    fail = false;
+    const drained = await transport.drain({
+      product: "brokkr",
+      consent: userConsent(true, Date.parse("2026-01-01T00:00:00.000Z")),
+      central: { url: CENTRAL_URL, identity: identity("a") },
+      exceptDay: "2026-07-27",
+    });
+
+    expect(drained).toHaveLength(1);
+    expect(drained[0]!.day).toBe(DAY);
+    expect(drained[0]!.central.status).toBe("delivered");
+    // The RE-SENT bytes are the ones the delivery was created with — a delta producer cannot
+    // rebuild an older day, and the idempotency key is derived from that same document.
+    expect(attempts[1]!.body).toBe('{"central":true}');
+    expect(attempts[1]!.headers["Idempotency-Key"]).toBe(attempts[0]!.headers["Idempotency-Key"]);
+  });
+
+  test("a drain never re-sends a day that was already delivered", async () => {
+    const { transport, attempts, now } = harness(() => OK);
+    await transport.send({ ...sendInput(), copy: undefined });
+    now.value += 24 * 3_600_000;
+    const drained = await transport.drain({
+      product: "brokkr",
+      consent: userConsent(true, Date.parse("2026-01-01T00:00:00.000Z")),
+      central: { url: CENTRAL_URL, identity: identity("a") },
+      exceptDay: "2026-07-27",
+    });
+    expect(drained).toEqual([]);
+    expect(attempts).toHaveLength(1);
+  });
+
+  test("a drain does NOT fence, so draining one day cannot purge another day's copy state", async () => {
+    const { transport, now } = harness(() => FAIL);
+    await transport.send(sendInput()); // both destinations pending for 2026-07-26
+    now.value += 24 * 3_600_000;
+    await transport.send({ ...sendInput(), day: "2026-07-27" });
+    now.value += 24 * 3_600_000;
+
+    await transport.drain({
+      product: "brokkr",
+      consent: userConsent(true, Date.parse("2026-01-01T00:00:00.000Z")),
+      central: { url: CENTRAL_URL, identity: identity("a") },
+      copy: { url: COPY_URL, identity: identity("b") },
+      exceptDay: "2026-07-28",
+    });
+
+    expect(transport.record(DAY, "copy", COPY_URL)).toBeDefined();
+    expect(transport.record("2026-07-27", "copy", COPY_URL)).toBeDefined();
+  });
+
+  test("an opt-out drains nothing", async () => {
+    const { transport, attempts, now } = harness(() => FAIL);
+    await transport.send({ ...sendInput(), copy: undefined });
+    const before = attempts.length;
+    now.value += 24 * 3_600_000;
+    const drained = await transport.drain({
+      product: "brokkr",
+      consent: userConsent(false, now.value),
+      central: { url: CENTRAL_URL, identity: identity("a") },
+    });
+    expect(drained).toEqual([]);
+    expect(attempts).toHaveLength(before);
+  });
+
+  test("the retained payload is PURGED by the opt-out fence, not left on disk", async () => {
+    const root = tmpRoot();
+    const { transport, now } = harness(() => FAIL, { stateRoot: root });
+    await transport.send({ ...sendInput(), copy: undefined });
+    expect(fs.readFileSync(deliveryStateFilePath(root), "utf8")).toContain('{\\"central\\":true}');
+
+    now.value += 3_600_000;
+    await transport.send({ ...sendInput(userConsent(false, now.value)), copy: undefined });
+    expect(fs.readFileSync(deliveryStateFilePath(root), "utf8")).not.toContain("central");
+  });
+
+  test("a delivered record does not keep its payload around", async () => {
+    const root = tmpRoot();
+    const { transport } = harness(() => OK, { stateRoot: root });
+    await transport.send({ ...sendInput(), copy: undefined });
+    expect(transport.record(DAY, "central", CENTRAL_URL)?.body).toBeUndefined();
+  });
+
+  test("a record with no retained payload is retired rather than posted empty", async () => {
+    const root = tmpRoot();
+    const { transport, attempts } = harness(() => OK, { stateRoot: root });
+    fs.mkdirSync(path.join(root, "telemetry"), { recursive: true });
+    fs.writeFileSync(
+      deliveryStateFilePath(root),
+      JSON.stringify({
+        version: 1,
+        records: {
+          [`${DAY}|central|${CENTRAL_URL}`]: {
+            day: DAY,
+            kind: "central",
+            destination: CENTRAL_URL,
+            generation: "",
+            idempotency_key: "k",
+            attempts: 1,
+            status: "pending",
+          },
+        },
+        breakers: {},
+      }),
+    );
+    await transport.drain({
+      product: "brokkr",
+      consent: userConsent(true, Date.parse("2026-01-01T00:00:00.000Z")),
+      central: { url: CENTRAL_URL, identity: identity("a") },
+      exceptDay: "2026-07-28",
+    });
+    expect(attempts).toHaveLength(0);
+  });
+});

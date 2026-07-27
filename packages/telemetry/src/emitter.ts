@@ -75,7 +75,16 @@ export interface DisclosureEntry {
 }
 
 export type EmitResult =
-  | { sent: true; report: SendReport }
+  | {
+      sent: true;
+      report: SendReport;
+      /**
+       * Re-attempts of EARLIER days that were still unresolved. Without this the durable delivery
+       * state would be decorative: the candidate day rolls forward at midnight, so a day whose
+       * retry window crossed it would never be revisited and would age out of retention unsent.
+       */
+      drained: SendReport[];
+    }
   | { sent: false; reason: "opted_out" | "invalid_payload" | "misconfigured"; detail: string };
 
 export class HeartbeatEmitter<P extends ProductName> {
@@ -200,15 +209,29 @@ export class HeartbeatEmitter<P extends ProductName> {
       copyBody = JSON.stringify(copyPayload);
     }
 
+    const copyDestination =
+      copyIdentity === undefined || copyBody === undefined ? undefined : { url: endpoints.copyUrl!, identity: copyIdentity, body: copyBody };
+
     const report = await this.deps.transport.send({
       day,
       product: this.deps.product,
       consent,
       central: { url: endpoints.centralUrl, identity: central, body: JSON.stringify(centralPayload) },
-      copy: copyIdentity === undefined || copyBody === undefined ? undefined : { url: endpoints.copyUrl!, identity: copyIdentity, body: copyBody },
+      copy: copyDestination,
     });
 
-    return { sent: true, report };
+    // Then re-attempt anything older that is still unresolved, using the bytes those deliveries
+    // were created with. A delta-normalising producer cannot rebuild an older day — its snapshot
+    // has moved on — so a retry that is not a re-send of the stored payload is not a retry at all.
+    const drained = await this.deps.transport.drain({
+      product: this.deps.product,
+      consent,
+      central: { url: endpoints.centralUrl, identity: central },
+      copy: copyDestination === undefined ? undefined : { url: copyDestination.url, identity: copyDestination.identity },
+      exceptDay: day,
+    });
+
+    return { sent: true, report, drained };
   }
 
   /** Per-destination delivery state for a day, without sending. */

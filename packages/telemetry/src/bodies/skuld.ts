@@ -29,12 +29,16 @@ export const SKULD_COUNTER_NAMES = [
   "runs_succeeded",
   "runs_failed",
   "chain_rejections",
-  "event_deferrals",
   "gate_rejections",
   "gate_approvals",
   "sandbox_pool_exhausted",
   "sandbox_uid_vends",
 ] as const;
+// `event_deferrals` is NOT on this list. It was drafted into the contract and then found to have a
+// dead producer — the event trigger arm validates-and-RUNS rather than validates-and-defers, so the
+// deferral path is unreachable and the bump was retired. It was dropped before the freeze rather
+// than shipped permanently zero, and repointing it at a neighbouring counter would have silently
+// redefined a frozen field. Wanting it later means a new leaf in a new schema version.
 
 function clamp(value: number): number {
   return Math.min(Math.max(0, Math.floor(value)), MAX_COUNT);
@@ -80,7 +84,6 @@ export function buildSkuldMetrics(input: SkuldBodyInput): SkuldMetrics {
       failed: d("runs_failed"),
       chain_rejections: d("chain_rejections"),
     },
-    events: { deferrals: d("event_deferrals") },
     gate: { rejections: d("gate_rejections"), approvals: d("gate_approvals") },
     sandbox: { pool_exhausted: d("sandbox_pool_exhausted"), uid_vends: d("sandbox_uid_vends") },
     detection_state: (DETECTION_STATES as readonly string[]).includes(state) ? state : "unknown",

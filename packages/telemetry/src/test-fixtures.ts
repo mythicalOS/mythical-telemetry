@@ -52,7 +52,7 @@ export function sagaFixture(): SagaHeartbeat {
       collect: { runs: 48, errors: 2 },
       refusals: 3,
       mcp: { tool_calls: 91, refusals: 4 },
-      advisories: { fired: 6, by_severity: { info: 3, warn: 2, critical: 1 } },
+      advisories: { fired: 6, by_severity: { info: 4, warn: 2 } },
       connections: { by_engine: { postgres: 2, mysql: 1, sqlite: 1 }, total: 5 },
       probe: { outcomes: { ok: 40, auth_failed: 1, unreachable: 2, timeout: 1, other: 0 } },
       uptime_bucket: "1d-7d",
@@ -70,7 +70,6 @@ export function skuldFixture(): SkuldHeartbeat {
     metrics: {
       jobs: { created_by_type: { script: 12, ai: 5, report: 2, agent_send: 1, distill: 3 } },
       runs: { total: 23, succeeded: 20, failed: 2, chain_rejections: 1 },
-      events: { deferrals: 4 },
       gate: { rejections: 2, approvals: 7 },
       sandbox: { pool_exhausted: 0, uid_vends: 23 },
       detection_state: "detected",
