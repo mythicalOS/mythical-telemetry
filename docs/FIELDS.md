@@ -86,11 +86,24 @@ Producer: `heartbeat-rollup.ts` folds, already shipping.
 | `mcp.tool_calls` | `count` | delta | `mcp_tool_calls_total` (`mcp/dispatch.ts`) | existing |
 | `mcp.refusals` | `count` | delta | `mcp_refusals_total` (`mcp/dispatch.ts`) | existing |
 | `advisories.fired` | `count` | delta | `advisories_fired_total` (`advisor/rules.ts`) | existing |
-| `advisories.by_severity.{info,warn,critical}` | `count` | delta | **new** per-severity bumps in `advisor/rules.ts` | NEW |
+| `advisories.by_severity.{info,warn}` | `count` | delta | `advisories_fired_{info,warn}_total`, per-severity bumps at the advisor fire site | NEW |
 | `connections.by_engine.{postgres,mysql,sqlite}` | `count` | gauge | connections registry — count per `engine` | existing source, new shaping |
 | `connections.total` | `count` | gauge | connections registry length | existing |
 | `probe.outcomes.{ok,auth_failed,unreachable,timeout,other}` | `count` | delta | **new** bumps at the monitor's probe site | NEW |
 | `uptime_bucket` | `bucket` | gauge | `uptimeBucket()` | existing |
+
+**`advisories.by_severity` carries `{info, warn}` and NOT `critical` (amended 2026-07-27).** The
+draft named a third severity that does not exist — the advisor's severity type is `info | warn`
+in both its store and its UI types, and no rule emits anything else. Emitting `critical: 0`
+forever would be a leaf with no producer, which rule 4 forbids. The emitted set is fenced to the
+source declaration by a two-way compile-time assignability check plus a runtime test that parses
+the declaration, so adding a severity upstream without extending the payload breaks the build
+rather than silently dropping data.
+
+**Probe-outcome classification is deliberately coarse, and derived from the bounded engine error
+CODE only — never an error message.** `MISSING_CREDENTIAL` maps to `auth_failed` (nothing left
+the host, but that is the class an operator would act on); `TLS_FAILED` maps to `other`, not
+`unreachable`, because TCP did connect and "unreachable" would be false.
 
 `connections.by_engine` **supersedes** v1's `engines_used` booleans — a count per engine family
 is strictly more informative and no less safe, and it is derivable from the registry today with
