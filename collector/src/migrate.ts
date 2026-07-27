@@ -26,8 +26,20 @@
 //     version, so a database whose tables were converted by other means still
 //     gets its stored v1 documents normalized.
 //
-// Nothing is dropped. A payload that cannot be parsed is carried over verbatim
-// and counted, never discarded.
+// NO ROW IS DROPPED. A payload that cannot be parsed is carried over verbatim
+// and counted, never discarded, and a rebuild that would carry fewer rows than
+// it found aborts the whole transaction instead of completing.
+//
+// That guarantee is about ROWS, and deliberately not about schema objects
+// ATTACHED to the rebuilt tables. A rebuild is `DROP TABLE` + `RENAME`, and
+// SQLite drops a table's triggers and indexes with it; this code recreates its
+// own indexes (INDEX_DDL, below) but cannot recreate objects it never
+// declared. Nothing in this service's schema history — current or
+// pre-product — defines a trigger or a view, so there is nothing of ours to
+// lose; an operator who has hand-added one to a collector volume must
+// recreate it after an upgrade. Recorded here rather than solved, because
+// preserving arbitrary operator DDL across a rebuild is a much larger promise
+// than this store needs to make.
 
 import type { Database } from 'bun:sqlite';
 import { v1ToV2 } from './normalize';

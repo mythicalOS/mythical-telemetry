@@ -54,33 +54,45 @@ export interface HeartbeatValidator {
  * Call a validator without trusting it to honour its own contract. A thrown
  * validator becomes an ordinary rejection rather than a 500 — one malformed
  * input must not be able to take the ingest route down.
+ *
+ * THE WHOLE INSPECTION IS INSIDE THE `try`, NOT JUST THE CALL. Reading
+ * `result.ok`, `result.error`, `result.value` and the envelope fields are
+ * property accesses on an object THIS FUNCTION DID NOT CONSTRUCT — the seam
+ * exists precisely so a third-party implementation can be injected, and such
+ * an object may expose accessors (or a Proxy trap) that throw on read. With
+ * only the call guarded, such a result escaped past this function to the route
+ * handler's catch-all and became a 500 `internal_error` — exactly the "one
+ * malformed input takes the ingest route down" outcome this guard is here to
+ * prevent, and it would have been counted as an internal fault rather than a
+ * rejection. A throw from anywhere in here is the same class of failure as a
+ * throw from `validate` itself, so it collapses to the same `validator_`-
+ * prefixed reason and the server counts it as a validator error.
  */
 export function safeValidate(validator: HeartbeatValidator, raw: unknown): ValidationResult {
-  let result: ValidationResult;
   try {
-    result = validator.validate(raw);
+    const result = validator.validate(raw);
+    if (!result || typeof result !== 'object') return { ok: false, error: 'validator_malformed_result' };
+    if (result.ok !== true) return { ok: false, error: typeof result.error === 'string' ? result.error : 'invalid' };
+    const value = result.value as Heartbeat | undefined;
+    // Envelope fields the collector indexes by must exist and be strings even if
+    // a future validator's typing says otherwise — they become primary-key
+    // components, so a non-string here would corrupt the store rather than
+    // reject a request.
+    if (
+      !value ||
+      typeof value !== 'object' ||
+      typeof value.instance_id !== 'string' ||
+      typeof value.day !== 'string' ||
+      !value.product ||
+      typeof value.product !== 'object' ||
+      typeof value.product.name !== 'string'
+    ) {
+      return { ok: false, error: 'validator_malformed_result' };
+    }
+    return { ok: true, value };
   } catch {
     return { ok: false, error: 'validator_threw' };
   }
-  if (!result || typeof result !== 'object') return { ok: false, error: 'validator_malformed_result' };
-  if (result.ok !== true) return { ok: false, error: typeof result.error === 'string' ? result.error : 'invalid' };
-  const value = result.value as Heartbeat | undefined;
-  // Envelope fields the collector indexes by must exist and be strings even if
-  // a future validator's typing says otherwise — they become primary-key
-  // components, so a non-string here would corrupt the store rather than
-  // reject a request.
-  if (
-    !value ||
-    typeof value !== 'object' ||
-    typeof value.instance_id !== 'string' ||
-    typeof value.day !== 'string' ||
-    !value.product ||
-    typeof value.product !== 'object' ||
-    typeof value.product.name !== 'string'
-  ) {
-    return { ok: false, error: 'validator_malformed_result' };
-  }
-  return { ok: true, value };
 }
 
 // ── The wiring site ───────────────────────────────────────────────────────

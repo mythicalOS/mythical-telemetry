@@ -57,9 +57,18 @@ describe('there is no second validator in the collector', () => {
 describe('loadCanonicalValidator — wired to the real thing', () => {
   test('resolves a validator that ACCEPTS a genuine payload from the client package', async () => {
     const validator = await loadCanonicalValidator();
+    const fixtures = allFixtures();
+    // The corpus is asserted BEFORE it is iterated. A bare `for (… of
+    // allFixtures())` proves nothing if the corpus is ever emptied: the loop
+    // runs zero times, makes zero assertions, and the test goes green while
+    // the collector is no longer checked against the package's payloads at
+    // all. Pinning the count and the product coverage is what makes the loop
+    // below mean something.
+    expect(fixtures.length).toBeGreaterThan(0);
+    expect(fixtures.map((f) => f.product.name).sort()).toEqual(['brokkr', 'saga', 'skuld']);
     // Fixtures come from the package that owns the schema, so this fails if the
     // collector is ever pointed at a stub or a stale copy.
-    for (const fixture of allFixtures()) {
+    for (const fixture of fixtures) {
       const result = validator.validate(fixture);
       expect(result.ok, `${fixture.product.name} fixture must validate`).toBe(true);
     }
@@ -122,6 +131,60 @@ describe('safeValidate — the collector never trusts the injected validator to 
     for (const bad of [undefined, null, 'yes', 42, {}, { ok: 'true' }]) {
       const result = safeValidate(stub(() => bad), {});
       expect(result.ok).toBe(false);
+    }
+  });
+
+  test('a result that THROWS WHILE BEING INSPECTED is a rejection, not a 500', () => {
+    // The seam takes an implementation from outside this package, so the
+    // returned object is not one the collector built. An accessor (or a Proxy
+    // trap) that throws on read is a throw the guard has to absorb just like a
+    // throwing `validate` — guarding only the call left every property read
+    // below it unprotected, so such a result escaped to the route handler's
+    // catch-all and became a 500 `internal_error`.
+    const throwing = (prop: string): HeartbeatValidator =>
+      stub(() => ({
+        ok: true,
+        value: valid,
+        get [prop](): never {
+          throw new Error(`hostile getter on ${prop}`);
+        },
+      }));
+    // `ok` and `error` are read on the rejection arm; `value` on the accept arm.
+    for (const prop of ['ok', 'value']) {
+      expect(safeValidate(throwing(prop), {}), prop).toEqual({ ok: false, error: 'validator_threw' });
+    }
+    // …and an envelope field read during the key-safety check.
+    const hostileEnvelope = stub(() => ({
+      ok: true,
+      value: {
+        ...valid,
+        get instance_id(): never {
+          throw new Error('hostile envelope getter');
+        },
+      },
+    }));
+    expect(safeValidate(hostileEnvelope, {})).toEqual({ ok: false, error: 'validator_threw' });
+    // A Proxy whose `get` trap throws is the same class and must also be absorbed.
+    const hostileProxy = stub(() =>
+      new Proxy({}, { get(): never { throw new Error('hostile trap'); } }),
+    );
+    expect(safeValidate(hostileProxy, {})).toEqual({ ok: false, error: 'validator_threw' });
+  });
+
+  test('every reason safeValidate invents for a faulty validator carries the `validator_` prefix', () => {
+    // The server splits its counters on this prefix: a validator fault must be
+    // counted as an internal fault, never as an ordinary bad payload. These are
+    // the only reasons this function originates (a reason it CARRIES THROUGH
+    // comes from the validator and is the payload's verdict, not a fault).
+    const faults = [
+      safeValidate(stub(() => { throw new Error('x'); }), {}),
+      safeValidate(stub(() => ({ ok: true, value: null })), {}),
+      safeValidate(stub(() => new Proxy({}, { get(): never { throw new Error('t'); } })), {}),
+    ];
+    for (const result of faults) {
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error('unreachable');
+      expect(result.error.startsWith('validator_')).toBe(true);
     }
   });
 
