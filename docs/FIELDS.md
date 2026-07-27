@@ -122,6 +122,10 @@ that buys little. If it is wanted later it needs its own review and a new schema
 | `runs.succeeded` | `count` | delta | `runs_succeeded` | existing |
 | `runs.failed` | `count` | delta | `runs_failed` | existing |
 | `runs.chain_rejections` | `count` | delta | `chain_rejections` | existing |
+| `events.runs_enqueued` | `count` | delta | `event_runs_enqueued`, event fire that enqueued a run | existing |
+| `events.asks_delivered` | `count` | delta | `event_asks_delivered` | existing |
+| `events.rate_limit_deferred` | `count` | delta | `rate_limit_merged`, a fire deferred until the oldest in-window fire ages out | existing |
+| `events.route_errors` | `count` | delta | `event_route_errors`, a rule matcher/resolver threw | existing |
 | `gate.rejections` | `count` | delta | `gate_rejections`, gate refuse path | existing |
 | `gate.approvals` | `count` | delta | `gate_approvals`, gate **admit** path | NEW |
 | `sandbox.pool_exhausted` | `count` | delta | `sandbox_pool_exhausted` | existing |
@@ -142,6 +146,24 @@ later it becomes a **new leaf in a new schema version**, and that cost is the co
 This is what the producer rule is *for*: the field looked real in the plan, in the draft contract
 and in the counter allowlist, and only building it surfaced that nothing had incremented it since
 the design change.
+
+**Four event leaves were ADDED in its place (2026-07-27)** — `events.runs_enqueued`,
+`events.asks_delivered`, `events.rate_limit_deferred` and `events.route_errors`. All four bump
+sites already existed and were verified durable empirically (write → close → reopen → read), not
+just by reading the code. `rate_limit_merged` turned out to be the genuine deferral signal the
+dropped leaf was reaching for, so it earns an honestly-named slot of its own. Note this is an
+**addition of new leaves**, not a repointing of the dropped one: `events.rate_limit_deferred`
+says exactly what it counts, whereas reusing the old name would have silently changed a frozen
+field's meaning.
+
+Three durable counters were considered and **excluded**, recorded so the reasoning survives:
+
+- **`event_arm_refused`** — its in-memory dedup means a restart re-counts a still-refused job, so
+  its delta systematically over-reports. A counter with a known, uncorrectable bias is worse than
+  no counter, and `gate.rejections` covers the same ground with better fidelity.
+- **`coalesce_suppressed`** and **`events_ignored_replay`** — real and privacy-safe, but they
+  measure *our* window tuning rather than product usage, and we can read those off our own
+  installs. Not worth a permanent slot in someone else's payload.
 
 Three further clarifications from implementation, none of which change the wire shape:
 
