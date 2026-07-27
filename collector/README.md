@@ -199,7 +199,9 @@ of it and is ignored. Every failure — an untrusted peer, a chain shorter than 
 header, an implausible value — falls back to the peer address, never to a header value.
 
 An IPv4-mapped IPv6 peer (`::ffff:10.0.0.1`, which is what a dual-stack listener commonly reports)
-matches an IPv4 CIDR, so you do not have to write your ranges twice. A malformed entry in the list
+matches an IPv4 CIDR, so you do not have to write your ranges twice. Throttle buckets are keyed by
+an address's canonical bytes, so one source cannot spell itself two ways, and a value that does not
+parse as an address gets no bucket at all. A malformed entry in the list
 fails at boot with the offending text rather than being skipped — a silently dropped proxy means
 the header is ignored and your whole population shares one bucket, which looks like a capacity
 problem rather than a configuration one.
@@ -293,7 +295,7 @@ volumes:
 | `MYTHICAL_TELEMETRY_NEW_INSTANCE_PER_SOURCE_PER_HOUR` | `20` | per-source budget for FRESH identities |
 | `MYTHICAL_TELEMETRY_NEW_INSTANCES_PER_DAY` | `5000` | global daily budget for fresh identities (0 disables) |
 | `MYTHICAL_TELEMETRY_MAX_INSTANCES` | `100000` | absolute ceiling on stored identities |
-| `MYTHICAL_TELEMETRY_RETENTION_DAYS` | `400` | per-(instance, product) row cap, pruned daily |
+| `MYTHICAL_TELEMETRY_RETENTION_DAYS` | `400` | per-(instance, product) row cap, pruned daily. **Must be ≥ 1** — the service refuses to start at 0, which would delete every heartbeat on the next prune |
 | `MYTHICAL_TELEMETRY_TRUSTED_PROXY_HOPS` | `0` | proxies in the chain; 0 = never trust `X-Forwarded-For` |
 | `MYTHICAL_TELEMETRY_TRUSTED_PROXIES` | *(unset)* | which peers those are: comma-separated addresses/CIDRs. **Required** when hops > 0; the service refuses to start otherwise |
 | `MYTHICAL_TELEMETRY_MIN_AGGREGATE_CELL` | `5` | small-cell floor for the public aggregate |
@@ -324,6 +326,11 @@ rewrites tables in place, and no test is a substitute for a copy of the file.
 Up to `MYTHICAL_TELEMETRY_RETENTION_DAYS` daily rows per (instance, product), pruned daily. State
 whatever you configure in your privacy notice; it is a published property, not an implementation
 detail.
+
+The same prune trims the admission ledger, by a **date cutoff** rather than a row count: the
+current day's row must survive, or a restart would hand back that day's budget. A retention of `0`
+is refused at startup for the same reason — "store nothing" is not a supported configuration, and
+silently doing it would be worse than saying so.
 
 ## Deleting your data
 

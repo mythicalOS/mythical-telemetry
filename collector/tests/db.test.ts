@@ -265,15 +265,56 @@ describe('admission control — the decision and the write are one transaction',
     db.close();
   });
 
-  test('the ledger is trimmed by the retention prune', () => {
-    const db = new TelemetryDb({ path: ':memory:', retentionDays: 2 });
+  test('the ledger is trimmed by a DATE CUTOFF, and today always survives it', () => {
+    // A row-count trim could drop the current day's row and hand back the
+    // whole day's budget on the next prune.
+    const db = new TelemetryDb({
+      path: ':memory:',
+      retentionDays: 2,
+      nowUtcDay: () => '2026-07-04',
+    });
     for (const day of ['2026-07-01', '2026-07-02', '2026-07-03', '2026-07-04']) {
       db.recordHeartbeat(`id-${day}`, 'brokkr', day, 2, payload(day), day);
     }
     expect(db.admittedOnDay('2026-07-01')).toBe(1);
     db.pruneRetention();
-    expect(db.admittedOnDay('2026-07-01')).toBe(0);
-    expect(db.admittedOnDay('2026-07-04')).toBe(1);
+    expect(db.admittedOnDay('2026-07-01')).toBe(0); // older than the cutoff
+    expect(db.admittedOnDay('2026-07-02')).toBe(1); // exactly at the cutoff
+    expect(db.admittedOnDay('2026-07-04')).toBe(1); // today, always kept
+    db.close();
+  });
+
+  test('a future-dated row (clock skew) is not pruned either', () => {
+    const db = new TelemetryDb({ path: ':memory:', retentionDays: 1, nowUtcDay: () => '2026-07-04' });
+    db.recordHeartbeat('id-future', 'brokkr', '2026-07-04', 2, payload('x'), '2026-08-01');
+    db.pruneRetention();
+    expect(db.admittedOnDay('2026-08-01')).toBe(1);
+    db.close();
+  });
+
+  test('a retention of zero is REFUSED, not honoured', () => {
+    // Honouring it would delete every heartbeat on the next prune and erase
+    // the current day from the ledger, handing back the daily budget on every
+    // restart.
+    expect(() => new TelemetryDb({ path: ':memory:', retentionDays: 0 })).toThrow(/at least 1/);
+    expect(() => new TelemetryDb({ path: ':memory:', retentionDays: -5 })).toThrow(/at least 1/);
+    expect(() => new TelemetryDb({ path: ':memory:', retentionDays: 1.5 })).toThrow(/at least 1/);
+  });
+
+  test('the prune cannot be used to reset the CURRENT day budget by restarting', () => {
+    const db = new TelemetryDb({
+      path: ':memory:',
+      retentionDays: 1,
+      newInstancesPerDay: 1,
+      nowUtcDay: () => '2026-07-09',
+    });
+    db.recordHeartbeat('id-1', 'brokkr', '2026-07-09', 2, payload('a'), '2026-07-09');
+    db.pruneRetention(); // as the boot path does
+    expect(db.admittedOnDay('2026-07-09')).toBe(1);
+    expect(db.recordHeartbeat('id-2', 'brokkr', '2026-07-09', 2, payload('a'), '2026-07-09')).toEqual({
+      ok: false,
+      reason: 'daily_admission_budget',
+    });
     db.close();
   });
 });

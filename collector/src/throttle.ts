@@ -32,32 +32,19 @@
 // implausible value all mean the request did not arrive the way the operator
 // described.
 
-import { isTrustedPeer, type CidrPattern } from './ip';
+import { addressKey, isTrustedPeer, type CidrPattern } from './ip';
 
 export interface ServerLike {
   requestIP?: (req: Request) => { address: string } | null;
 }
 
-/** Longest plausible textual address: 45 for IPv4-mapped IPv6, plus a zone id. */
-const MAX_ADDRESS_LEN = 64;
 /**
- * Address-ish characters only: hex digits and dots/colons, plus the letters,
- * digits, `-` and `_` an IPv6 zone id (an interface name) may carry.
- *
- * This is defence in depth, not the control. With N trusted hops the selected
- * position was written by the operator's own proxy, so an attacker cannot
- * choose it at all; the check bounds the damage of a MISCONFIGURED hop count,
- * where an attacker-supplied entry could be selected and would otherwise let
- * them mint unlimited distinct bucket keys.
+ * Fall-back key for a peer the address parser does not understand — a unix
+ * socket, or the "unknown" a server without `requestIP` yields. It is bounded
+ * and comes from the runtime, never from the request.
  */
-const PLAUSIBLE_ADDRESS_RE = /^[0-9a-zA-Z.:%_-]+$/;
-
-function isPlausibleAddress(value: string): boolean {
-  if (value.length === 0 || value.length > MAX_ADDRESS_LEN) return false;
-  if (!PLAUSIBLE_ADDRESS_RE.test(value)) return false;
-  // Must look like an address of some family, not a bare number: an attacker
-  // choosing arbitrary short strings would otherwise mint unlimited buckets.
-  return value.includes('.') || value.includes(':');
+function opaquePeerKey(peer: string): string {
+  return `peer:${peer.slice(0, 64)}`;
 }
 
 /**
@@ -74,21 +61,26 @@ export function resolveSourceKey(
   trustedProxies: readonly CidrPattern[] = [],
 ): string {
   const peer = server?.requestIP?.(req)?.address ?? 'unknown';
-  if (trustedProxyHops <= 0) return peer;
+  const peerKey = addressKey(peer) ?? opaquePeerKey(peer);
+  if (trustedProxyHops <= 0) return peerKey;
   // The peer must be one of the operator's own proxies. A direct connection
   // never gets to choose its own bucket.
-  if (!isTrustedPeer(peer, trustedProxies)) return peer;
+  if (!isTrustedPeer(peer, trustedProxies)) return peerKey;
 
   const header = req.headers.get('x-forwarded-for');
-  if (!header) return peer;
+  if (!header) return peerKey;
 
   const parts = header.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
   const index = parts.length - trustedProxyHops;
-  if (index < 0 || index >= parts.length) return peer;
+  if (index < 0 || index >= parts.length) return peerKey;
 
   const candidate = parts[index];
-  if (candidate === undefined || !isPlausibleAddress(candidate)) return peer;
-  return candidate;
+  if (candidate === undefined) return peerKey;
+  // The selected entry must PARSE as an address, and the key is derived from
+  // its canonical bytes. A "looks address-ish" text test would let a caller
+  // behind a misconfigured hop count mint unlimited near-miss buckets, and
+  // would treat `10.0.0.1` and `::ffff:10.0.0.1` as two sources.
+  return addressKey(candidate) ?? peerKey;
 }
 
 /**

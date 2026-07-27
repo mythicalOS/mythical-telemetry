@@ -4,7 +4,7 @@
 // real proxy is an outage.
 
 import { describe, expect, test } from 'bun:test';
-import { ipInCidr, isTrustedPeer, parseCidr, parseIp, parseTrustedProxies } from '../src/ip';
+import { addressKey, ipInCidr, isTrustedPeer, parseCidr, parseIp, parseTrustedProxies } from '../src/ip';
 
 const hex = (bytes: Uint8Array | null) => (bytes ? Buffer.from(bytes).toString('hex') : null);
 
@@ -34,10 +34,33 @@ describe('parseIp', () => {
     for (const bad of [
       '', '   ', 'not an address', '1.2.3', '1.2.3.4.5', '256.0.0.1', '1.2.3.-1', '01.2.3.4444',
       '999', 'localhost', '<script>', '2001:db8::1::2', '2001:db8:::1', '2001:db8:zzzz::1',
-      '2001:db8:0:0:0:0:0:0:1', ':::', '1:2:3:4:5:6:7', 'x'.repeat(200),
+      '2001:db8:0:0:0:0:0:0:1', ':::', '1:2:3:4:5:6:7', 'x'.repeat(200), 'a:a', '::ffff:',
     ]) {
       expect(parseIp(bad), bad).toBeNull();
     }
+  });
+
+  test('an embedded IPv4 is legal ONLY as the final group', () => {
+    // The hazard is not a rejected address, it is an accepted one that parses
+    // to bytes nobody wrote: `2001:db8:192.0.2.1::` would otherwise become
+    // `2001:db8:c000:201::`.
+    expect(parseIp('2001:db8:192.0.2.1::')).toBeNull();
+    expect(parseIp('192.0.2.1::1')).toBeNull();
+    expect(parseIp('1.2.3.4:2001:db8::')).toBeNull();
+    expect(parseIp('::ffff:1.2.3.4:5')).toBeNull();
+    // ...and the legal placements still work.
+    expect(hex(parseIp('::ffff:1.2.3.4'))).toBe('01020304');
+    expect(hex(parseIp('2001:db8::1.2.3.4'))).toBe('20010db8000000000000000001020304');
+    expect(hex(parseIp('0:0:0:0:0:0:1.2.3.4'))).toBe('00000000000000000000000001020304');
+  });
+
+  test('a zone id is validated, not silently truncated at the first percent sign', () => {
+    expect(hex(parseIp('fe80::1%eth0'))).toBe('fe800000000000000000000000000001');
+    expect(hex(parseIp('fe80::1%3'))).toBe('fe800000000000000000000000000001');
+    expect(parseIp('fe80::1%')).toBeNull();
+    expect(parseIp('fe80::1%a%b')).toBeNull();
+    expect(parseIp('fe80::1% ')).toBeNull();
+    expect(parseIp('fe80::1%a:b')).toBeNull();
   });
 
   test('trims surrounding whitespace', () => {
@@ -126,5 +149,33 @@ describe('isTrustedPeer', () => {
   test('addresses outside every range are not trusted', () => {
     expect(isTrustedPeer('203.0.113.9', proxies)).toBe(false);
     expect(isTrustedPeer('2001:db8:9::1', proxies)).toBe(false);
+  });
+});
+
+describe('addressKey', () => {
+  test('every spelling of one address yields ONE key', () => {
+    const v4 = addressKey('10.0.0.1');
+    expect(addressKey(' 10.0.0.1 ')).toBe(v4);
+    expect(addressKey('::ffff:10.0.0.1')).toBe(v4);
+    expect(addressKey('::ffff:0a00:0001')).toBe(v4);
+
+    const v6 = addressKey('2001:db8::1');
+    expect(addressKey('2001:0db8:0000:0000:0000:0000:0000:0001')).toBe(v6);
+    expect(addressKey('2001:db8::1%eth0')).toBe(v6);
+  });
+
+  test('the families are distinguished in the key itself', () => {
+    expect(addressKey('10.0.0.1')?.startsWith('v4:')).toBe(true);
+    expect(addressKey('2001:db8::1')?.startsWith('v6:')).toBe(true);
+  });
+
+  test('distinct addresses yield distinct keys', () => {
+    expect(addressKey('10.0.0.1')).not.toBe(addressKey('10.0.0.2'));
+  });
+
+  test('a non-address yields NO key, so it can never become a bucket', () => {
+    for (const bad of ['unknown', '', 'a:a', 'not an address', '999', '2001:db8:192.0.2.1::']) {
+      expect(addressKey(bad), bad).toBeNull();
+    }
   });
 });

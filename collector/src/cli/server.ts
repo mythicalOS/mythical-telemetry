@@ -50,6 +50,8 @@ const dbPath = process.env.MYTHICAL_TELEMETRY_DB_PATH || '/data/telemetry.db';
 const port = envInt('MYTHICAL_TELEMETRY_PORT', DEFAULT_PORT);
 
 const db = new TelemetryDb({
+  // A retention of 0 is rejected by TelemetryDb rather than honoured — it
+  // would delete every heartbeat on the next prune.
   path: dbPath,
   retentionDays: envInt('MYTHICAL_TELEMETRY_RETENTION_DAYS', DEFAULT_RETENTION_DAYS),
   maxInstances: envInt('MYTHICAL_TELEMETRY_MAX_INSTANCES', DEFAULT_MAX_INSTANCES),

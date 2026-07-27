@@ -32,6 +32,7 @@
 // and never-existed instances are indistinguishable.
 
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { dayToEpochUtc, MS_PER_DAY, shiftDay } from './day';
 import type { TelemetryDb } from './db';
 import { authorizesInstance, UUID_V4_RE } from './identity';
 import { Counters, type CounterName } from './counters';
@@ -51,7 +52,6 @@ export const DEFAULT_MIN_AGGREGATE_CELL = 5;
 export const DEFAULT_ACTIVE_WINDOW_DAYS = 28;
 
 const DAY_WINDOW_DAYS = 30;
-const MS_PER_DAY = 86_400_000;
 const MINUTE_MS = 60_000;
 const HOUR_MS = 3_600_000;
 
@@ -124,26 +124,6 @@ function json(status: number, body: unknown): Response {
 
 function html(status: number, body: string): Response {
   return new Response(body, { status, headers: { 'content-type': 'text/html; charset=utf-8' } });
-}
-
-/** YYYY-MM-DD → UTC epoch ms, null if not a real calendar day (e.g. 2026-02-30). */
-export function dayToEpochUtc(day: string): number | null {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
-  if (!m) return null;
-  const y = Number(m[1]);
-  const mo = Number(m[2]);
-  const d = Number(m[3]);
-  const t = Date.UTC(y, mo - 1, d);
-  const dt = new Date(t);
-  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return null;
-  return t;
-}
-
-/** Shift a YYYY-MM-DD day by a whole number of days, staying in UTC. */
-function shiftDay(day: string, deltaDays: number): string {
-  const epoch = dayToEpochUtc(day);
-  if (epoch === null) return day;
-  return new Date(epoch + deltaDays * MS_PER_DAY).toISOString().slice(0, 10);
 }
 
 /** The presented instance secret, canonical header first. */

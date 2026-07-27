@@ -32,10 +32,20 @@ function parseIpv4(text: string): Uint8Array | null {
   return out;
 }
 
-/** Append the hextet values of `groups` to `out`; false on anything malformed. */
-function pushHextets(groups: string[], out: number[]): boolean {
-  for (const group of groups) {
+/**
+ * Append the hextet values of `groups` to `out`; false on anything malformed.
+ *
+ * `embeddedV4Index` is the ONLY position at which a dotted IPv4 literal is
+ * permitted (-1 for none). RFC 4291 allows an embedded IPv4 only at the very
+ * end of the address, and accepting it anywhere else means text like
+ * `2001:db8:192.0.2.1::` parses to a perfectly valid-looking address that is
+ * not the one written. In a gate that decides whether to trust a header, "this
+ * parsed to the wrong bytes" is worse than "this failed to parse".
+ */
+function pushHextets(groups: string[], out: number[], embeddedV4Index: number): boolean {
+  for (const [index, group] of groups.entries()) {
     if (group.includes('.')) {
+      if (index !== embeddedV4Index) return false;
       const v4 = parseIpv4(group);
       if (!v4) return false;
       out.push(((v4[0] ?? 0) << 8) | (v4[1] ?? 0), ((v4[2] ?? 0) << 8) | (v4[3] ?? 0));
@@ -63,8 +73,16 @@ export function parseIp(text: string): Uint8Array | null {
   if (trimmed.length === 0 || trimmed.length > MAX_TEXT_LEN) return null;
   if (!trimmed.includes(':')) return parseIpv4(trimmed);
 
-  // Strip an IPv6 zone id — it names a local interface, not the address.
-  const noZone = trimmed.split('%')[0] ?? '';
+  // An IPv6 zone id names a local interface, not the address, so it is dropped
+  // — but it is VALIDATED first. Silently truncating at the first '%' would
+  // accept `fe80::1%a%b` and `fe80::1%` as the same address as `fe80::1`.
+  let noZone = trimmed;
+  const percent = trimmed.indexOf('%');
+  if (percent >= 0) {
+    const zone = trimmed.slice(percent + 1);
+    if (zone.length === 0 || !/^[0-9A-Za-z._-]+$/.test(zone)) return null;
+    noZone = trimmed.slice(0, percent);
+  }
   if (noZone.length === 0) return null;
 
   const doubleColon = noZone.indexOf('::');
@@ -81,9 +99,15 @@ export function parseIp(text: string): Uint8Array | null {
     head = noZone.split(':');
   }
 
+  // An embedded IPv4 literal is legal only as the final group of the whole
+  // address — which means the tail's last group when '::' is present (nothing
+  // follows the tail), and the head's last group when it is not.
+  const headV4Index = doubleColon >= 0 ? -1 : head.length - 1;
+  const tailV4Index = doubleColon >= 0 ? tail.length - 1 : -1;
+
   const headValues: number[] = [];
   const tailValues: number[] = [];
-  if (!pushHextets(head, headValues) || !pushHextets(tail, tailValues)) return null;
+  if (!pushHextets(head, headValues, headV4Index) || !pushHextets(tail, tailValues, tailV4Index)) return null;
 
   let hextets: number[];
   if (doubleColon >= 0) {
@@ -155,6 +179,21 @@ export function parseTrustedProxies(entries: readonly string[]): CidrPattern[] {
     out.push(parsed);
   }
   return out;
+}
+
+/**
+ * A canonical throttle-bucket key for an address, or null if it is not one.
+ *
+ * Canonical because the key must not be attacker-shapeable: `10.0.0.1`,
+ * ` 10.0.0.1 `, `::ffff:10.0.0.1` and `::ffff:0a00:0001` are ONE source, and
+ * anything that is not an address gets no key at all. Deriving the key from a
+ * "looks address-ish" text test instead would let a caller mint unlimited
+ * distinct buckets out of near-miss strings.
+ */
+export function addressKey(text: string): string | null {
+  const bytes = parseIp(text);
+  if (!bytes) return null;
+  return `${bytes.length === 4 ? 'v4' : 'v6'}:${Buffer.from(bytes).toString('hex')}`;
 }
 
 /** Is this peer one of the operator's proxies? */
