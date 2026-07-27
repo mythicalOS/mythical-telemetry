@@ -176,7 +176,8 @@ interface StatsBody {
     days_counted: number;
     excluded_day: string | null;
     excluded_reason: 'first_report_is_not_a_daily_delta' | null;
-    per_day: Record<string, number> | null;
+    /** null for the object when there is no representative day; null for a leaf whose value is not representable. */
+    per_day: Record<string, number | null> | null;
   };
 }
 
@@ -393,7 +394,7 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
     if (!inst) return null;
     const rows = db.getHeartbeats(uuid, product, recentDays);
 
-    const days = rows.map((row) => {
+    const rendered = rows.map((row) => {
       // A returned day is the stored document with (a) instance_id omitted —
       // it is hoisted to `instance.id` — and (b) brokkr's computed
       // spine.tokens_saved added. Everything else exactly as stored. A stored
@@ -410,8 +411,13 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
       }
       delete payload['instance_id'];
       decorateDay(product, payload);
-      return payload;
+      // The ROW key travels alongside the document. Which day a row is for is
+      // a fact about the store, not a claim inside a payload that may be
+      // corrupt or disagree — and it is what the first-report exclusion below
+      // must match on.
+      return { rowDay: row.day, payload };
     });
+    const days = rendered.map((r) => r.payload);
 
     // The first heartbeat from an identity is not a one-day delta: a counter
     // with no prior snapshot emits its LIFETIME value, so an install that ran
@@ -420,7 +426,7 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
     const firstReportDay = inst.first_report_day;
     const rateDays = firstReportDay === null
       ? days
-      : days.filter((d) => d['day'] !== firstReportDay);
+      : rendered.filter((r) => r.rowDay !== firstReportDay).map((r) => r.payload);
     const excluded = firstReportDay !== null && rateDays.length !== days.length;
 
     return {

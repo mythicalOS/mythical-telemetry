@@ -7,7 +7,7 @@
 // exists to keep that from coming back.
 
 import { describe, expect, test } from 'bun:test';
-import { foldTotals } from '../src/totals';
+import { foldRates, foldTotals } from '../src/totals';
 import { ingestReq, makeHarness, statsReq } from './helpers';
 import { INSTANCE_A, makeV1, makeV2, SECRET_A } from './fixtures';
 
@@ -401,5 +401,80 @@ describe('the FIRST heartbeat is not a one-day delta, and is excluded from every
     await b.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-08'), SECRET_A));
     await b.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-09'), SECRET_A));
     expect((await statsFor(b, 'brokkr')).rates.per_day.models).toBeUndefined();
+  });
+});
+
+describe('the exclusion keys off the STORE, not the document', () => {
+  test('a payload whose internal day disagrees with its row is still excluded correctly', async () => {
+    // Which day a row is for is a fact about the store. A corrupt historical
+    // document that claims another day — or none — must not smuggle the
+    // first-report row back into the rate window.
+    const h = makeHarness();
+    h.db.recordHeartbeat(
+      INSTANCE_A, 'brokkr', '2026-07-07', 2,
+      JSON.stringify({ day: '1999-01-01', metrics: { sessions: { count: 900 } } }),
+      '2026-07-07',
+    );
+    h.db.recordHeartbeat(
+      INSTANCE_A, 'brokkr', '2026-07-08', 2,
+      JSON.stringify({ metrics: { sessions: { count: 10 } } }), // no `day` at all
+      '2026-07-08',
+    );
+    const body = await statsFor(h, 'brokkr');
+    expect(body.instance.first_report_day).toBe('2026-07-07');
+    expect(body.rates.excluded_day).toBe('2026-07-07');
+    expect(body.rates.days_counted).toBe(1);
+    expect(body.rates.per_day.sessions).toBe(10); // the 900 is not averaged in
+  });
+
+  test('an unparseable first-report row is still excluded', async () => {
+    const h = makeHarness();
+    h.db.recordHeartbeat(INSTANCE_A, 'brokkr', '2026-07-07', 2, 'not json', '2026-07-07');
+    h.db.recordHeartbeat(
+      INSTANCE_A, 'brokkr', '2026-07-08', 2,
+      JSON.stringify({ day: '2026-07-08', metrics: { sessions: { count: 6 } } }),
+      '2026-07-08',
+    );
+    const body = await statsFor(h, 'brokkr');
+    expect(body.rates.excluded_day).toBe('2026-07-07');
+    expect(body.rates.days_counted).toBe(1);
+    expect(body.rates.per_day.sessions).toBe(6);
+  });
+});
+
+describe('accumulated figures stay representable', () => {
+  test('an overflowing total reports null, not a bare JSON null from Infinity', () => {
+    // Individual leaves are finite, but a long enough window of large enough
+    // ones can still overflow while adding up. JSON.stringify renders Infinity
+    // as `null` with no explanation; a deliberate null from a documented union
+    // says the same thing honestly.
+    const huge = { metrics: { sessions: { count: Number.MAX_VALUE, minutes: 1 } } };
+    const totals = foldTotals('brokkr', [huge, huge, huge]);
+    expect(totals['sessions']).toBeNull();
+    expect(totals['minutes']).toBe(3);
+    expect(JSON.parse(JSON.stringify(totals)).sessions).toBeNull();
+  });
+
+  test('a rate over huge leaves stays finite via a running mean', () => {
+    const huge = { metrics: { sessions: { count: Number.MAX_VALUE, minutes: 4 } } };
+    const rates = foldRates('brokkr', [huge, huge, huge])!;
+    // sum-then-divide would have overflowed to Infinity first.
+    expect(rates['sessions']).toBe(Number.MAX_VALUE);
+    expect(Number.isFinite(rates['sessions'] as number)).toBe(true);
+    expect(rates['minutes']).toBe(4);
+  });
+
+  test('every emitted figure survives a JSON round trip as a number or an explicit null', () => {
+    const days = [
+      { metrics: { sessions: { count: 5, minutes: 50, failed: 1 }, spine: { tokens_before: 9, tokens_after: 4 } } },
+      { metrics: { sessions: { count: Number.MAX_VALUE, minutes: 10, failed: 0 } } },
+    ];
+    for (const value of Object.values(foldTotals('brokkr', days))) {
+      expect(typeof value === 'number' || typeof value === 'boolean' || value === null || Array.isArray(value)).toBe(true);
+      if (typeof value === 'number') expect(Number.isFinite(value)).toBe(true);
+    }
+    for (const value of Object.values(foldRates('brokkr', days)!)) {
+      expect(value === null || Number.isFinite(value)).toBe(true);
+    }
   });
 });

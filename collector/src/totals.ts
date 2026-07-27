@@ -85,6 +85,20 @@ function num(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
+/**
+ * An accumulated figure, or null when it is not representable.
+ *
+ * Individual leaves are finite, but a long enough window of large enough ones
+ * can still overflow to Infinity while adding up. `JSON.stringify` renders
+ * that as a bare `null` with no explanation, so a consumer reads "no value"
+ * where the truth is "too large to state". Returning null deliberately, from
+ * a documented union, says the same thing honestly — and it never yields
+ * `NaN`, which would serialize the same way and mean something else again.
+ */
+function finite(value: number): number | null {
+  return Number.isFinite(value) ? value : null;
+}
+
 /** A JSON-safe scalar, or null. Used for gauges, whose type is per-leaf. */
 function scalar(value: unknown): number | string | boolean | null {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
@@ -108,7 +122,7 @@ export function foldTotals(product: string, days: readonly unknown[]): Record<st
     if (spec.mode === 'sum') {
       let acc = 0;
       for (const day of days) acc += num(dig(day, spec.path));
-      out[spec.key] = acc;
+      out[spec.key] = finite(acc);
     } else if (spec.mode === 'or') {
       let acc = false;
       for (const day of days) acc = acc || dig(day, spec.path) === true;
@@ -125,7 +139,7 @@ export function foldTotals(product: string, days: readonly unknown[]): Record<st
   }
 
   if (product === 'brokkr') {
-    out['spine_tokens_saved'] = foldSpineTokensSaved(days);
+    out['spine_tokens_saved'] = finite(foldSpineTokensSaved(days));
     out['models'] = foldModels(days);
   }
 
@@ -156,21 +170,39 @@ export function foldTotals(product: string, days: readonly unknown[]): Record<st
  * Returns null when the window has no representative day left, rather than
  * zeros — "no data to average" and "averaged to zero" are different claims.
  */
-export function foldRates(product: string, rateDays: readonly unknown[]): Record<string, number> | null {
+export function foldRates(product: string, rateDays: readonly unknown[]): Record<string, number | null> | null {
   const specs = SPECS[product];
   if (!specs || rateDays.length === 0) return null;
 
-  const out: Record<string, number> = {};
+  // Accumulated as a running mean rather than sum-then-divide: the sum of a
+  // long window of large leaves can overflow to Infinity even though the mean
+  // is perfectly representable.
+  const out: Record<string, number | null> = {};
   for (const spec of specs) {
     if (spec.mode !== 'sum') continue;
-    let acc = 0;
-    for (const day of rateDays) acc += num(dig(day, spec.path));
-    out[spec.key] = acc / rateDays.length;
+    out[spec.key] = finite(runningMean(rateDays, (day) => num(dig(day, spec.path))));
   }
   if (product === 'brokkr') {
-    out['spine_tokens_saved'] = foldSpineTokensSaved(rateDays) / rateDays.length;
+    out['spine_tokens_saved'] = finite(
+      runningMean(rateDays, (day) => {
+        const before = num(dig(day, ['metrics', 'spine', 'tokens_before']));
+        const after = num(dig(day, ['metrics', 'spine', 'tokens_after']));
+        return Math.max(0, before - after);
+      }),
+    );
   }
   return out;
+}
+
+/** Incremental mean — never forms the (possibly overflowing) total. */
+function runningMean(days: readonly unknown[], valueOf: (day: unknown) => number): number {
+  let mean = 0;
+  let n = 0;
+  for (const day of days) {
+    n += 1;
+    mean += (valueOf(day) - mean) / n;
+  }
+  return mean;
 }
 
 /**
@@ -203,7 +235,7 @@ function foldModels(days: readonly unknown[]): Array<{ name: string; sessions: n
     }
   }
   return [...totals.entries()]
-    .map(([name, sessions]) => ({ name, sessions }))
+    .map(([name, sessions]) => ({ name, sessions: Number.isFinite(sessions) ? sessions : 0 }))
     .sort((a, b) => b.sessions - a.sessions || a.name.localeCompare(b.name));
 }
 

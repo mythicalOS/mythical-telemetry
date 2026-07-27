@@ -132,6 +132,12 @@ How this collector implements it:
   easy one to reach.
 - When the window holds only the first-report day, `rates.per_day` is `null` rather than zeros —
   "nothing representative to average" and "averaged to zero" are different claims.
+- The exclusion matches on the **stored row's** day, not on the `day` inside the document. Which
+  day a row is for is a fact about the store; a corrupt historical payload must not be able to
+  smuggle the first-report row back into the rate window.
+- Any accumulated figure that overflows to a value JavaScript cannot represent is emitted as an
+  explicit `null` rather than as `Infinity` — which `JSON.stringify` renders as a bare `null`
+  meaning something else entirely. Rates are computed as a running mean for the same reason.
 - Gauges get no rate (a mean of snapshots is not a rate of anything), and neither does the model
   breakdown.
 - Upgrading an existing volume derives `first_report_day` from the earliest surviving heartbeat.
