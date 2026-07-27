@@ -57,6 +57,28 @@ produces completed-day deltas. The wire carries deltas only, so saga and skuld e
 
 A delta leaf is therefore always `>= 0`, and the schema enforces `minimum: 0`.
 
+### The FIRST heartbeat from any instance is not a one-day delta — the collector must handle this
+
+Rule 4 means a counter with no prior snapshot emits its **current lifetime value**. On a fresh
+install that is genuinely about one day's activity. On an install that has been running for
+months before telemetry was first switched on, it is **months of accumulation reported as a
+single day**.
+
+This is not an edge case that might occur — **it is guaranteed for every install**. Telemetry
+has never been activated anywhere, so at first activation every counter on every instance is
+seeing its first snapshot. The same applies whenever a *new leaf* is added later: its first
+heartbeat on an existing install carries that counter's whole history.
+
+The emitter deliberately does **not** solve this by emitting `0` for an unseen counter — that
+would silently discard real activity, and the lifetime total is genuinely useful on the first
+observation.
+
+**Therefore the collector must exclude each `(instance_id, product)`'s first observed day from
+any per-day rate statistic**, and must not present it as a representative day. Storing it is
+correct; averaging it in is not. A collector that skips this rule will report a large one-time
+spike at every install's activation and will overstate per-day rates permanently, because the
+inflated row never ages out of a lifetime average.
+
 ## `brokkr` body
 
 **v1's ten sections, moved verbatim under `metrics`.** No leaf is added, removed, renamed or
