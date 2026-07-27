@@ -362,31 +362,44 @@ const DEFAULT_MAX_RESPONSE_BYTES = 4096;
 function sanitizeDetail(text: string, redact: readonly string[] = []): string | undefined {
   let cleaned = text.replace(/[^\x20-\x7e]+/g, " ");
 
+  // DETECTION RUNS ON THE WHOLE CAPTURED BODY, then the survivor is truncated for display.
+  // Detecting on the truncated excerpt instead would hand the endpoint a trivial evasion: pad the
+  // key out past the display limit and the tail of it lands in the excerpt unexamined. The body is
+  // already bounded by `maxResponseBytes`, so this stays linear and cheap.
   for (const secret of redact) {
     if (secret.length < 8) continue;
-    cleaned = cleaned.split(secret).join("[redacted]");
-    // The endpoint ALREADY HOLDS the key, so it can choose how to spell it back: eight 8-character
-    // chunks separated by spaces or hyphens is neither an exact substring nor a long hex run.
-    // Match the secret's characters with arbitrary separators allowed between them.
-    const spaced = new RegExp(secret.split("").map(escapeRegExp).join("[^0-9A-Za-z]{0,4}"), "gi");
-    cleaned = cleaned.replace(spaced, "[redacted]");
+    // The endpoint ALREADY HOLDS the key, so it chooses how to spell it back. An exact substring
+    // and a punctuation-separated form are the easy cases; interleaving a letter between every
+    // character ("a1Zb2Zc3Z…") defeats both, and defeats a hex-run scan too, because the filler is
+    // alphanumeric. So the real test is a SUBSEQUENCE test: do the secret's characters appear in
+    // order anywhere in the body? Sixty-four specific characters, in order, do not occur in prose
+    // by accident.
+    if (containsSubsequence(cleaned, secret)) return REDACTED_DETAIL;
   }
 
-  cleaned = cleaned.replace(/[0-9a-fA-F]{32,}/g, "[redacted]");
+  // Defence in depth for key-like material the caller did NOT name: a long hex run once every
+  // separator is removed. The threshold sits above a UUID's 32 hex digits so a collector echoing
+  // an instance id keeps its actionable message. Honest limit: this is a heuristic. Only the
+  // named-secret subsequence test above is a guarantee.
+  if (/[0-9a-fA-F]{40,}/.test(cleaned.replace(/[^0-9A-Za-z]/g, ""))) return REDACTED_DETAIL;
 
-  // Last line of defence against a spelling nobody anticipated: if the text still contains a long
-  // hex run once every separator is removed, drop the excerpt entirely. The threshold sits above a
-  // UUID's 32 hex digits so a collector echoing an instance id keeps its actionable message.
-  if (/[0-9a-fA-F]{40,}/.test(cleaned.replace(/[^0-9A-Za-z]/g, ""))) {
-    return "[redacted — the response body contained key-like material]";
-  }
-
-  cleaned = cleaned.trim().slice(0, 200);
+  cleaned = cleaned.replace(/[0-9a-fA-F]{32,}/g, "[redacted]").trim().slice(0, MAX_DETAIL_CHARS);
   return cleaned === "" ? undefined : cleaned;
 }
 
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const MAX_DETAIL_CHARS = 200;
+const REDACTED_DETAIL = "[redacted — the response body contained key-like material]";
+
+/** Case-insensitive: do `needle`'s characters appear in order within `haystack`? O(haystack). */
+function containsSubsequence(haystack: string, needle: string): boolean {
+  const h = haystack.toLowerCase();
+  const n = needle.toLowerCase();
+  let i = 0;
+  for (const ch of h) {
+    if (ch === n[i]) i += 1;
+    if (i === n.length) return true;
+  }
+  return false;
 }
 
 /**

@@ -172,6 +172,12 @@ export class HeartbeatEmitter<P extends ProductName> {
         central: endpoints.centralUrl === "" ? undefined : endpoints.centralUrl,
         copy: endpoints.copyUrl === "" ? undefined : endpoints.copyUrl,
       });
+      // Presence is not validity. `ftp://…`, a malformed URL, or one carrying credentials all pass
+      // an is-it-configured check and then throw deep inside the transport — past the fence, with
+      // the previous endpoint's pending payload still retained. Normalising here turns every one
+      // of those into the same misconfiguration path, which fences.
+      normalizeDestinationUrl(endpoints.centralUrl);
+      if (endpoints.copyUrl !== undefined && endpoints.copyUrl !== "") normalizeDestinationUrl(endpoints.copyUrl);
     } catch (err) {
       // A destination that is no longer configured is a RETIRED destination: purge its queued
       // deliveries and its retained payloads rather than leaving them for a URL that may never
@@ -263,6 +269,20 @@ export class HeartbeatEmitter<P extends ProductName> {
    * consent and configuration are unchanged.
    */
   applyConfigChange(): void {
+    try {
+      this.applyConfigChangeInner();
+    } catch (err) {
+      // This is called from a settings-save path; it must never throw at the caller. A URL that
+      // cannot even be parsed is a retired destination — fence both rather than leave a pending
+      // payload addressed to something unusable.
+      this.log(`telemetry config change rejected: ${err instanceof Error ? err.message : String(err)}`);
+      this.deps.transport.fenceDestination("central", undefined, undefined);
+      this.deps.transport.fenceDestination("copy", undefined, undefined);
+      if (this.deps.identity.currentCopyDestination() !== undefined) this.deps.identity.clearCopyIdentity();
+    }
+  }
+
+  private applyConfigChangeInner(): void {
     const consent = this.deps.getConsent();
     if (!isSendPermitted(consent)) {
       this.deps.transport.fenceAll("telemetry disabled");

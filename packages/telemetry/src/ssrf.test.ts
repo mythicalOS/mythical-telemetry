@@ -451,7 +451,9 @@ describe("the surfaced detail never carries key material", () => {
     });
     expect(result.status).toBe(401);
     expect(result.detail).not.toContain(SECRET);
-    expect(result.detail).toContain("[redacted]");
+    // The whole excerpt is dropped rather than patched: once a body is known to carry key
+    // material, the safe move is to keep none of it.
+    expect(result.detail).toContain("[redacted");
   });
 
   test("a long hex run is redacted even when the caller did not name it", async () => {
@@ -462,7 +464,7 @@ describe("the surfaced detail never carries key material", () => {
     });
     const result = await postPinned({ endpoint: await pinnedTo(port), body: "{}", headers: {}, timeoutMs: 2000 });
     expect(result.detail).not.toContain(other);
-    expect(result.detail).toContain("[redacted]");
+    expect(result.detail).toContain("[redacted");
   });
 });
 
@@ -505,5 +507,58 @@ describe("redaction survives a hostile endpoint choosing how to spell the key ba
     });
     const result = await postPinned({ endpoint: await pinnedTo(port), body: "{}", headers: {}, timeoutMs: 2000 });
     expect(result.detail).toContain("already has a row for that day");
+  });
+});
+
+describe("redaction closes the interleaving bypass", () => {
+  const SECRET = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+
+  test("the key interleaved with non-hex letters is caught by the subsequence test", async () => {
+    // Neither an exact substring, nor punctuation-separated, nor a hex run once separators are
+    // stripped — the letters ARE alphanumeric. Only a subsequence test sees it.
+    const interleaved = SECRET.split("").join("Z");
+    const { port } = await serve((_req, res) => {
+      res.writeHead(401, { "content-type": "text/plain" });
+      res.end(`nope ${interleaved}`);
+    });
+    const result = await postPinned({
+      endpoint: await pinnedTo(port),
+      body: "{}",
+      headers: {},
+      timeoutMs: 2000,
+      redactFromDetail: [SECRET],
+    });
+    expect(result.detail).toBe("[redacted — the response body contained key-like material]");
+  });
+
+  test("interleaved with mixed junk, and with the case flipped", async () => {
+    const interleaved = SECRET.toUpperCase().split("").join(" x-");
+    const { port } = await serve((_req, res) => {
+      res.writeHead(401, { "content-type": "text/plain" });
+      res.end(interleaved);
+    });
+    const result = await postPinned({
+      endpoint: await pinnedTo(port),
+      body: "{}",
+      headers: {},
+      timeoutMs: 2000,
+      redactFromDetail: [SECRET],
+    });
+    expect(result.detail).toBe("[redacted — the response body contained key-like material]");
+  });
+
+  test("an ordinary error message that happens to share letters is NOT redacted", async () => {
+    const { port } = await serve((_req, res) => {
+      res.writeHead(400, { "content-type": "text/plain" });
+      res.end("schema_version 2 is not supported by this collector; upgrade to >= 1.4.0");
+    });
+    const result = await postPinned({
+      endpoint: await pinnedTo(port),
+      body: "{}",
+      headers: {},
+      timeoutMs: 2000,
+      redactFromDetail: [SECRET],
+    });
+    expect(result.detail).toContain("schema_version 2 is not supported");
   });
 });

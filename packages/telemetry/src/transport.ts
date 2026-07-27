@@ -565,9 +565,23 @@ export class Transport {
       );
     }
 
-    const days = this.unresolvedDays({ central: input.central, copy: input.copy, exceptDay: input.exceptDay });
+    const maxDays = input.maxDays ?? 3;
     const reports: SendReport[] = [];
-    for (const day of days.slice(0, input.maxDays ?? 3)) {
+    const visited = new Set<string>();
+    let attempted = 0;
+
+    // Eligibility is re-evaluated on EVERY pass, and only a day that actually produced an attempt
+    // spends the cap. Selecting a fixed slice up front meant one day whose failure opened the
+    // circuit breaker could make the next selections no-ops, so the cap was consumed by days that
+    // never left the building while newer eligible days waited for a tick that never came.
+    while (attempted < maxDays) {
+      const day = this.unresolvedDays({ central: input.central, copy: input.copy, exceptDay: input.exceptDay }).find(
+        (candidate) => !visited.has(candidate),
+      );
+      if (day === undefined) break;
+      visited.add(day);
+
+      const attemptsBefore = this.attemptsForDay(day, input.central.url, input.copy?.url);
       const central = this.record(day, "central", input.central.url);
       const copy = input.copy === undefined ? undefined : this.record(day, "copy", input.copy.url);
       // The stored body wins inside deliverOnce; these are only the record-creation fallback. A
@@ -587,8 +601,17 @@ export class Transport {
           { fence: false, onlyExisting: true },
         ),
       );
+      // A day skipped by a breaker that opened mid-loop made no request, so it must not count.
+      if (this.attemptsForDay(day, input.central.url, input.copy?.url) > attemptsBefore) attempted += 1;
     }
     return reports;
+  }
+
+  /** Total attempts recorded for a day across its configured destinations. */
+  private attemptsForDay(day: string, centralUrl: string, copyUrl: string | undefined): number {
+    const central = this.record(day, "central", centralUrl)?.attempts ?? 0;
+    const copy = copyUrl === undefined ? 0 : (this.record(day, "copy", copyUrl)?.attempts ?? 0);
+    return central + copy;
   }
 
   private outcomeFor(

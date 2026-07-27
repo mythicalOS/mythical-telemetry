@@ -377,3 +377,48 @@ describe("a removed endpoint does not escape the purge fences", () => {
     expect(check.emitter.status("2026-07-26")!.central.attempts).toBe(0);
   });
 });
+
+describe("a malformed endpoint is a misconfiguration, not an exception", () => {
+  for (const bad of ["ftp://collector.example.com", "not a url", "https://user:pw@collector.example.com", "https://"]) {
+    test(`emit() with ${JSON.stringify(bad)} returns misconfigured and never throws`, async () => {
+      const { emitter, sent } = makeEmitter({ endpoints: { centralUrl: bad } });
+      const result = await emitter.emit("2026-07-26");
+      expect(result).toMatchObject({ sent: false, reason: "misconfigured" });
+      expect(sent).toHaveLength(0);
+    });
+  }
+
+  test("a malformed endpoint PURGES the previous endpoint's pending payload", async () => {
+    const root = tmpRoot();
+    const failing = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, respond: () => ({ status: 503, ok: false, detail: "down" }) });
+    await failing.emitter.emit("2026-07-26");
+    expect(failing.emitter.status("2026-07-26")!.central.attempts).toBe(1);
+
+    // Presence is not validity: an endpoint edited into something unusable used to sail past the
+    // fence and throw deep inside the transport, leaving the old payload retained.
+    const broken = makeEmitter({ root, endpoints: { centralUrl: "ftp://collector.example.com" } });
+    expect((await broken.emitter.emit("2026-07-26")).sent).toBe(false);
+
+    const check = makeEmitter({ root, endpoints: { centralUrl: CENTRAL } });
+    expect(check.emitter.status("2026-07-26")!.central.attempts).toBe(0);
+  });
+
+  test("a malformed COPY endpoint does not throw either", async () => {
+    const { emitter, sent } = makeEmitter({ endpoints: { centralUrl: CENTRAL, copyUrl: "gopher://ops.example.net" } });
+    const result = await emitter.emit("2026-07-26");
+    expect(result).toMatchObject({ sent: false, reason: "misconfigured" });
+    expect(sent).toHaveLength(0);
+  });
+
+  test("applyConfigChange never throws on a malformed endpoint, and fences", async () => {
+    const root = tmpRoot();
+    const failing = makeEmitter({ root, endpoints: { centralUrl: CENTRAL }, respond: () => ({ status: 503, ok: false, detail: "down" }) });
+    await failing.emitter.emit("2026-07-26");
+
+    const broken = makeEmitter({ root, endpoints: { centralUrl: "://nonsense" } });
+    expect(() => broken.emitter.applyConfigChange()).not.toThrow();
+
+    const check = makeEmitter({ root, endpoints: { centralUrl: CENTRAL } });
+    expect(check.emitter.status("2026-07-26")!.central.attempts).toBe(0);
+  });
+});

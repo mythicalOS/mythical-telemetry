@@ -691,3 +691,75 @@ describe("drain fences for itself — it does not assume a preceding send() did"
     expect(transport.unresolvedDays({ central: { url: CENTRAL_URL }, eligibleOnly: false })).toEqual([DAY]);
   });
 });
+
+describe("the drain cap counts ATTEMPTS, not selections", () => {
+  const CONSENT = userConsent(true, Date.parse("2026-01-01T00:00:00.000Z"));
+
+  test("a breaker that opens mid-loop does not let skipped days eat the cap", async () => {
+    const root = tmpRoot();
+    // Seed four unresolved days, each with a retained payload, none in backoff.
+    const seed = harness(() => FAIL, { stateRoot: root, maxAttempts: 99, breakerThreshold: 99 });
+    const days = ["2026-07-20", "2026-07-21", "2026-07-22", "2026-07-23"];
+    for (const day of days) await seed.transport.send({ ...sendInput(CONSENT), day, copy: undefined });
+    for (const day of days) {
+      const rec = seed.transport.record(day, "central", CENTRAL_URL)!;
+      rec.attempts = 0;
+      rec.next_attempt_at = null;
+    }
+    seed.transport.fenceDestination("central", CENTRAL_URL, seed.transport.record(days[0]!, "central", CENTRAL_URL)!.generation);
+
+    // The FIRST attempt opens a long-cooldown breaker. Every later day in the same loop is
+    // skipped without contacting anything — and must therefore not spend the cap.
+    let calls = 0;
+    const drainer = harness(
+      () => {
+        calls += 1;
+        return FAIL;
+      },
+      { stateRoot: root, maxAttempts: 99, breakerThreshold: 1, breakerCooldownMs: 7 * 24 * 3_600_000, nowMs: undefined },
+    );
+    const reports = await drainer.transport.drain({
+      product: "brokkr",
+      consent: CONSENT,
+      central: { url: CENTRAL_URL, identity: identity("a") },
+      exceptDay: "2026-07-28",
+      maxDays: 3,
+    });
+
+    // Exactly one real attempt happened; the loop stopped instead of burning the cap on days it
+    // could not contact, so nothing newer was skipped over and lost.
+    expect(calls).toBe(1);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]!.day).toBe("2026-07-20");
+  });
+
+  test("the drain terminates and respects the cap when every day is attemptable", async () => {
+    const root = tmpRoot();
+    const seed = harness(() => FAIL, { stateRoot: root, maxAttempts: 99, breakerThreshold: 99 });
+    const days = ["2026-07-20", "2026-07-21", "2026-07-22", "2026-07-23", "2026-07-24"];
+    for (const day of days) await seed.transport.send({ ...sendInput(CONSENT), day, copy: undefined });
+    for (const day of days) {
+      const rec = seed.transport.record(day, "central", CENTRAL_URL)!;
+      rec.next_attempt_at = null;
+    }
+    seed.transport.fenceDestination("central", CENTRAL_URL, seed.transport.record(days[0]!, "central", CENTRAL_URL)!.generation);
+
+    let calls = 0;
+    const drainer = harness(
+      () => {
+        calls += 1;
+        return OK;
+      },
+      { stateRoot: root, maxAttempts: 99, breakerThreshold: 99, nowMs: undefined },
+    );
+    const reports = await drainer.transport.drain({
+      product: "brokkr",
+      consent: CONSENT,
+      central: { url: CENTRAL_URL, identity: identity("a") },
+      exceptDay: "2026-07-28",
+      maxDays: 2,
+    });
+    expect(calls).toBe(2);
+    expect(reports.map((r) => r.day)).toEqual(["2026-07-20", "2026-07-21"]);
+  });
+});
