@@ -100,10 +100,31 @@ export function safeValidate(validator: HeartbeatValidator, raw: unknown): Valid
 
 const CANONICAL_VALIDATOR_MODULE = '@mythicalos/telemetry';
 
+/**
+ * What the client package actually exports: a total function returning
+ * `{ok:true, value}` or `{ok:false, errors: string[]}` — note the PLURAL,
+ * which is why this is an adapter and not a rename.
+ */
 interface ValidatorModuleShape {
-  createHeartbeatValidator?: () => HeartbeatValidator;
-  heartbeatValidator?: HeartbeatValidator;
+  validateHeartbeat?: (raw: unknown) => { ok: true; value: unknown } | { ok: false; errors: string[] };
 }
+
+/**
+ * The package's rejection detail is DISCARDED rather than adapted through.
+ *
+ * Its error strings are of the form `path: expectation`, and a path can embed
+ * an attacker-supplied property name from a rejected document. The collector
+ * only ever uses this string to choose between two counter names — it is never
+ * returned on the wire and never stored — so passing the real text through
+ * would buy nothing and would put attacker-controlled bytes on a code path
+ * that a future change could easily start logging or persisting. The client
+ * package removed an equivalent field for exactly this reason after it was
+ * bypassed four separate ways; re-introducing the class here would undo that.
+ *
+ * `schema_invalid` deliberately does NOT start with `validator_`, so the server
+ * still distinguishes a rejected payload from a faulty validator.
+ */
+const SCHEMA_INVALID = 'schema_invalid';
 
 /**
  * Load the canonical validator from the client package.
@@ -127,12 +148,18 @@ export async function loadCanonicalValidator(): Promise<HeartbeatValidator> {
       }. The collector refuses to start without it — it never validates payloads itself.`,
     );
   }
-  const validator = mod.createHeartbeatValidator?.() ?? mod.heartbeatValidator;
-  if (!validator || typeof validator.validate !== 'function') {
+  const validateHeartbeat = mod.validateHeartbeat;
+  if (typeof validateHeartbeat !== 'function') {
     throw new Error(
       `"${CANONICAL_VALIDATOR_MODULE}" exports no heartbeat validator ` +
-        '(expected `createHeartbeatValidator()` or `heartbeatValidator`).',
+        '(expected a `validateHeartbeat` function).',
     );
   }
-  return validator;
+  return {
+    validate(raw: unknown): ValidationResult {
+      const result = validateHeartbeat(raw);
+      if (result.ok) return { ok: true, value: result.value as Heartbeat };
+      return { ok: false, error: SCHEMA_INVALID };
+    },
+  };
 }

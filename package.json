@@ -1,7 +1,7 @@
 {
   "name": "mythical-telemetry",
   "version": "0.0.0",
-  "description": "mythicalOS product telemetry — the shared heartbeat client (@mythicalos/telemetry) and the collector that ingests it. One repo so the schema, the emitter and the validator cannot drift apart.",
+  "description": "mythicalOS product telemetry \u2014 the shared heartbeat client (@mythicalos/telemetry) and the collector that ingests it. One repo so the schema, the emitter and the validator cannot drift apart.",
   "type": "module",
   "private": true,
   "license": "Apache-2.0",
@@ -16,7 +16,8 @@
     "url": "git+https://github.com/mythicalOS/mythical-telemetry.git"
   },
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "collector"
   ],
   "devDependencies": {
     "bun-types": "^1.3.14",

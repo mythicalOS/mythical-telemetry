@@ -10,6 +10,12 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadCanonicalValidator, safeValidate, type HeartbeatValidator } from '../src/validator';
 import { INSTANCE_A } from './fixtures';
+// Deliberately a relative path, not the package name: these fixtures are
+// excluded from the published tarball (they are test material, not API), and
+// naming the package outside the wiring site would trip the guard above. The
+// coupling is the point — the collector proves itself against payloads built
+// by the package that owns the schema.
+import { allFixtures } from '../../packages/telemetry/src/test-fixtures.ts';
 
 const SRC = join(import.meta.dir, '..', 'src');
 
@@ -38,19 +44,51 @@ describe('there is no second validator in the collector', () => {
     expect(naming.map((f) => f.replace(`${SRC}/`, ''))).toEqual(['validator.ts']);
   });
 
-  test('the collector declares no runtime dependency it does not have', () => {
+  test('the collector declares EXACTLY ONE runtime dependency — the canonical validator', () => {
     const pkg = JSON.parse(readFileSync(join(import.meta.dir, '..', 'package.json'), 'utf8'));
-    // The client package is added here at merge; until then declaring it would
-    // break `bun install` for everyone on this branch.
-    expect(pkg.dependencies ?? {}).toEqual({});
+    // Before the merge this asserted `{}`, because declaring a package that did
+    // not yet exist would have broken `bun install`. The invariant it protects
+    // is unchanged: the collector takes on no runtime dependency other than the
+    // one validator it is not allowed to reimplement.
+    expect(pkg.dependencies ?? {}).toEqual({ '@mythicalos/telemetry': 'workspace:*' });
   });
 });
 
-describe('loadCanonicalValidator', () => {
-  test('refuses to start rather than falling back when the package is absent', async () => {
-    // On this branch the package genuinely does not exist, which is exactly
-    // the condition being asserted: no silent permissive fallback.
-    await expect(loadCanonicalValidator()).rejects.toThrow(/cannot load the canonical heartbeat validator/);
+describe('loadCanonicalValidator — wired to the real thing', () => {
+  test('resolves a validator that ACCEPTS a genuine payload from the client package', async () => {
+    const validator = await loadCanonicalValidator();
+    // Fixtures come from the package that owns the schema, so this fails if the
+    // collector is ever pointed at a stub or a stale copy.
+    for (const fixture of allFixtures()) {
+      const result = validator.validate(fixture);
+      expect(result.ok, `${fixture.product.name} fixture must validate`).toBe(true);
+    }
+  });
+
+  test('REJECTS an invalid payload, and reports it as schema-invalid rather than a validator fault', async () => {
+    const validator = await loadCanonicalValidator();
+    const result = validator.validate({ schema_version: 2, nonsense: true });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error('unreachable');
+    // The server splits its rejection counters on this prefix: `validator_*`
+    // means the validator itself misbehaved, anything else means the payload
+    // was bad. A schema rejection must not be miscounted as an internal fault.
+    expect(result.error.startsWith('validator_')).toBe(false);
+  });
+
+  test('does not carry the validator\'s error text — a rejected document cannot put its own bytes on this path', async () => {
+    const validator = await loadCanonicalValidator();
+    // The package reports failures as `path: expectation`, and a path can embed
+    // an attacker-supplied property name. The collector discards that detail:
+    // it only ever needs to choose a counter, so the text is replaced by a
+    // constant rather than adapted through. The package removed an equivalent
+    // field after it was bypassed four separate ways; this keeps it closed.
+    const marker = 'zzattackerpropzz';
+    const result = validator.validate({ schema_version: 2, [marker]: 1 });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error('unreachable');
+    expect(result.error).not.toContain(marker);
+    expect(result.error).toBe('schema_invalid');
   });
 });
 
