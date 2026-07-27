@@ -158,20 +158,32 @@ function tableExists(db: Database, name: string): boolean {
   return (row?.n ?? 0) > 0;
 }
 
+/**
+ * Column names, ASCII-lowercased.
+ *
+ * SQLite identifiers are case-INSENSITIVE, but `PRAGMA table_info` reports the
+ * casing as declared. Comparing those verbatim means a table declared with
+ * `PRODUCT` reads as having no product column — it would be rebuilt
+ * needlessly, and worse, the rebuild would then treat its real product values
+ * as absent and overwrite every one of them with the legacy default. Folding
+ * case makes the comparison agree with what SQLite itself considers the same
+ * column. The SQL below only ever uses fixed lowercase identifiers, which
+ * SQLite matches whatever the declaration said.
+ */
 function columnNames(db: Database, table: string): string[] {
   // PRAGMA takes no bound parameters; `table` is never user input — it is one
   // of the literals below.
   const rows = db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all();
-  return rows.map((r) => r.name);
+  return rows.map((r) => r.name.toLowerCase());
 }
 
-/** The table's primary-key columns, in key order. Empty when it has none. */
+/** The table's primary-key columns, in key order, lowercased. Empty when it has none. */
 function primaryKeyColumns(db: Database, table: string): string[] {
   const rows = db.query<{ name: string; pk: number }, []>(`PRAGMA table_info(${table})`).all();
   return rows
     .filter((r) => r.pk > 0)
     .sort((a, b) => a.pk - b.pk)
-    .map((r) => r.name);
+    .map((r) => r.name.toLowerCase());
 }
 
 function sameColumns(actual: readonly string[], expected: readonly string[]): boolean {
@@ -399,20 +411,38 @@ function rebuildInstances(db: Database): number {
  * as it is. This pass never deletes.
  */
 function normalizeStoredV1Payloads(db: Database): { normalized: number; unparseable: number } {
-  const select = db.query<{ rowid: number; payload: string }, [number, number]>(
-    'SELECT rowid AS rowid, payload FROM heartbeats WHERE rowid > ?1 ORDER BY rowid LIMIT ?2',
+  // Paged on the PRIMARY KEY, not on `rowid`. A `WITHOUT ROWID` heartbeats
+  // table passes every shape check above and is not rebuilt — and would then
+  // make this pass fail on `rowid`, rolling the whole migration back and
+  // leaving the service unable to start. The composite key exists by
+  // definition and is stable while only `payload` is rewritten.
+  interface Row {
+    instance_id: string;
+    product: string;
+    day: string;
+    payload: string;
+  }
+  const COLS = 'instance_id, product, day, payload';
+  const ORDER = 'ORDER BY instance_id, product, day LIMIT ';
+  const selectFirst = db.query<Row, [number]>(`SELECT ${COLS} FROM heartbeats ${ORDER}?1`);
+  const selectNext = db.query<Row, [string, string, string, number]>(
+    `SELECT ${COLS} FROM heartbeats WHERE (instance_id, product, day) > (?1, ?2, ?3) ${ORDER}?4`,
   );
-  const update = db.query('UPDATE heartbeats SET payload = ?2 WHERE rowid = ?1');
+  const update = db.query(
+    'UPDATE heartbeats SET payload = ?4 WHERE instance_id = ?1 AND product = ?2 AND day = ?3',
+  );
 
-  let cursor = 0;
+  let cursor: { instance_id: string; product: string; day: string } | null = null;
   let normalized = 0;
   let unparseable = 0;
 
   for (;;) {
-    const rows = select.all(cursor, PAYLOAD_BATCH);
+    const rows: Row[] = cursor === null
+      ? selectFirst.all(PAYLOAD_BATCH)
+      : selectNext.all(cursor.instance_id, cursor.product, cursor.day, PAYLOAD_BATCH);
     if (rows.length === 0) break;
     for (const row of rows) {
-      cursor = row.rowid;
+      cursor = { instance_id: row.instance_id, product: row.product, day: row.day };
       let parsed: unknown;
       try {
         parsed = JSON.parse(row.payload);
@@ -426,7 +456,7 @@ function normalizeStoredV1Payloads(db: Database): { normalized: number; unparsea
       }
       const doc = parsed as Record<string, unknown>;
       if (doc['schema_version'] !== 1) continue; // already v2 (or unknown) — leave it alone
-      update.run(row.rowid, JSON.stringify(v1ToV2(doc)));
+      update.run(row.instance_id, row.product, row.day, JSON.stringify(v1ToV2(doc)));
       normalized += 1;
     }
     if (rows.length < PAYLOAD_BATCH) break;

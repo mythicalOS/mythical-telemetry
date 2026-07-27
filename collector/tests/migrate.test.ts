@@ -475,6 +475,105 @@ describe('migration against a REAL old-schema database', () => {
     }
   });
 
+  test('a table declared with different column CASING is recognised, not rebuilt and overwritten', () => {
+    // SQLite identifiers are case-insensitive but PRAGMA table_info reports
+    // the casing as declared. Comparing verbatim would call this table
+    // unconverted, rebuild it, and — because its product column would also
+    // read as absent — overwrite every real product value with the default.
+    const path = tempDbPath();
+    const raw = new Database(path, { create: true });
+    raw.exec(`
+      CREATE TABLE Heartbeats (
+        Instance_ID TEXT NOT NULL, PRODUCT TEXT NOT NULL, Day TEXT NOT NULL,
+        Schema_Version INTEGER NOT NULL, Payload TEXT NOT NULL, Received_Day TEXT NOT NULL,
+        PRIMARY KEY (Instance_ID, PRODUCT, Day)
+      );
+      CREATE TABLE Instances (
+        Instance_ID TEXT NOT NULL, PRODUCT TEXT NOT NULL,
+        First_Seen_Day TEXT NOT NULL, Last_Seen_Day TEXT NOT NULL,
+        PRIMARY KEY (Instance_ID, PRODUCT)
+      );
+    `);
+    raw.query('INSERT INTO Instances VALUES (?1, ?2, ?3, ?3)').run(INSTANCE_A, 'saga', '2026-07-07');
+    raw
+      .query('INSERT INTO Heartbeats VALUES (?1, ?2, ?3, ?4, ?5, ?3)')
+      .run(INSTANCE_A, 'saga', '2026-07-07', 2, JSON.stringify({ schema_version: 2, metrics: {} }));
+    raw.close();
+
+    const db = new TelemetryDb({ path });
+    try {
+      expect(db.migration.rebuiltHeartbeats).toBe(false);
+      expect(db.migration.rebuiltInstances).toBe(false);
+      // The product value survived, rather than being replaced by the default.
+      expect(db.countHeartbeats(INSTANCE_A, 'saga')).toBe(1);
+      expect(db.countHeartbeats(INSTANCE_A, LEGACY_PRODUCT)).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  test('a WITHOUT ROWID heartbeats table does not break the payload pass', () => {
+    // It passes every shape check and so is not rebuilt — a pass that paged on
+    // `rowid` would then fail, roll the migration back, and leave the service
+    // unable to start.
+    const path = tempDbPath();
+    const raw = new Database(path, { create: true });
+    raw.exec(`
+      CREATE TABLE heartbeats (
+        instance_id TEXT NOT NULL, product TEXT NOT NULL, day TEXT NOT NULL,
+        schema_version INTEGER NOT NULL, payload TEXT NOT NULL, received_day TEXT NOT NULL,
+        PRIMARY KEY (instance_id, product, day)
+      ) WITHOUT ROWID;
+      CREATE TABLE instances (
+        instance_id TEXT NOT NULL, product TEXT NOT NULL,
+        first_seen_day TEXT NOT NULL, last_seen_day TEXT NOT NULL,
+        PRIMARY KEY (instance_id, product)
+      ) WITHOUT ROWID;
+    `);
+    const insert = raw.query('INSERT INTO heartbeats VALUES (?1, ?2, ?3, ?4, ?5, ?3)');
+    for (const day of ['2026-07-07', '2026-07-08']) {
+      insert.run(INSTANCE_A, 'brokkr', day, 1, JSON.stringify(makeV1(INSTANCE_A, day)));
+    }
+    raw.query('INSERT INTO instances VALUES (?1, ?2, ?3, ?3)').run(INSTANCE_A, 'brokkr', '2026-07-07');
+    raw.close();
+
+    const db = new TelemetryDb({ path });
+    try {
+      expect(db.migration.rebuiltHeartbeats).toBe(false);
+      expect(db.migration.normalizationPassRan).toBe(true);
+      expect(db.migration.payloadsNormalized).toBe(2);
+      const rows = db.getHeartbeats(INSTANCE_A, LEGACY_PRODUCT);
+      expect(rows.map((r) => r.day)).toEqual(['2026-07-07', '2026-07-08']);
+      expect(JSON.parse(rows[0]!.payload).metrics.sessions.count).toBe(12);
+    } finally {
+      db.close();
+    }
+  });
+
+  test('the payload pass pages correctly across more rows than one batch', () => {
+    // Keyset pagination on the composite key: every row must be visited
+    // exactly once, with none skipped at a batch boundary.
+    const path = tempDbPath();
+    const rows: SeedRow[] = [];
+    for (let i = 0; i < 1200; i++) {
+      const day = new Date(Date.UTC(2026, 0, 1) + i * 86_400_000).toISOString().slice(0, 10);
+      rows.push({ instanceId: INSTANCE_A, day, payload: JSON.stringify(makeV1(INSTANCE_A, day)) });
+    }
+    seedOldDatabase(path, rows);
+
+    const db = new TelemetryDb({ path });
+    try {
+      expect(db.migration.heartbeatRowsCarried).toBe(1200);
+      expect(db.migration.payloadsNormalized).toBe(1200);
+      expect(db.countHeartbeats(INSTANCE_A, LEGACY_PRODUCT)).toBe(1200);
+      for (const row of db.getHeartbeats(INSTANCE_A, LEGACY_PRODUCT)) {
+        expect(JSON.parse(row.payload).schema_version).toBe(2);
+      }
+    } finally {
+      db.close();
+    }
+  });
+
   test('a fresh database is created, not migrated', () => {
     const path = tempDbPath();
     const db = new TelemetryDb({ path });
