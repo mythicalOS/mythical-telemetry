@@ -1,0 +1,120 @@
+name: Release
+
+# Publishes @mythicalos/telemetry to npm WITH provenance attestation, via OIDC
+# Trusted Publishing — no stored NPM_TOKEN. Configure the trusted publisher on
+# npmjs.com (Settings -> package -> Trusted Publisher):
+#   repository = mythicalOS/mythical-telemetry, workflow = release.yml
+#
+# NOTE: the FIRST publish of a brand-new package name cannot use trusted
+# publishing — npm has no package to attach a publisher to yet. That first
+# release is a deliberate human step; every subsequent one runs from here.
+#
+# Why npm and not `bun publish`: provenance is an npm feature; bun cannot emit it.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write            # required for OIDC trusted publishing + provenance
+
+env:
+  BUN_VERSION: "1.3.14"
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history + refs: the tag gate below tests reachability from main.
+          fetch-depth: 0
+
+      # A tag push is the ONLY publish trigger and an npm publish is IRREVERSIBLE,
+      # so the tag is validated before anything can reach the registry:
+      #   1. plain `vX.Y.Z` only — an RC, a build suffix or a typo must never ship
+      #      the stable version sitting in the manifest;
+      #   2. the tag must EQUAL "v" + the package version — this repo publishes
+      #      exactly one package, so that identity is meaningful here (unlike a
+      #      multi-package repo, where the tag is only a repo counter);
+      #   3. reachable from origin/main — a tag pushed on a side branch must not
+      #      publish.
+      - name: Validate the release tag
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::refusing to publish from tag '${tag}' — expected a plain vX.Y.Z release tag (no pre-release or build suffix)."
+            exit 1
+          fi
+          version=$(node -p "require('./packages/telemetry/package.json').version")
+          if [ "${tag}" != "v${version}" ]; then
+            echo "::error::tag '${tag}' does not match the package version '${version}' — expected 'v${version}'. Refusing to publish."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::tag '${tag}' (${GITHUB_SHA}) is not reachable from origin/main — refusing to publish from a side branch."
+            exit 1
+          fi
+          echo "release tag ${tag} validated: plain semver, matches package version, reachable from main."
+
+      - name: Set up bun (install, build, test)
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Set up Node + npm (publish)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing / provenance needs npm >= 11.5.1; ubuntu-latest ships 10.x.
+      - name: Upgrade npm to a trusted-publishing-capable version
+        run: npm install -g npm@latest && npm --version
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build
+        run: bun run build
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Unit tests
+        run: bun test
+
+      - name: Validate the field-class manifest against the schema
+        run: bun run check:manifest
+
+      # Last chance to see what this tag actually ships, in the log, BEFORE the
+      # irreversible step.
+      - name: Pre-flight — what this tag will publish
+        run: |
+          set -euo pipefail
+          name=$(node -p "require('./packages/telemetry/package.json').name")
+          version=$(node -p "require('./packages/telemetry/package.json').version")
+          if npm view "${name}@${version}" version > /dev/null 2>&1; then
+            echo "  SKIP     ${name}@${version}  (already on the registry)"
+          else
+            echo "  PUBLISH  ${name}@${version}"
+          fi
+
+      # Idempotent: a re-tag or re-run of an already-published version is a no-op
+      # rather than a hard failure.
+      - name: Publish with provenance
+        run: |
+          set -euo pipefail
+          name=$(node -p "require('./packages/telemetry/package.json').name")
+          version=$(node -p "require('./packages/telemetry/package.json').version")
+          if npm view "${name}@${version}" version >/dev/null 2>&1; then
+            echo "already published: ${name}@${version} — skipping"
+            exit 0
+          fi
+          echo "publishing ${name}@${version} (with provenance)"
+          cd packages/telemetry && npm publish --provenance --access public

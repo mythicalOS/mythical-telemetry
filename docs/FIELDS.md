@@ -109,13 +109,36 @@ that buys little. If it is wanted later it needs its own review and a new schema
 | `runs.succeeded` | `count` | delta | `runs_succeeded` | existing |
 | `runs.failed` | `count` | delta | `runs_failed` | existing |
 | `runs.chain_rejections` | `count` | delta | `chain_rejections` | existing |
-| `events.deferrals` | `count` | delta | `event_deferrals` | existing |
-| `gate.rejections` | `count` | delta | `gate_rejections` (SD11) | existing |
-| `gate.approvals` | `count` | delta | **new** bump at the SD11 approve path | NEW |
+| `gate.rejections` | `count` | delta | `gate_rejections`, gate refuse path | existing |
+| `gate.approvals` | `count` | delta | `gate_approvals`, gate **admit** path | NEW |
 | `sandbox.pool_exhausted` | `count` | delta | `sandbox_pool_exhausted` | existing |
-| `sandbox.uid_vends` | `count` | delta | **new** bump at the uid-vend site | NEW |
-| `detection_state` | `enum` | gauge | `detection_state` | existing — emit as a closed enum, never a raw integer |
+| `sandbox.uid_vends` | `count` | delta | `sandbox_uid_vends`, at the uid **pool boundary** | NEW |
+| `detection_state` | `enum` | gauge | `detection_state` gauge | existing — closed enum `unknown` \| `not_detected` \| `detected` |
 | `uptime_bucket` | `bucket` | gauge | `uptimeBucket()` | existing |
+
+### Amendments, and what they cost
+
+**`events.deferrals` was DROPPED before freezing (2026-07-27).** It was drafted against
+`event_deferrals`, whose producer is dead: an earlier design change turned the event trigger arm
+from validate-and-**defer** into validate-and-**run**, so the deferral path is unreachable and
+the bump was retired. Rule 4 forbids freezing a leaf with no producer, and repointing it at a
+different counter would silently redefine a frozen field's meaning — which needs the named human
+review this document mandates, not a quiet substitution. If event-deferral telemetry is wanted
+later it becomes a **new leaf in a new schema version**, and that cost is the correct one.
+
+This is what the producer rule is *for*: the field looked real in the plan, in the draft contract
+and in the counter allowlist, and only building it surfaced that nothing had incremented it since
+the design change.
+
+Three further clarifications from implementation, none of which change the wire shape:
+
+- **`gate.approvals` counts gate *admissions*, not approvals granted.** It is the symmetric
+  partner of `gate.rejections`; together they are the gate's throughput. A recurring job that was
+  approved once bumps this on every run.
+- **`sandbox.uid_vends` is counted at the uid pool boundary**, not at a single call site — the
+  pool has more than one consumer, and per-caller counting under-reports.
+- **`detection_state`'s "never probed" state is real and distinct.** The prior flat payload
+  collapsed it into `0`, making "not detected" and "never asked" indistinguishable.
 
 **skuld's `meta.instance_id` is NOT the telemetry identity and must not be touched.** It seeds
 scheduling jitter (`engine/engine.ts`); replacing it silently changes when jobs run. Telemetry
