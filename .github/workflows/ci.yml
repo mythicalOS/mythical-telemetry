@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUN_VERSION: "1.3.14"
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # The collector imports the client package's validator, so the package
+      # must be built before the collector typechecks against it. There is
+      # exactly ONE validator in this repo by design — a second copy is the
+      # drift hazard the repo exists to remove.
+      - name: Build
+        run: bun run build
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      # Includes the lockstep spec: JSON Schema <-> runtime validator <-> real
+      # emitter output <-> collector ingest. A rename that lands in two of the
+      # three and not the third is exactly the defect class this catches.
+      - name: Unit tests
+        run: bun test
+
+  manifest:
+    name: field-class manifest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Enforces SHAPE, not privacy: every leaf declares a value class and a
+      # temporal class, no leaf is classed `cumulative` (normalisation happens
+      # at the emitter), no unconstrained strings, no open-ended key maps.
+      # It CANNOT tell a privacy-safe count from a privacy-hostile one — new or
+      # reclassified leaves still need a named human privacy review in the PR.
+      - name: Validate the field-class manifest against the schema
+        run: bun run check:manifest
