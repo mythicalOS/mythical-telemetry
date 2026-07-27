@@ -1,0 +1,95 @@
+{
+  "$comment": "The machine-readable field-class manifest for heartbeat.v2.json. EVERY leaf in the schema appears exactly once, here or in `reserved`; scripts/check-field-classes.ts fails the build on any drift in either direction. Value classes: count | ratio | bucket | enum | bool | version | duration. Temporal classes: delta | gauge — and NOTHING else. `cumulative` is deliberately NOT a legal value: normalisation happens at the emitter (gate G2), so no lifetime counter ever reaches the wire. There is deliberately NO `opaque-id` class (gate G1b chose three documented per-product identities over a shared install_group field); adding one re-opens that gate. Envelope descriptors carry temporal `gauge` because they are per-document snapshots that are never summed — docs/FIELDS.md writes their temporal as '—', which this vocabulary cannot express. THIS MANIFEST AND ITS CHECK ENFORCE SHAPE, NOT PRIVACY: see `limits` below.",
+  "schema": "heartbeat.v2.json",
+  "schema_version": 2,
+  "limits": "A mechanical check cannot tell a privacy-safe count from a privacy-hostile one. `metrics.database_oid: integer` classed `count`+`delta` passes every rule in this file. Any NEW or RECLASSIFIED leaf therefore requires a named human privacy review recorded in the pull request. Do not describe this manifest, or its CI check, as enforcing privacy.",
+  "reserved": {
+    "instance_id": {
+      "reason": "Identity, not a metric. It has no value class by design — the class vocabulary has no identifier member, and adding one re-opens gate G1b. Fenced instead by an exact grammar: the UUIDv4 pattern pinned in the schema, which no name, label or encoded hostname satisfies.",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "day": {
+      "reason": "The document's aggregation key, not a metric. Fenced by an exact calendar-day grammar.",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    }
+  },
+  "envelope": {
+    "schema_version": { "class": "version", "temporal": "gauge" },
+    "product.name": { "class": "enum", "temporal": "gauge" },
+    "product.version": { "class": "version", "temporal": "gauge" },
+    "platform.os": { "class": "enum", "temporal": "gauge" },
+    "platform.arch": { "class": "enum", "temporal": "gauge" }
+  },
+  "metrics": {
+    "brokkr": {
+      "config.backend": { "class": "enum", "temporal": "gauge" },
+      "config.harness_type": { "class": "enum", "temporal": "gauge" },
+      "config.wizard_completed": { "class": "bool", "temporal": "gauge" },
+      "config.team_size": { "class": "count", "temporal": "gauge" },
+      "config.playbooks_active": { "class": "count", "temporal": "gauge" },
+      "config.review_mode": { "class": "enum", "temporal": "gauge" },
+      "features.terminal": { "class": "bool", "temporal": "gauge" },
+      "features.edges": { "class": "bool", "temporal": "gauge" },
+      "sessions.count": { "class": "count", "temporal": "delta" },
+      "sessions.minutes": { "class": "count", "temporal": "delta" },
+      "sessions.failed": { "class": "count", "temporal": "delta" },
+      "context_fill.peak_histogram[]": { "class": "bucket", "temporal": "delta" },
+      "context_fill.avg_mean": { "class": "ratio", "temporal": "delta", "nullable": true },
+      "mode_split.normal": { "class": "count", "temporal": "delta" },
+      "mode_split.spine": { "class": "count", "temporal": "delta" },
+      "spine.joints": { "class": "count", "temporal": "delta" },
+      "spine.tokens_before": { "class": "count", "temporal": "delta" },
+      "spine.tokens_after": { "class": "count", "temporal": "delta" },
+      "spine.estimated": { "class": "bool", "temporal": "gauge" },
+      "models[].name": { "class": "enum", "temporal": "delta" },
+      "models[].sessions": { "class": "count", "temporal": "delta" },
+      "tokens.input": { "class": "count", "temporal": "delta" },
+      "tokens.cache_read": { "class": "count", "temporal": "delta" },
+      "tokens.cache_creation": { "class": "count", "temporal": "delta" },
+      "tokens.output": { "class": "count", "temporal": "delta" },
+      "review.runs": { "class": "count", "temporal": "delta" },
+      "errors.classes.session_failed": { "class": "count", "temporal": "delta" }
+    },
+    "saga": {
+      "collect.runs": { "class": "count", "temporal": "delta" },
+      "collect.errors": { "class": "count", "temporal": "delta" },
+      "refusals": { "class": "count", "temporal": "delta" },
+      "mcp.tool_calls": { "class": "count", "temporal": "delta" },
+      "mcp.refusals": { "class": "count", "temporal": "delta" },
+      "advisories.fired": { "class": "count", "temporal": "delta" },
+      "advisories.by_severity.info": { "class": "count", "temporal": "delta" },
+      "advisories.by_severity.warn": { "class": "count", "temporal": "delta" },
+      "connections.by_engine.postgres": { "class": "count", "temporal": "gauge" },
+      "connections.by_engine.mysql": { "class": "count", "temporal": "gauge" },
+      "connections.by_engine.sqlite": { "class": "count", "temporal": "gauge" },
+      "connections.total": { "class": "count", "temporal": "gauge" },
+      "probe.outcomes.ok": { "class": "count", "temporal": "delta" },
+      "probe.outcomes.auth_failed": { "class": "count", "temporal": "delta" },
+      "probe.outcomes.unreachable": { "class": "count", "temporal": "delta" },
+      "probe.outcomes.timeout": { "class": "count", "temporal": "delta" },
+      "probe.outcomes.other": { "class": "count", "temporal": "delta" },
+      "uptime_bucket": { "class": "bucket", "temporal": "gauge" }
+    },
+    "skuld": {
+      "jobs.created_by_type.script": { "class": "count", "temporal": "delta" },
+      "jobs.created_by_type.ai": { "class": "count", "temporal": "delta" },
+      "jobs.created_by_type.report": { "class": "count", "temporal": "delta" },
+      "jobs.created_by_type.agent_send": { "class": "count", "temporal": "delta" },
+      "jobs.created_by_type.distill": { "class": "count", "temporal": "delta" },
+      "runs.total": { "class": "count", "temporal": "delta" },
+      "runs.succeeded": { "class": "count", "temporal": "delta" },
+      "runs.failed": { "class": "count", "temporal": "delta" },
+      "runs.chain_rejections": { "class": "count", "temporal": "delta" },
+      "events.runs_enqueued": { "class": "count", "temporal": "delta" },
+      "events.asks_delivered": { "class": "count", "temporal": "delta" },
+      "events.rate_limit_deferred": { "class": "count", "temporal": "delta" },
+      "events.route_errors": { "class": "count", "temporal": "delta" },
+      "gate.rejections": { "class": "count", "temporal": "delta" },
+      "gate.approvals": { "class": "count", "temporal": "delta" },
+      "sandbox.pool_exhausted": { "class": "count", "temporal": "delta" },
+      "sandbox.uid_vends": { "class": "count", "temporal": "delta" },
+      "detection_state": { "class": "enum", "temporal": "gauge" },
+      "uptime_bucket": { "class": "bucket", "temporal": "gauge" }
+    }
+  }
+}

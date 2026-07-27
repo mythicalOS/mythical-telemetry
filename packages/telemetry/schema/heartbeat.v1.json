@@ -1,0 +1,181 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "mythical-telemetry/schema/heartbeat.v1.json",
+  "title": "mythical heartbeat v1",
+  "description": "Anonymous daily product heartbeat (M14 WS8 design, section 2). Strictness IS the drop-rule: additionalProperties:false at every level plus value discipline on every leaf, so a payload carrying prompts, transcripts, code, file paths, keys, repo/org names, hostnames, usernames, IPs, or emails is structurally rejected. Counts/booleans/model-IDs/percent-buckets only. The payload carries NO auth material: write auth rides the X-Mythical-Write-Key transport header, never the schema. Cross-field invariants that JSON Schema cannot express are noted in description fields below and enforced by the runtime zod validator (src/schema.ts, kept in lockstep by test). schema_version is the discriminator; v2 would be a new file, never a silent widening of v1. ONE deliberate exception has been taken to that rule: product.name's const changed from \"mythical\" to \"brokkr\" with the product rename, in place, without a v2. That is normally a breaking change to a frozen schema — it was judged safe here ONLY because v1 has never had a consumer: telemetry is opt-in, the client ships no default ingest endpoint, and no ingest service was ever deployed against v1, so there is no receiver anywhere that could reject the new value. If an ingest is ever deployed, this exception closes and any further change to a v1 leaf must go to v2.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "instance_id", "day", "product", "platform", "config", "features", "sessions", "context_fill", "mode_split", "spine", "models", "tokens", "review", "errors"],
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "description": "Version discriminator. v1 is strict; future versions are new schema files."
+    },
+    "instance_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "The ONLY identity: lowercase UUIDv4-shaped, derived as the first 16 bytes of sha256(instance_secret) with v4 version/variant bits. Uniformly random to any observer; only the secret-holder can authenticate as it (write auth = X-Mythical-Write-Key header, verified statelessly)."
+    },
+    "day": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "description": "The completed UTC day this document aggregates. Cross-field (ingest-enforced): must be a real calendar day, <= today UTC and >= today-30."
+    },
+    "product": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "daemon_version"],
+      "properties": {
+        "name": { "const": "brokkr", "description": "Fixed product name — the bare family product key, matching /detect and the sibling products (saga, skuld)." },
+        "daemon_version": {
+          "type": "string",
+          "pattern": "^(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}|other)$",
+          "description": "Strict semver-core OR the literal \"other\" (the daemon buckets anything non-semver). No org-nameable space."
+        }
+      }
+    },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "arch"],
+      "properties": {
+        "os": { "type": "string", "enum": ["darwin", "linux", "win32", "other"] },
+        "arch": { "type": "string", "enum": ["arm64", "x64", "other"] }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backend", "harness_type", "wizard_completed", "team_size", "playbooks_active", "review_mode"],
+      "properties": {
+        "backend": { "type": "string", "enum": ["local", "server"] },
+        "harness_type": { "type": "string", "enum": ["claude", "codex", "other"] },
+        "wizard_completed": { "type": "boolean" },
+        "team_size": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "playbooks_active": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "review_mode": { "type": "string", "enum": ["cross-model", "ephemeral"] }
+      }
+    },
+    "features": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["terminal", "edges"],
+      "properties": {
+        "terminal": { "type": "boolean" },
+        "edges": { "type": "boolean" }
+      }
+    },
+    "sessions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "minutes", "failed"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "minutes": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "failed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100000,
+          "description": "Cross-field (zod-enforced): sessions.failed <= sessions.count."
+        }
+      }
+    },
+    "context_fill": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["peak_histogram", "avg_mean"],
+      "properties": {
+        "peak_histogram": {
+          "type": "array",
+          "minItems": 10,
+          "maxItems": 10,
+          "items": { "type": "integer", "minimum": 0, "maximum": 100000 },
+          "description": "Per-session peak fill %, bucketed into EXACTLY 10 deciles: [0-10) ... [90-100]. Cross-field (zod-enforced): sum(peak_histogram) <= sessions.count (spawn failures carry no fill)."
+        },
+        "avg_mean": {
+          "anyOf": [
+            { "type": "number", "minimum": 0, "maximum": 100 },
+            { "type": "null" }
+          ],
+          "description": "Mean over FILL-BEARING sessions of per-session average fill PERCENT, in [0,100]; null iff zero fill-bearing sessions that day."
+        }
+      }
+    },
+    "mode_split": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["normal", "spine"],
+      "description": "Cross-field (zod-enforced): mode_split.normal + mode_split.spine === sessions.count.",
+      "properties": {
+        "normal": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "spine": { "type": "integer", "minimum": 0, "maximum": 100000 }
+      }
+    },
+    "spine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["joints", "tokens_before", "tokens_after", "estimated"],
+      "properties": {
+        "joints": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "tokens_before": { "type": "integer", "minimum": 0, "maximum": 1000000000000 },
+        "tokens_after": { "type": "integer", "minimum": 0, "maximum": 1000000000000 },
+        "estimated": {
+          "type": "boolean",
+          "description": "true iff ANY joint that day used the daemon's length/4 fallback for after-tokens — an estimate must never masquerade as a hard count."
+        }
+      }
+    },
+    "models": {
+      "type": "array",
+      "maxItems": 16,
+      "description": "Normalized model IDs only — a CLOSED allowlist of publicly-published IDs plus \"other\" (identity leak capacity zero; the allowlist ships as src/model-id-allowlist.ts and is kept equal to this enum by test). Cross-field (zod-enforced): sum(models[].sessions) <= sessions.count.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "sessions"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": ["claude-fable-5", "claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5-20251001", "claude-opus-4-1", "claude-sonnet-4-20250514", "claude-3-5-haiku-20241022", "gpt-5", "gpt-4.1", "o3", "codex-mini-latest", "gemini-2.5-pro", "gemini-2.5-flash", "other"]
+          },
+          "sessions": { "type": "integer", "minimum": 0, "maximum": 100000 }
+        }
+      }
+    },
+    "tokens": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input", "cache_read", "cache_creation", "output"],
+      "description": "Whole-session raw SDK usage sums (all-assistant scope, including subagent/sidechain usage).",
+      "properties": {
+        "input": { "type": "integer", "minimum": 0, "maximum": 1000000000000 },
+        "cache_read": { "type": "integer", "minimum": 0, "maximum": 1000000000000 },
+        "cache_creation": { "type": "integer", "minimum": 0, "maximum": 1000000000000 },
+        "output": { "type": "integer", "minimum": 0, "maximum": 1000000000000 }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runs"],
+      "properties": {
+        "runs": { "type": "integer", "minimum": 0, "maximum": 100000 }
+      }
+    },
+    "errors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["classes"],
+      "properties": {
+        "classes": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "CLOSED key taxonomy (v1: session_failed only); grows ONLY by schema-version bump — never free keys. Cross-field (zod-enforced): sum of class counts <= sessions.count.",
+          "properties": {
+            "session_failed": { "type": "integer", "minimum": 0, "maximum": 100000 }
+          }
+        }
+      }
+    }
+  }
+}
