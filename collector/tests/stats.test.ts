@@ -128,7 +128,7 @@ describe('stats: totals per product — and NO 500 when a section is absent', ()
   test('a stored payload with none of the product’s sections yields zeros, and still serves its days', async () => {
     const h = makeHarness();
     await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A));
-    h.db.upsertHeartbeat(INSTANCE_A, 'saga', '2026-07-09', 2, JSON.stringify({ weird: true }), '2026-07-09');
+    h.db.recordHeartbeat(INSTANCE_A, 'saga', '2026-07-09', 2, JSON.stringify({ weird: true }), '2026-07-09');
     const r = await h.handler(statsReq(INSTANCE_A, 'saga', { secret: SECRET_A }));
     expect(r.status).toBe(200);
     const body = await r.json() as any;
@@ -140,7 +140,7 @@ describe('stats: totals per product — and NO 500 when a section is absent', ()
   test('a corrupt stored row degrades to a placeholder rather than denying the whole history', async () => {
     const h = makeHarness();
     await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-08'), SECRET_A));
-    h.db.upsertHeartbeat(INSTANCE_A, 'brokkr', '2026-07-09', 2, 'not json', '2026-07-09');
+    h.db.recordHeartbeat(INSTANCE_A, 'brokkr', '2026-07-09', 2, 'not json', '2026-07-09');
     const body = await statsFor(h, 'brokkr');
     expect(body.days.length).toBe(2);
     expect(body.days[1]).toEqual({ day: '2026-07-09', unreadable: true });

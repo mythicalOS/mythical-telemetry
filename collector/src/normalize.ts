@@ -35,6 +35,31 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Write an OWN property, whatever the key is.
+ *
+ * `target[key] = value` is not safe for a key that arrives in a payload.
+ * `JSON.parse` creates a genuine own `__proto__` property, so it survives into
+ * `Object.entries`, but assigning it back with `[]=` invokes the inherited
+ * `__proto__` SETTER instead of creating a property — the field silently
+ * disappears from the normalized document. That is exactly the laundering this
+ * file exists to prevent: an undeclared `__proto__` section in a v1 payload
+ * would vanish during the move and leave a document the validator accepts.
+ *
+ * `defineProperty` creates a real own data property in every case, so the
+ * field survives and stays rejectable.
+ */
+function setOwn(target: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(target, key, { value, writable: true, enumerable: true, configurable: true });
+}
+
+/** Copy every own enumerable key of `source` into a fresh object, safely. */
+function cloneOwn(source: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source)) setOwn(out, key, value);
+  return out;
+}
+
+/**
  * Read the wire version discriminator without trusting anything else about the
  * document. Anything that is not the literal 1 or 2 is unsupported.
  */
@@ -75,25 +100,25 @@ export function v1ToV2(raw: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
 
   for (const [key, value] of Object.entries(raw)) {
-    if (V2_ENVELOPE_KEYS.has(key)) out[key] = value;
-    else metrics[key] = value;
+    if (V2_ENVELOPE_KEYS.has(key)) setOwn(out, key, value);
+    else setOwn(metrics, key, value);
   }
 
-  out['schema_version'] = 2;
+  setOwn(out, 'schema_version', 2);
 
   // `product` is rebuilt only when it is an object we can rebuild. Anything
   // else is passed through unchanged so the validator sees — and rejects —
   // exactly what arrived.
   const product = raw['product'];
   if (isPlainObject(product)) {
-    out['product'] = renameDaemonVersion(product);
+    setOwn(out, 'product', renameDaemonVersion(product));
   }
 
   // A v1 document that already carried a `metrics` key had it moved into
   // `metrics.metrics` by the loop above (it is not an envelope key), which the
   // validator rejects as an undeclared section. That is the intended outcome:
   // v1 has no `metrics`, so its presence is an undeclared field, not a hint.
-  out['metrics'] = metrics;
+  setOwn(out, 'metrics', metrics);
 
   return out;
 }
@@ -110,12 +135,11 @@ export function v1ToV2(raw: Record<string, unknown>): Record<string, unknown> {
 function renameDaemonVersion(product: Record<string, unknown>): Record<string, unknown> {
   const hasLegacy = Object.hasOwn(product, 'daemon_version');
   const hasCurrent = Object.hasOwn(product, 'version');
-  if (!hasLegacy || hasCurrent) return { ...product };
+  if (!hasLegacy || hasCurrent) return cloneOwn(product);
 
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(product)) {
-    if (key === 'daemon_version') out['version'] = value;
-    else out[key] = value;
+    setOwn(out, key === 'daemon_version' ? 'version' : key, value);
   }
   return out;
 }

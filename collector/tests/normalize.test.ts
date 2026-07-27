@@ -117,3 +117,46 @@ describe('v1 → v2 fidelity', () => {
     expect(v1ToV2({ schema_version: 1 })).toEqual({ schema_version: 2, metrics: {} });
   });
 });
+
+describe('`__proto__` cannot be used to launder a field past the move', () => {
+  // `JSON.parse` creates a genuine OWN `__proto__` property, but assigning it
+  // back with `target[key] = value` invokes the inherited setter instead — the
+  // field would vanish from the normalized document and leave something the
+  // validator accepts. These payloads are built with JSON.parse precisely
+  // because an object literal would NOT reproduce the hazard.
+
+  test('a top-level `__proto__` section survives the move as an own property', () => {
+    const v1 = JSON.parse('{"schema_version":1,"__proto__":{"polluted":true}}');
+    const out = v1ToV2(v1);
+    const metrics = out['metrics'] as Record<string, unknown>;
+    expect(Object.hasOwn(metrics, '__proto__')).toBe(true);
+    expect(Object.keys(metrics)).toContain('__proto__');
+    // ...and it round-trips through JSON, which is how it reaches the validator.
+    expect(JSON.parse(JSON.stringify(out)).metrics.__proto__).toEqual({ polluted: true });
+  });
+
+  test('nothing is polluted along the way', () => {
+    const v1 = JSON.parse('{"schema_version":1,"__proto__":{"polluted":true}}');
+    const out = v1ToV2(v1);
+    expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+    expect(Object.getPrototypeOf(out['metrics'] as object)).toBe(Object.prototype);
+    expect(({} as Record<string, unknown>)['polluted']).toBeUndefined();
+  });
+
+  test('a `__proto__` inside product survives both the rename path and the pass-through path', () => {
+    const renamed = v1ToV2(
+      JSON.parse('{"schema_version":1,"product":{"name":"brokkr","daemon_version":"1.0.0","__proto__":{"x":1}}}'),
+    );
+    expect(Object.keys(renamed['product'] as object).sort()).toEqual(['__proto__', 'name', 'version']);
+
+    const passedThrough = v1ToV2(
+      JSON.parse('{"schema_version":1,"product":{"name":"brokkr","version":"1.0.0","__proto__":{"x":1}}}'),
+    );
+    expect(Object.keys(passedThrough['product'] as object).sort()).toEqual(['__proto__', 'name', 'version']);
+  });
+
+  test('a `constructor` key is likewise carried, not swallowed', () => {
+    const out = v1ToV2(JSON.parse('{"schema_version":1,"constructor":{"nope":1}}'));
+    expect((out['metrics'] as Record<string, unknown>)['constructor']).toEqual({ nope: 1 });
+  });
+});

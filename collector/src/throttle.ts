@@ -14,16 +14,25 @@
 //     from the balancer. The limiter then throttles the entire population as
 //     one source — a self-inflicted outage the first time traffic is normal.
 //
-// So the operator states the number of proxies they run. With N trusted hops
-// the rightmost N entries of the chain were appended by infrastructure the
-// operator controls, and the client address is the (N)th from the right end of
-// the list. Anything an attacker prepends sits to the LEFT of that position and
-// is ignored.
+// So the operator states TWO things, and both are required together:
+//
+//   1. WHICH PEERS are their proxies (`trustedProxies`, addresses or CIDRs).
+//      A hop count alone is not enough: it would honour the header from
+//      whoever connected, so anyone with a direct route to the listener —
+//      a sibling container, a misconfigured security group, a leaked internal
+//      port — could hand themselves any bucket they liked. The header is read
+//      only when the PEER is on this list.
+//   2. HOW MANY of those proxies are in the chain (`trustedProxyHops`). The
+//      rightmost N entries were appended by that infrastructure, so the client
+//      address sits N from the right end. Anything an attacker prepends is to
+//      the LEFT of that position and is ignored.
 //
 // Every failure mode falls back to the peer address, never to a header value:
-// a chain shorter than the declared hop count means the request did not come
-// through the expected path, and an implausible address means the header is
-// not what the operator thinks it is.
+// an untrusted peer, a chain shorter than the declared hop count, or an
+// implausible value all mean the request did not arrive the way the operator
+// described.
+
+import { isTrustedPeer, type CidrPattern } from './ip';
 
 export interface ServerLike {
   requestIP?: (req: Request) => { address: string } | null;
@@ -54,12 +63,21 @@ function isPlausibleAddress(value: string): boolean {
 /**
  * Resolve the throttling key for a request.
  *
- * `trustedProxyHops` is the number of reverse proxies the operator runs in
- * front of the collector. 0 (the default) means "trust nothing in the request".
+ * `trustedProxyHops` is how many of the operator's proxies are in the chain;
+ * `trustedProxies` is which peers those are. Both are required before any
+ * header is read — see the header comment.
  */
-export function resolveSourceKey(req: Request, server: ServerLike | undefined, trustedProxyHops: number): string {
+export function resolveSourceKey(
+  req: Request,
+  server: ServerLike | undefined,
+  trustedProxyHops: number,
+  trustedProxies: readonly CidrPattern[] = [],
+): string {
   const peer = server?.requestIP?.(req)?.address ?? 'unknown';
   if (trustedProxyHops <= 0) return peer;
+  // The peer must be one of the operator's own proxies. A direct connection
+  // never gets to choose its own bucket.
+  if (!isTrustedPeer(peer, trustedProxies)) return peer;
 
   const header = req.headers.get('x-forwarded-for');
   if (!header) return peer;

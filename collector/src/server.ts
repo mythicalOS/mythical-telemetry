@@ -35,6 +35,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import type { TelemetryDb } from './db';
 import { authorizesInstance, UUID_V4_RE } from './identity';
 import { Counters, type CounterName } from './counters';
+import { parseTrustedProxies } from './ip';
 import { normalizeToV2 } from './normalize';
 import { renderAggregatePage, type AggregateProductView, type AggregateView } from './page';
 import { resolveSourceKey, TokenBucketLimiter, type ServerLike } from './throttle';
@@ -91,8 +92,13 @@ export interface TelemetryServerConfig {
   rateLimitPerMin?: number;
   /** Tighter, separate budget for requests that would create a NEW identity. */
   newInstancePerSourcePerHour?: number;
-  /** Reverse proxies in front of this service. 0 = never trust X-Forwarded-For. */
+  /** Reverse proxies in the chain. 0 = never trust X-Forwarded-For. */
   trustedProxyHops?: number;
+  /**
+   * WHICH peers are those proxies (addresses or CIDRs). Required whenever
+   * `trustedProxyHops > 0`; construction throws otherwise.
+   */
+  trustedProxies?: readonly string[];
   /** Gates GET /metrics. Absent/empty ⇒ the route does not exist. */
   opsKey?: string | null;
   /** Accept v1 payloads (the stated compatibility window). */
@@ -167,6 +173,19 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
   const acceptWireV1 = config.acceptWireV1 ?? true;
   const minCell = config.minAggregateCell ?? DEFAULT_MIN_AGGREGATE_CELL;
   const trustedProxyHops = config.trustedProxyHops ?? 0;
+  // Throws on a malformed entry — a silently dropped proxy means the header is
+  // ignored and the whole population shares one bucket.
+  const trustedProxies = parseTrustedProxies(config.trustedProxies ?? []);
+  if (trustedProxyHops > 0 && trustedProxies.length === 0) {
+    // Fail at construction rather than serve. A hop count with no peer list
+    // would honour X-Forwarded-For from whoever connected, which is strictly
+    // worse than not configuring it at all.
+    throw new Error(
+      'trustedProxyHops > 0 requires trustedProxies: naming how many proxies are in the chain without ' +
+        'naming WHICH peers they are would let anyone reaching this listener directly choose their own ' +
+        'throttle bucket.',
+    );
+  }
   const opsKey = config.opsKey && config.opsKey.length > 0 ? config.opsKey : null;
   const nowUtcDay = config.nowUtcDay ?? (() => new Date().toISOString().slice(0, 10));
   const nowMs = config.nowMs ?? Date.now;
@@ -240,7 +259,7 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
 
     // (2) per-source throttle. The address is the bucket key and nothing else:
     // never logged, never stored.
-    const source = resolveSourceKey(req, server, trustedProxyHops);
+    const source = resolveSourceKey(req, server, trustedProxyHops, trustedProxies);
     if (!limiter.allow(source)) {
       return rejectIngest(429, 'rate_limited', 'ingest_rejected_rate_limited');
     }
@@ -317,7 +336,17 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
     if (!known && !newInstanceLimiter.allow(source)) {
       return rejectIngest(429, 'rate_limited', 'ingest_rejected_new_instance_source_limit');
     }
-    const admission = db.admit(hb.instance_id, product, today);
+    // (11) the authoritative admission decision and the write are ONE
+    // transaction — see TelemetryDb.recordHeartbeat. `schema_version` records
+    // the WIRE version; the payload is always the normalized v2 document.
+    const admission = db.recordHeartbeat(
+      hb.instance_id,
+      product,
+      hb.day,
+      normalized.wireVersion,
+      JSON.stringify(hb),
+      today,
+    );
     if (!admission.ok) {
       counters.inc(
         admission.reason === 'instance_capacity'
@@ -328,16 +357,6 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
       return json(429, { ok: false, error: 'instance_capacity' });
     }
 
-    // (11) store. `schema_version` records the WIRE version; the payload is
-    // always the normalized v2 document.
-    db.upsertHeartbeat(
-      hb.instance_id,
-      product,
-      hb.day,
-      normalized.wireVersion,
-      JSON.stringify(hb),
-      today,
-    );
     counters.inc('ingest_accepted_total');
     counters.inc(normalized.wireVersion === 1 ? 'ingest_accepted_wire_v1' : 'ingest_accepted_wire_v2');
     if (!admission.existing) counters.inc('ingest_accepted_new_instance');
@@ -514,13 +533,14 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
       counters: counters.snapshot(),
       store: {
         instances_total: db.countInstances(),
-        new_instances_today: db.countNewInstancesOnDay(nowUtcDay()),
+        new_instances_today: db.admittedOnDay(nowUtcDay()),
         max_instances: db.maxInstances,
         new_instances_per_day: db.newInstancesPerDay,
         retention_days: db.retentionDays,
       },
       throttle: {
         trusted_proxy_hops: trustedProxyHops,
+        trusted_proxies_configured: trustedProxies.length,
         rate_limit_keys: limiter.size(),
         new_instance_keys: newInstanceLimiter.size(),
       },

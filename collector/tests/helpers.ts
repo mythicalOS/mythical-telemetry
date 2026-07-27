@@ -24,6 +24,7 @@ export interface HarnessOptions {
   rateLimitPerMin?: number;
   newInstancePerSourcePerHour?: number;
   trustedProxyHops?: number;
+  trustedProxies?: readonly string[];
   retentionDays?: number;
   maxInstances?: number;
   newInstancesPerDay?: number;
@@ -53,6 +54,7 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
     rateLimitPerMin: opts.rateLimitPerMin,
     newInstancePerSourcePerHour: opts.newInstancePerSourcePerHour,
     trustedProxyHops: opts.trustedProxyHops,
+    trustedProxies: opts.trustedProxies,
     minAggregateCell: opts.minAggregateCell ?? 1,
     acceptWireV1: opts.acceptWireV1,
     opsKey: opts.opsKey ?? null,

@@ -83,7 +83,9 @@ export class TelemetryDb {
   private readonly stmtUpsertHeartbeat: Statement;
   private readonly stmtGetInstance: Statement<InstanceRow, [string, string]>;
   private readonly stmtCountInstances: Statement<{ n: number }, []>;
-  private readonly stmtCountNewToday: Statement<{ n: number }, [string]>;
+  private readonly stmtAdmittedOnDay: Statement<{ admitted: number }, [string]>;
+  private readonly stmtBumpAdmissions: Statement;
+  private readonly stmtPruneAdmissions: Statement;
   private readonly stmtCountHeartbeats: Statement<{ n: number }, [string, string]>;
   private readonly stmtHeartbeatsAsc: Statement<HeartbeatRow, [string, string]>;
   private readonly stmtHeartbeatsRecent: Statement<HeartbeatRow, [string, string, number]>;
@@ -122,7 +124,14 @@ export class TelemetryDb {
       'SELECT instance_id, product, first_seen_day, last_seen_day FROM instances WHERE instance_id = ?1 AND product = ?2',
     );
     this.stmtCountInstances = this.db.query('SELECT COUNT(*) AS n FROM instances');
-    this.stmtCountNewToday = this.db.query('SELECT COUNT(*) AS n FROM instances WHERE first_seen_day = ?1');
+    this.stmtAdmittedOnDay = this.db.query('SELECT admitted FROM admissions WHERE day = ?1');
+    this.stmtBumpAdmissions = this.db.query(`
+      INSERT INTO admissions (day, admitted) VALUES (?1, 1)
+      ON CONFLICT(day) DO UPDATE SET admitted = admissions.admitted + 1
+    `);
+    this.stmtPruneAdmissions = this.db.query(
+      'DELETE FROM admissions WHERE day NOT IN (SELECT day FROM admissions ORDER BY day DESC LIMIT ?1)',
+    );
     this.stmtCountHeartbeats = this.db.query(
       'SELECT COUNT(*) AS n FROM heartbeats WHERE instance_id = ?1 AND product = ?2',
     );
@@ -167,7 +176,15 @@ export class TelemetryDb {
   }
 
   /**
-   * Admission control for a heartbeat write.
+   * Admit and store one heartbeat, ATOMICALLY.
+   *
+   * The check and the write are one `IMMEDIATE` transaction on purpose. Split
+   * apart, two processes sharing this database could each observe capacity
+   * available and each insert, walking straight past both budgets — and the
+   * whole point of deriving them from the database rather than from memory is
+   * that they hold across replicas. IMMEDIATE takes the write lock before the
+   * first read, so the second process blocks (busy_timeout) and then re-reads
+   * the winner's state.
    *
    * An identity that already exists is always admitted — established installs
    * must never be throttled by a flood of fresh ones. A never-seen identity is
@@ -177,42 +194,61 @@ export class TelemetryDb {
    *   • the daily budget (`newInstancesPerDay`) — how fast the ceiling may be
    *     approached.
    *
-   * The daily budget is derived from `first_seen_day` rather than kept in
-   * memory, so it survives a restart and is shared by every replica reading
-   * the same database. Its honest limit is stated in the README: it converts
-   * "one flood permanently exhausts the ceiling" into "one flood exhausts one
-   * day's budget". It does not remove the lever.
+   * The daily budget reads the append-only `admissions` ledger, NOT a count of
+   * `instances.first_seen_day`: that count falls again when an installation
+   * exercises its right to delete, so mint-delete-repeat would have bought
+   * unlimited admissions. The ledger is only ever incremented.
+   *
+   * Its honest limit is stated in the README: it converts "one flood
+   * permanently exhausts the ceiling" into "one flood exhausts one day's
+   * budget". It does not remove the lever.
    */
-  admit(instanceId: string, product: string, today: string): Admission {
-    if (this.stmtGetInstance.get(instanceId, product)) return { ok: true, existing: true };
-    if ((this.stmtCountInstances.get()?.n ?? 0) >= this.maxInstances) {
-      return { ok: false, reason: 'instance_capacity' };
-    }
-    if (this.newInstancesPerDay > 0 && (this.stmtCountNewToday.get(today)?.n ?? 0) >= this.newInstancesPerDay) {
-      return { ok: false, reason: 'daily_admission_budget' };
-    }
-    return { ok: true, existing: false };
-  }
-
-  /** True when this identity already has an instances row for that product. */
-  isKnownInstance(instanceId: string, product: string): boolean {
-    return this.stmtGetInstance.get(instanceId, product) !== null;
-  }
-
-  /** Upsert one heartbeat, last-write-wins per (instance_id, product, day). */
-  upsertHeartbeat(
+  recordHeartbeat(
     instanceId: string,
     product: string,
     day: string,
     wireVersion: number,
     payloadJson: string,
     receivedDay: string,
-  ): void {
-    const tx = this.db.transaction(() => {
+  ): Admission {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const existing = this.stmtGetInstance.get(instanceId, product) !== null;
+      if (!existing) {
+        if ((this.stmtCountInstances.get()?.n ?? 0) >= this.maxInstances) {
+          this.db.exec('ROLLBACK');
+          return { ok: false, reason: 'instance_capacity' };
+        }
+        if (this.newInstancesPerDay > 0 && this.admittedOnDay(receivedDay) >= this.newInstancesPerDay) {
+          this.db.exec('ROLLBACK');
+          return { ok: false, reason: 'daily_admission_budget' };
+        }
+        this.stmtBumpAdmissions.run(receivedDay);
+      }
       this.stmtUpsertInstance.run(instanceId, product, receivedDay);
       this.stmtUpsertHeartbeat.run(instanceId, product, day, wireVersion, payloadJson, receivedDay);
-    });
-    tx();
+      this.db.exec('COMMIT');
+      return { ok: true, existing };
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // Already resolved; the original error is what matters.
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * True when this identity already has an instances row for that product.
+   *
+   * ADVISORY ONLY — used to decide whether a request should spend a
+   * per-source mint token. It is not an authorization or admission decision,
+   * and a race here costs at most one token in either direction. The
+   * authoritative check lives inside `recordHeartbeat`'s transaction.
+   */
+  isKnownInstance(instanceId: string, product: string): boolean {
+    return this.stmtGetInstance.get(instanceId, product) !== null;
   }
 
   getInstance(instanceId: string, product: string): InstanceRow | null {
@@ -227,8 +263,9 @@ export class TelemetryDb {
     return this.stmtCountInstances.get()?.n ?? 0;
   }
 
-  countNewInstancesOnDay(day: string): number {
-    return this.stmtCountNewToday.get(day)?.n ?? 0;
+  /** Identities admitted for the first time on `day`, from the append-only ledger. */
+  admittedOnDay(day: string): number {
+    return this.stmtAdmittedOnDay.get(day)?.admitted ?? 0;
   }
 
   /** Day-ascending heartbeat rows; `recentDays` trims to the most recent N (still ascending). */
@@ -246,9 +283,15 @@ export class TelemetryDb {
     tx();
   }
 
-  /** Per-(instance, product) row cap: drop everything older than the newest retentionDays rows. */
+  /**
+   * Per-(instance, product) row cap: drop everything older than the newest
+   * retentionDays rows. Also trims the admission ledger to the same horizon —
+   * it is one row per day, but unbounded is still unbounded.
+   */
   pruneRetention(): number {
-    return this.stmtPrune.run(this.retentionDays).changes;
+    const pruned = this.stmtPrune.run(this.retentionDays).changes;
+    this.stmtPruneAdmissions.run(this.retentionDays);
+    return pruned;
   }
 
   /**

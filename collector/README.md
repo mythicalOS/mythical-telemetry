@@ -15,6 +15,7 @@ canonical schema declares — counts, buckets, booleans, closed enums and versio
 |---|---|
 | `instances` | `instance_id`, `product`, `first_seen_day`, `last_seen_day` — PK `(instance_id, product)` |
 | `heartbeats` | `instance_id`, `product`, `day`, `schema_version`, `payload`, `received_day` — PK `(instance_id, product, day)` |
+| `admissions` | `day`, `admitted` — the append-only admission ledger; counts only, no identities |
 
 Three privacy properties are **schema-level**, not promises in a code comment:
 
@@ -106,7 +107,9 @@ Normalization is a structural move only — sections move under `metrics`, `prod
 becomes `product.version` — and it deliberately moves *every* non-envelope key, including ones the
 schema does not declare, so an undeclared section stays rejectable. Copying a known list of
 sections across would silently discard the rest and turn a rejectable payload into an acceptable
-one.
+one. For the same reason every key is written with `defineProperty` rather than plain assignment:
+`JSON.parse` produces a genuine own `__proto__` property, and assigning it back would invoke the
+inherited setter and make the field vanish mid-move.
 
 ---
 
@@ -143,8 +146,18 @@ Three budgets bound how much a flood can consume:
 **The ceiling is itself a denial-of-service lever: exhaust it and legitimate first-time
 installations get `429`.** The daily budget does not remove that — it converts *one flood
 permanently exhausts the ceiling* into *one flood exhausts one day's budget*, and it restores
-itself at the UTC day boundary. It is derived from `first_seen_day` in the database, so it survives
-a restart and is shared by every replica on the same store.
+itself at the UTC day boundary.
+
+Two properties make those budgets real rather than nominal:
+
+- **The check and the write are one `IMMEDIATE` transaction.** Split apart, two replicas sharing a
+  store could each observe capacity available and each insert, walking straight past both budgets.
+- **The daily count comes from an append-only `admissions` ledger, not from counting
+  `instances.first_seen_day`.** That count falls again when an installation exercises its right to
+  delete, so mint → delete → repeat would have bought unlimited admissions. The ledger is only ever
+  incremented.
+
+Both are therefore shared by every replica reading the same database, and both survive a restart.
 
 The per-source mint budget is the anomaly isolation: minting is throttled separately from, and far
 more tightly than, ordinary traffic, and an installation that is already reporting is **never**
@@ -168,14 +181,31 @@ Both mistakes here are real, and neither is safe to guess:
   limiter then throttles your entire population as one source — a self-inflicted outage the first
   time traffic is normal.
 
-So state the number of proxies you run. With `N` hops, the rightmost `N` entries of the chain were
-appended by infrastructure you control, and the client address is taken from that position.
-Anything an attacker prepends sits to the left of it and is ignored. Every failure — a chain
-shorter than declared, a missing header, an implausible value — falls back to the peer address,
-never to a header value.
+So state **two** things, and both are required together:
 
-**Set this to the number of proxies that actually rewrite the header.** Setting it too high is the
-dangerous direction: it selects a position an attacker can write.
+| Variable | Meaning |
+|---|---|
+| `MYTHICAL_TELEMETRY_TRUSTED_PROXIES` | **which peers** are your proxies — a comma-separated list of addresses or CIDRs (IPv4 and IPv6), e.g. `10.0.0.0/8,2001:db8:1::/48` |
+| `MYTHICAL_TELEMETRY_TRUSTED_PROXY_HOPS` | **how many** of them are in the chain |
+
+A hop count alone is not enough, and the collector refuses to start with one: it would honour the
+header from whoever connected, so anyone with a direct route to the listener — a sibling container,
+a misconfigured security group, a leaked internal port — could hand themselves any bucket they
+liked. The header is read **only when the peer is on the list**.
+
+With `N` hops, the rightmost `N` entries of the chain were appended by infrastructure you control,
+and the client address is taken from that position. Anything an attacker prepends sits to the left
+of it and is ignored. Every failure — an untrusted peer, a chain shorter than declared, a missing
+header, an implausible value — falls back to the peer address, never to a header value.
+
+An IPv4-mapped IPv6 peer (`::ffff:10.0.0.1`, which is what a dual-stack listener commonly reports)
+matches an IPv4 CIDR, so you do not have to write your ranges twice. A malformed entry in the list
+fails at boot with the offending text rather than being skipped — a silently dropped proxy means
+the header is ignored and your whole population shares one bucket, which looks like a capacity
+problem rather than a configuration one.
+
+**Set the hop count to the number of proxies that actually rewrite the header.** Setting it too
+high is the dangerous direction: it selects a position an attacker can write.
 
 ### Monitoring hooks
 
@@ -206,8 +236,9 @@ above zero; a sustained rise in `ingest_accepted_new_instance`; `internal_error`
   manual operator action against the database.
 - **`product.version` is self-asserted.** A modified client can claim any allowlisted version. A
   version allowlist here would be an operational control, never a consent or compliance guarantee.
-- **A replica per store shares the daily budget** (it is a database count), but each replica has
-  its **own** in-memory per-source throttle. Per-source limits are therefore per-replica; size them
+- **Replicas share the durable budgets but not the per-source throttle.** The ceiling and the daily
+  ledger live in the database and are enforced transactionally across replicas; the per-source
+  token buckets are per-process memory. Per-source limits are therefore per-replica — size them
   accordingly, or enforce them at the edge.
 
 ### Reverse proxy and TLS (required)
@@ -243,7 +274,8 @@ services:
     volumes:
       - telemetry-data:/data
     environment:
-      MYTHICAL_TELEMETRY_TRUSTED_PROXY_HOPS: "1"   # set to YOUR proxy count
+      MYTHICAL_TELEMETRY_TRUSTED_PROXY_HOPS: "1"          # YOUR proxy count
+      MYTHICAL_TELEMETRY_TRUSTED_PROXIES: "10.0.0.0/8"     # YOUR proxy addresses
       MYTHICAL_TELEMETRY_RATE_LIMIT_PER_MIN: "60"
 
 volumes:
@@ -262,7 +294,8 @@ volumes:
 | `MYTHICAL_TELEMETRY_NEW_INSTANCES_PER_DAY` | `5000` | global daily budget for fresh identities (0 disables) |
 | `MYTHICAL_TELEMETRY_MAX_INSTANCES` | `100000` | absolute ceiling on stored identities |
 | `MYTHICAL_TELEMETRY_RETENTION_DAYS` | `400` | per-(instance, product) row cap, pruned daily |
-| `MYTHICAL_TELEMETRY_TRUSTED_PROXY_HOPS` | `0` | proxies in front of this service; 0 = never trust `X-Forwarded-For` |
+| `MYTHICAL_TELEMETRY_TRUSTED_PROXY_HOPS` | `0` | proxies in the chain; 0 = never trust `X-Forwarded-For` |
+| `MYTHICAL_TELEMETRY_TRUSTED_PROXIES` | *(unset)* | which peers those are: comma-separated addresses/CIDRs. **Required** when hops > 0; the service refuses to start otherwise |
 | `MYTHICAL_TELEMETRY_MIN_AGGREGATE_CELL` | `5` | small-cell floor for the public aggregate |
 | `MYTHICAL_TELEMETRY_ACCEPT_V1` | `1` | accept v1 payloads (the compatibility window) |
 | `MYTHICAL_TELEMETRY_OPS_KEY` | *(unset)* | gates `/metrics`; unset means the route does not exist |
@@ -273,6 +306,8 @@ The store gained a product dimension. `CREATE TABLE IF NOT EXISTS` cannot expres
 collector ships a **transactional rebuild** that runs at boot:
 
 - every existing row is carried over and backfilled as product `brokkr`;
+- the admission ledger is created and seeded from the identities already stored, so upgrading does
+  not hand today's budget back in full;
 - stored v1 payloads are normalized to v2 **at rest**, so the read path has one shape — leaving
   them would not crash, it would silently fold zeros into every historical total;
 - the whole thing is one `IMMEDIATE` transaction: it lands completely or not at all, and a second

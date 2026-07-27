@@ -208,7 +208,7 @@ describe('migration against a REAL old-schema database', () => {
     try {
       // Same id, same day, different product: under the old key this
       // overwrote; under the new one both rows live.
-      db.upsertHeartbeat(INSTANCE_A, 'saga', '2026-07-08', 2, JSON.stringify({ metrics: {} }), '2026-07-08');
+      db.recordHeartbeat(INSTANCE_A, 'saga', '2026-07-08', 2, JSON.stringify({ metrics: {} }), '2026-07-08');
       expect(db.countHeartbeats(INSTANCE_A, LEGACY_PRODUCT)).toBe(1);
       expect(db.countHeartbeats(INSTANCE_A, 'saga')).toBe(1);
       expect(db.countInstances()).toBe(2);

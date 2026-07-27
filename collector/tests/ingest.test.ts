@@ -324,3 +324,26 @@ describe('ingest: upsert idempotency', () => {
     expect(stats.days[0].metrics.sessions.count).toBe(99);
   });
 });
+
+describe('ingest: `__proto__` cannot launder a v1 payload into an accepted one', () => {
+  test('an undeclared `__proto__` section is still rejected after normalization', async () => {
+    // Built as raw JSON text on purpose: an object literal would not reproduce
+    // the own-property `__proto__` that JSON.parse creates.
+    const { handler, db, counters } = makeHarness();
+    const v1 = makeV1(INSTANCE_A);
+    const body = JSON.stringify(v1).replace(/^\{/, '{"__proto__":{"secret_path":"/Users/someone"},');
+    const r = await handler(ingestReq(body, SECRET_A));
+    expect(r.status).toBe(400);
+    expect(counters.get('ingest_rejected_schema_invalid')).toBe(1);
+    expect(db.countHeartbeats(INSTANCE_A, 'brokkr')).toBe(0);
+    expect(({} as Record<string, unknown>)['secret_path']).toBeUndefined();
+  });
+
+  test('the same trick inside `product` is rejected too', async () => {
+    const { handler, db } = makeHarness();
+    const v1 = makeV1(INSTANCE_A);
+    const body = JSON.stringify(v1).replace('"product":{', '"product":{"__proto__":{"x":1},');
+    expect((await handler(ingestReq(body, SECRET_A))).status).toBe(400);
+    expect(db.countHeartbeats(INSTANCE_A, 'brokkr')).toBe(0);
+  });
+});

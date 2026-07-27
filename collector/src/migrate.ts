@@ -53,6 +53,8 @@ export interface MigrationReport {
   payloadsNormalized: number;
   /** Rows whose payload could not be parsed — carried over verbatim, never dropped. */
   payloadsUnparseable: number;
+  /** The admission ledger was created and back-filled from existing rows. */
+  admissionsSeeded: boolean;
 }
 
 const HEARTBEATS_DDL = `
@@ -74,6 +76,19 @@ const INSTANCES_DDL = `
     first_seen_day TEXT NOT NULL,
     last_seen_day  TEXT NOT NULL,
     PRIMARY KEY (instance_id, product)
+  );
+`;
+
+// The admission ledger: one row per UTC day, counting identities admitted for
+// the FIRST time on that day. It is deliberately NOT derived from
+// `instances.first_seen_day`, because that count falls again when an
+// installation exercises its right to delete — so mint, delete, repeat would
+// have bought unlimited admissions against the daily budget. The ledger is
+// only ever incremented.
+const ADMISSIONS_DDL = `
+  CREATE TABLE IF NOT EXISTS admissions (
+    day      TEXT PRIMARY KEY,
+    admitted INTEGER NOT NULL
   );
 `;
 
@@ -115,6 +130,7 @@ export function migrate(db: Database): MigrationReport {
     instanceRowsCarried: 0,
     payloadsNormalized: 0,
     payloadsUnparseable: 0,
+    admissionsSeeded: false,
   };
 
   // IMMEDIATE takes the write lock up front, so a second process booting on
@@ -142,9 +158,21 @@ export function migrate(db: Database): MigrationReport {
 
     // Creates anything still missing (fresh database, or only one table
     // present). Never touches a table that already exists.
+    const hadAdmissions = tableExists(db, 'admissions');
     db.exec(HEARTBEATS_DDL);
     db.exec(INSTANCES_DDL);
+    db.exec(ADMISSIONS_DDL);
     db.exec(INDEX_DDL);
+
+    // Seed the ledger from what is already stored, so upgrading does not hand
+    // today's budget back in full. `INSERT OR IGNORE` keeps this a one-shot.
+    if (!hadAdmissions) {
+      db.exec(
+        `INSERT OR IGNORE INTO admissions (day, admitted)
+         SELECT first_seen_day, COUNT(*) FROM instances GROUP BY first_seen_day`,
+      );
+      report.admissionsSeeded = true;
+    }
 
     // The payload pass is O(rows) and must not run on every boot. It runs when
     // a rebuild just happened, or when the version marker says this database

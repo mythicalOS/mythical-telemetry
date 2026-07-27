@@ -9,6 +9,7 @@
 // denial of service than the flood it defends against.
 
 import { describe, expect, test } from 'bun:test';
+import { parseTrustedProxies } from '../src/ip';
 import { resolveSourceKey, TokenBucketLimiter } from '../src/throttle';
 import { getReq, ingestReq, makeHarness } from './helpers';
 import { INSTANCE_A, INSTANCE_B, INSTANCE_C, makeV2, SECRET_A, SECRET_B, SECRET_C } from './fixtures';
@@ -49,52 +50,84 @@ describe('the trusted-proxy model', () => {
   const req = (xff?: string) =>
     new Request('http://telemetry.local/v1/ingest', { headers: xff === undefined ? {} : { 'x-forwarded-for': xff } });
   const server = (address: string) => ({ requestIP: () => ({ address }) });
+  // The operator's own proxies. Nothing outside this list is ever believed.
+  const PROXIES = parseTrustedProxies(['10.0.0.0/8', '2001:db8:1::/48']);
 
   test('at the default of ZERO hops, X-Forwarded-For is ignored entirely', () => {
-    expect(resolveSourceKey(req('1.2.3.4'), server('10.0.0.1'), 0)).toBe('10.0.0.1');
-    expect(resolveSourceKey(req('1.2.3.4, 5.6.7.8'), server('10.0.0.1'), 0)).toBe('10.0.0.1');
+    expect(resolveSourceKey(req('1.2.3.4'), server('10.0.0.1'), 0, PROXIES)).toBe('10.0.0.1');
+    expect(resolveSourceKey(req('1.2.3.4, 5.6.7.8'), server('10.0.0.1'), 0, PROXIES)).toBe('10.0.0.1');
+  });
+
+  test('an UNTRUSTED peer can never choose its own bucket, however plausible the header', () => {
+    // The finding this closes: a hop count alone would honour the header from
+    // whoever connected, so anyone with a direct route to the listener could
+    // hand themselves any bucket they liked.
+    expect(resolveSourceKey(req('203.0.113.9'), server('198.51.100.7'), 1, PROXIES)).toBe('198.51.100.7');
+    expect(resolveSourceKey(req('1.1.1.1, 2.2.2.2'), server('198.51.100.7'), 2, PROXIES)).toBe('198.51.100.7');
+    // Empty allowlist means no peer is trusted at all.
+    expect(resolveSourceKey(req('203.0.113.9'), server('10.0.0.1'), 1, [])).toBe('10.0.0.1');
   });
 
   test('with one trusted hop, the client address is taken and a spoofed prefix is ignored', () => {
-    // A single proxy appends what it saw. An attacker-supplied entry can only
-    // sit to the LEFT of that, so it is never selected.
-    expect(resolveSourceKey(req('203.0.113.9'), server('10.0.0.1'), 1)).toBe('203.0.113.9');
-    expect(resolveSourceKey(req('evil.spoof, 203.0.113.9'), server('10.0.0.1'), 1)).toBe('203.0.113.9');
-    expect(resolveSourceKey(req('1.1.1.1, 2.2.2.2, 203.0.113.9'), server('10.0.0.1'), 1)).toBe('203.0.113.9');
+    expect(resolveSourceKey(req('203.0.113.9'), server('10.0.0.1'), 1, PROXIES)).toBe('203.0.113.9');
+    expect(resolveSourceKey(req('evil.spoof, 203.0.113.9'), server('10.0.0.1'), 1, PROXIES)).toBe('203.0.113.9');
+    expect(resolveSourceKey(req('1.1.1.1, 2.2.2.2, 203.0.113.9'), server('10.0.0.1'), 1, PROXIES)).toBe('203.0.113.9');
   });
 
   test('with two trusted hops the second-from-right entry is taken', () => {
-    expect(resolveSourceKey(req('203.0.113.9, 172.16.0.1'), server('10.0.0.1'), 2)).toBe('203.0.113.9');
-    expect(resolveSourceKey(req('spoof, 203.0.113.9, 172.16.0.1'), server('10.0.0.1'), 2)).toBe('203.0.113.9');
+    expect(resolveSourceKey(req('203.0.113.9, 172.16.0.1'), server('10.0.0.1'), 2, PROXIES)).toBe('203.0.113.9');
+    expect(resolveSourceKey(req('spoof, 203.0.113.9, 172.16.0.1'), server('10.0.0.1'), 2, PROXIES)).toBe('203.0.113.9');
+  });
+
+  test('an IPv4-mapped IPv6 peer still matches an IPv4 CIDR', () => {
+    // A dual-stack listener commonly reports an IPv4 peer this way.
+    expect(resolveSourceKey(req('203.0.113.9'), server('::ffff:10.0.0.1'), 1, PROXIES)).toBe('203.0.113.9');
+  });
+
+  test('an IPv6 proxy inside its prefix is trusted; one outside it is not', () => {
+    expect(resolveSourceKey(req('203.0.113.9'), server('2001:db8:1::5'), 1, PROXIES)).toBe('203.0.113.9');
+    expect(resolveSourceKey(req('203.0.113.9'), server('2001:db8:9::5'), 1, PROXIES)).toBe('2001:db8:9::5');
   });
 
   test('every failure falls back to the peer address, never to a header value', () => {
     // Chain shorter than declared: the request did not arrive the expected way.
-    expect(resolveSourceKey(req('203.0.113.9'), server('10.0.0.1'), 2)).toBe('10.0.0.1');
+    expect(resolveSourceKey(req('203.0.113.9'), server('10.0.0.1'), 2, PROXIES)).toBe('10.0.0.1');
     // No header at all.
-    expect(resolveSourceKey(req(), server('10.0.0.1'), 1)).toBe('10.0.0.1');
+    expect(resolveSourceKey(req(), server('10.0.0.1'), 1, PROXIES)).toBe('10.0.0.1');
     // Empty / whitespace-only chain.
-    expect(resolveSourceKey(req(' , , '), server('10.0.0.1'), 1)).toBe('10.0.0.1');
-    // Implausible values: an attacker must not be able to mint arbitrary
-    // bucket keys, nor an unbounded number of them.
-    expect(resolveSourceKey(req('not an address'), server('10.0.0.1'), 1)).toBe('10.0.0.1');
-    expect(resolveSourceKey(req('999'), server('10.0.0.1'), 1)).toBe('10.0.0.1');
-    expect(resolveSourceKey(req('x'.repeat(400)), server('10.0.0.1'), 1)).toBe('10.0.0.1');
-    expect(resolveSourceKey(req('<script>'), server('10.0.0.1'), 1)).toBe('10.0.0.1');
+    expect(resolveSourceKey(req(' , , '), server('10.0.0.1'), 1, PROXIES)).toBe('10.0.0.1');
+    // Implausible values: with a MISCONFIGURED hop count an attacker-supplied
+    // entry could be selected, and must not be able to mint arbitrary keys.
+    expect(resolveSourceKey(req('not an address'), server('10.0.0.1'), 1, PROXIES)).toBe('10.0.0.1');
+    expect(resolveSourceKey(req('999'), server('10.0.0.1'), 1, PROXIES)).toBe('10.0.0.1');
+    expect(resolveSourceKey(req('x'.repeat(400)), server('10.0.0.1'), 1, PROXIES)).toBe('10.0.0.1');
+    expect(resolveSourceKey(req('<script>'), server('10.0.0.1'), 1, PROXIES)).toBe('10.0.0.1');
   });
 
-  test('IPv6 forms are accepted', () => {
-    expect(resolveSourceKey(req('2001:db8::1'), server('10.0.0.1'), 1)).toBe('2001:db8::1');
-    expect(resolveSourceKey(req('fe80::1%eth0'), server('10.0.0.1'), 1)).toBe('fe80::1%eth0');
+  test('IPv6 client forms are accepted', () => {
+    expect(resolveSourceKey(req('2001:db8::1'), server('10.0.0.1'), 1, PROXIES)).toBe('2001:db8::1');
+    expect(resolveSourceKey(req('fe80::1%eth0'), server('10.0.0.1'), 1, PROXIES)).toBe('fe80::1%eth0');
   });
 
   test('with no peer address available at all, the key is a constant rather than a header value', () => {
-    expect(resolveSourceKey(req('1.2.3.4'), undefined, 0)).toBe('unknown');
-    expect(resolveSourceKey(req(), undefined, 1)).toBe('unknown');
+    expect(resolveSourceKey(req('1.2.3.4'), undefined, 0, PROXIES)).toBe('unknown');
+    expect(resolveSourceKey(req(), undefined, 1, PROXIES)).toBe('unknown');
+    // "unknown" is not an address, so it is never trusted as a proxy either.
+    expect(resolveSourceKey(req('1.2.3.4'), undefined, 1, PROXIES)).toBe('unknown');
+  });
+
+  test('configuring hops without naming the proxies fails at construction, not at runtime', () => {
+    expect(() => makeHarness({ trustedProxyHops: 1 })).toThrow(/requires trustedProxies/);
+    expect(() => makeHarness({ trustedProxyHops: 1, trustedProxies: [] })).toThrow(/requires trustedProxies/);
+    // ...and a malformed entry is refused rather than silently dropped.
+    expect(() => makeHarness({ trustedProxyHops: 1, trustedProxies: ['10.0.0.0/8', 'not-an-ip'] })).toThrow(
+      /trusted-proxy list/,
+    );
+    expect(() => makeHarness({ trustedProxyHops: 1, trustedProxies: ['10.0.0.0/8'] })).not.toThrow();
   });
 
   test('end to end: hops=1 throttles per real client, not per proxy', async () => {
-    const h = makeHarness({ rateLimitPerMin: 1, trustedProxyHops: 1 });
+    const h = makeHarness({ rateLimitPerMin: 1, trustedProxyHops: 1, trustedProxies: ['10.0.0.0/8'] });
     const proxy = h.serverFor('10.0.0.1');
     const asClient = (id: string, secret: string, client: string, day: string) =>
       h.handler(ingestReq(makeV2('brokkr', id, day), secret, { 'x-forwarded-for': client }), proxy);
@@ -104,6 +137,16 @@ describe('the trusted-proxy model', () => {
     // A different real client behind the SAME proxy still has its own budget —
     // this is the outage the model exists to prevent.
     expect((await asClient(INSTANCE_B, SECRET_B, '198.51.100.7', '2026-07-09')).status).toBe(202);
+  });
+
+  test('end to end: a direct connection cannot dodge the limiter with the same header', async () => {
+    const h = makeHarness({ rateLimitPerMin: 1, trustedProxyHops: 1, trustedProxies: ['10.0.0.0/8'] });
+    const direct = h.serverFor('198.51.100.7'); // NOT one of the operator's proxies
+    const spoof = (id: string, secret: string, client: string, day: string) =>
+      h.handler(ingestReq(makeV2('brokkr', id, day), secret, { 'x-forwarded-for': client }), direct);
+
+    expect((await spoof(INSTANCE_A, SECRET_A, '1.1.1.1', '2026-07-09')).status).toBe(202);
+    expect((await spoof(INSTANCE_B, SECRET_B, '2.2.2.2', '2026-07-09')).status).toBe(429);
   });
 
   test('end to end: at hops=0 the same header cannot be used to dodge the limiter', async () => {

@@ -31,6 +31,13 @@ function envInt(name: string, fallback: number): number {
   return n;
 }
 
+/** Comma-separated list; empty entries dropped. Malformed values fail in the server. */
+function envList(name: string): string[] {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return [];
+  return raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
 function envBool(name: string, fallback: boolean): boolean {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return fallback;
@@ -66,6 +73,7 @@ const handler = buildFetchHandler({
     DEFAULT_NEW_INSTANCE_PER_SOURCE_PER_HOUR,
   ),
   trustedProxyHops: envInt('MYTHICAL_TELEMETRY_TRUSTED_PROXY_HOPS', 0),
+  trustedProxies: envList('MYTHICAL_TELEMETRY_TRUSTED_PROXIES'),
   minAggregateCell: envInt('MYTHICAL_TELEMETRY_MIN_AGGREGATE_CELL', DEFAULT_MIN_AGGREGATE_CELL),
   acceptWireV1: envBool('MYTHICAL_TELEMETRY_ACCEPT_V1', true),
   opsKey: process.env.MYTHICAL_TELEMETRY_OPS_KEY ?? null,

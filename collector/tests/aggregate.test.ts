@@ -58,7 +58,7 @@ describe('aggregate JSON', () => {
     // clears the floor and `installs_active` does not.
     await seed(h, 'brokkr', 1);
     for (const id of ['dormant-1', 'dormant-2']) {
-      h.db.upsertHeartbeat(id, 'brokkr', '2026-01-01', 2, '{}', '2026-01-01');
+      h.db.recordHeartbeat(id, 'brokkr', '2026-01-01', 2, '{}', '2026-01-01');
     }
     const body = await (await h.handler(getReq('/v1/stats'))).json() as any;
     const brokkr = body.products.find((p: any) => p.product === 'brokkr');
