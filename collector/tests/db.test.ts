@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { TelemetryDb } from '../src/db';
 
-const payload = (day: string) => JSON.stringify({ day, schema_version: 2, metrics: {} });
+const payload = (day: string) => JSON.stringify({ day, schema_version: 1, metrics: {} });
 
 describe('TelemetryDb basics', () => {
   test('file-backed database runs in WAL mode', () => {

@@ -38,14 +38,6 @@ function envList(name: string): string[] {
   return raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
 }
 
-function envBool(name: string, fallback: boolean): boolean {
-  const raw = process.env[name];
-  if (raw === undefined || raw === '') return fallback;
-  if (raw === '1' || raw === 'true') return true;
-  if (raw === '0' || raw === 'false') return false;
-  throw new Error(`${name} must be one of 1/0/true/false, got: ${raw}`);
-}
-
 const dbPath = process.env.MYTHICAL_TELEMETRY_DB_PATH || '/data/telemetry.db';
 const port = envInt('MYTHICAL_TELEMETRY_PORT', DEFAULT_PORT);
 
@@ -77,7 +69,6 @@ const handler = buildFetchHandler({
   trustedProxyHops: envInt('MYTHICAL_TELEMETRY_TRUSTED_PROXY_HOPS', 0),
   trustedProxies: envList('MYTHICAL_TELEMETRY_TRUSTED_PROXIES'),
   minAggregateCell: envInt('MYTHICAL_TELEMETRY_MIN_AGGREGATE_CELL', DEFAULT_MIN_AGGREGATE_CELL),
-  acceptWireV1: envBool('MYTHICAL_TELEMETRY_ACCEPT_V1', true),
   opsKey: process.env.MYTHICAL_TELEMETRY_OPS_KEY ?? null,
 });
 

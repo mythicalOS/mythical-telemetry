@@ -19,8 +19,6 @@
 export const COUNTER_NAMES = [
   // accepted
   'ingest_accepted_total',
-  'ingest_accepted_wire_v1',
-  'ingest_accepted_wire_v2',
   'ingest_accepted_new_instance',
   // rejected — one name per distinct internal reason
   'ingest_rejected_total',
@@ -28,8 +26,6 @@ export const COUNTER_NAMES = [
   'ingest_rejected_rate_limited',
   'ingest_rejected_body_too_large',
   'ingest_rejected_malformed_json',
-  'ingest_rejected_unsupported_schema_version',
-  'ingest_rejected_v1_window_closed',
   'ingest_rejected_schema_invalid',
   'ingest_rejected_validator_error',
   'ingest_rejected_unknown_product',

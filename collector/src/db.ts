@@ -12,11 +12,12 @@
 // another's for the same day, and that is a data-loss bug, not a theoretical
 // one.
 //
-// `schema_version` records the version the payload arrived as ON THE WIRE
-// (1 or 2). `payload` is ALWAYS the normalized v2 document. That split is what
-// gives the read path one shape to handle while keeping durable evidence of
-// how many installs are still on v1 — which is the number the support-window
-// decision actually needs.
+// `schema_version` records which heartbeat schema the stored `payload` is.
+// There is exactly one, so today the column only ever holds 1. It is kept
+// because it is the durable evidence a future second schema would need: a
+// store whose rows cannot say what shape they are is a store that has to guess.
+// Nothing is normalized on the way in or at rest — a document is stored as the
+// validator accepted it.
 //
 // Privacy properties, all schema-level rather than promises:
 //   • NO IP COLUMN ANYWHERE. The rate limiter's per-source state is in-memory

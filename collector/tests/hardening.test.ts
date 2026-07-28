@@ -12,7 +12,7 @@ import { describe, expect, test } from 'bun:test';
 import { addressKey, parseTrustedProxies } from '../src/ip';
 import { resolveSourceKey, TokenBucketLimiter } from '../src/throttle';
 import { getReq, ingestReq, makeHarness } from './helpers';
-import { INSTANCE_A, INSTANCE_B, INSTANCE_C, makeV2, SECRET_A, SECRET_B, SECRET_C } from './fixtures';
+import { INSTANCE_A, INSTANCE_B, INSTANCE_C, makeHeartbeat, SECRET_A, SECRET_B, SECRET_C } from './fixtures';
 
 describe('per-source throttle', () => {
   test('a bucket exhausts => 429, refills over a minute, and other sources are unaffected', async () => {
@@ -20,28 +20,28 @@ describe('per-source throttle', () => {
     const a = h.serverFor('198.51.100.7');
     const b = h.serverFor('203.0.113.9');
 
-    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A), a)).status).toBe(202);
-    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-08'), SECRET_A), a)).status).toBe(202);
-    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-07'), SECRET_A), a)).status).toBe(429);
-    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_B), SECRET_B), b)).status).toBe(202);
+    expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A), a)).status).toBe(202);
+    expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A, '2026-07-08'), SECRET_A), a)).status).toBe(202);
+    expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A, '2026-07-07'), SECRET_A), a)).status).toBe(429);
+    expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_B), SECRET_B), b)).status).toBe(202);
 
     h.advanceMs(61_000);
-    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-06'), SECRET_A), a)).status).toBe(202);
+    expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A, '2026-07-06'), SECRET_A), a)).status).toBe(202);
   });
 
   test('the secret-presence check precedes the limiter, so keyless floods cost no tokens', async () => {
     const h = makeHarness({ rateLimitPerMin: 1 });
     const a = h.serverFor('198.51.100.7');
-    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A), a)).status).toBe(202);
-    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A), a)).status).toBe(429);
-    const keyless = await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A)), a);
+    expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A), a)).status).toBe(202);
+    expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A), a)).status).toBe(429);
+    const keyless = await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A)), a);
     expect(keyless.status).toBe(403);
     expect(await keyless.json()).toEqual({ ok: false, error: 'write_key_mismatch' });
   });
 
   test('the limiter does not mask an authorization failure', async () => {
     const h = makeHarness({ rateLimitPerMin: 2 });
-    const r = await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_B), h.serverFor('198.51.100.7'));
+    const r = await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_B), h.serverFor('198.51.100.7'));
     expect(r.status).toBe(403);
   });
 });
@@ -181,7 +181,7 @@ describe('the trusted-proxy model', () => {
     const h = makeHarness({ rateLimitPerMin: 1, trustedProxyHops: 1, trustedProxies: ['10.0.0.0/8'] });
     const proxy = h.serverFor('10.0.0.1');
     const asClient = (id: string, secret: string, client: string, day: string) =>
-      h.handler(ingestReq(makeV2('brokkr', id, day), secret, { 'x-forwarded-for': client }), proxy);
+      h.handler(ingestReq(makeHeartbeat('brokkr', id, day), secret, { 'x-forwarded-for': client }), proxy);
 
     expect((await asClient(INSTANCE_A, SECRET_A, '203.0.113.9', '2026-07-09')).status).toBe(202);
     expect((await asClient(INSTANCE_A, SECRET_A, '203.0.113.9', '2026-07-08')).status).toBe(429);
@@ -194,7 +194,7 @@ describe('the trusted-proxy model', () => {
     const h = makeHarness({ rateLimitPerMin: 1, trustedProxyHops: 1, trustedProxies: ['10.0.0.0/8'] });
     const direct = h.serverFor('198.51.100.7'); // NOT one of the operator's proxies
     const spoof = (id: string, secret: string, client: string, day: string) =>
-      h.handler(ingestReq(makeV2('brokkr', id, day), secret, { 'x-forwarded-for': client }), direct);
+      h.handler(ingestReq(makeHeartbeat('brokkr', id, day), secret, { 'x-forwarded-for': client }), direct);
 
     expect((await spoof(INSTANCE_A, SECRET_A, '1.1.1.1', '2026-07-09')).status).toBe(202);
     expect((await spoof(INSTANCE_B, SECRET_B, '2.2.2.2', '2026-07-09')).status).toBe(429);
@@ -204,7 +204,7 @@ describe('the trusted-proxy model', () => {
     const h = makeHarness({ rateLimitPerMin: 1 });
     const peer = h.serverFor('10.0.0.1');
     const spoof = (id: string, secret: string, client: string, day: string) =>
-      h.handler(ingestReq(makeV2('brokkr', id, day), secret, { 'x-forwarded-for': client }), peer);
+      h.handler(ingestReq(makeHeartbeat('brokkr', id, day), secret, { 'x-forwarded-for': client }), peer);
 
     expect((await spoof(INSTANCE_A, SECRET_A, '1.1.1.1', '2026-07-09')).status).toBe(202);
     expect((await spoof(INSTANCE_B, SECRET_B, '2.2.2.2', '2026-07-09')).status).toBe(429);
@@ -216,47 +216,47 @@ describe('new-identity admission', () => {
     const h = makeHarness({ rateLimitPerMin: 1000, newInstancePerSourcePerHour: 1 });
     const src = h.serverFor('198.51.100.7');
 
-    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A), src)).status).toBe(202);
+    expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A), src)).status).toBe(202);
     // Second FRESH identity from the same source is refused...
-    const second = await h.handler(ingestReq(makeV2('brokkr', INSTANCE_B), SECRET_B), src);
+    const second = await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_B), SECRET_B), src);
     expect(second.status).toBe(429);
     expect(await second.json()).toEqual({ ok: false, error: 'rate_limited' });
     expect(h.counters.get('ingest_rejected_new_instance_source_limit')).toBe(1);
     // ...while the identity already established from that source keeps going.
     expect(
-      (await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-08'), SECRET_A), src)).status,
+      (await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A, '2026-07-08'), SECRET_A), src)).status,
     ).toBe(202);
     // ...and a different source is unaffected.
     expect(
-      (await h.handler(ingestReq(makeV2('brokkr', INSTANCE_B), SECRET_B), h.serverFor('203.0.113.9'))).status,
+      (await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_B), SECRET_B), h.serverFor('203.0.113.9'))).status,
     ).toBe(202);
   });
 
   test('the mint budget refills over an hour, not a minute', async () => {
     const h = makeHarness({ rateLimitPerMin: 1000, newInstancePerSourcePerHour: 1 });
     const src = h.serverFor('198.51.100.7');
-    await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A), src);
-    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_B), SECRET_B), src)).status).toBe(429);
+    await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A), src);
+    expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_B), SECRET_B), src)).status).toBe(429);
     h.advanceMs(61_000);
-    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_B), SECRET_B), src)).status).toBe(429);
+    expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_B), SECRET_B), src)).status).toBe(429);
     h.advanceMs(3_600_000);
-    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_B), SECRET_B), src)).status).toBe(202);
+    expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_B), SECRET_B), src)).status).toBe(202);
   });
 
   test('the absolute ceiling refuses unseen identities and never established ones', async () => {
     const h = makeHarness({ maxInstances: 1 });
-    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A))).status).toBe(202);
-    const r = await h.handler(ingestReq(makeV2('brokkr', INSTANCE_B), SECRET_B));
+    expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A))).status).toBe(202);
+    const r = await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_B), SECRET_B));
     expect(r.status).toBe(429);
     expect(await r.json()).toEqual({ ok: false, error: 'instance_capacity' });
     expect(h.counters.get('ingest_rejected_instance_capacity')).toBe(1);
-    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-08'), SECRET_A))).status).toBe(202);
+    expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A, '2026-07-08'), SECRET_A))).status).toBe(202);
   });
 
   test('the global daily budget bounds the mint rate and reports separately from the ceiling', async () => {
     const h = makeHarness({ maxInstances: 100, newInstancesPerDay: 1, newInstancePerSourcePerHour: 100 });
-    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A))).status).toBe(202);
-    const r = await h.handler(ingestReq(makeV2('brokkr', INSTANCE_B), SECRET_B), h.serverFor('203.0.113.9'));
+    expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A))).status).toBe(202);
+    const r = await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_B), SECRET_B), h.serverFor('203.0.113.9'));
     expect(r.status).toBe(429);
     // Same wire answer as the ceiling — operators get the distinction, callers
     // do not.
@@ -267,15 +267,15 @@ describe('new-identity admission', () => {
     // A new day restores it — this is what makes the exhaustion bounded rather
     // than permanent.
     h.setToday('2026-07-10');
-    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_B, '2026-07-10'), SECRET_B))).status).toBe(202);
+    expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_B, '2026-07-10'), SECRET_B))).status).toBe(202);
   });
 
   test('admission is checked AFTER identity, so it cannot be used as an existence oracle', async () => {
     const h = makeHarness({ maxInstances: 1 });
-    await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A));
+    await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A));
     // Wrong secret at a full collector answers 403, not 429 — the caller
     // learns nothing about capacity or about which ids exist.
-    const r = await h.handler(ingestReq(makeV2('brokkr', INSTANCE_B), SECRET_A));
+    const r = await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_B), SECRET_A));
     expect(r.status).toBe(403);
     expect(h.counters.get('ingest_rejected_identity_mismatch')).toBe(1);
     expect(h.counters.get('ingest_rejected_instance_capacity')).toBe(0);
@@ -320,7 +320,7 @@ describe('authenticated reads and deletes are throttled too', () => {
   test('a flood of authenticated reads from one source exhausts its bucket', async () => {
     const h = makeHarness({ rateLimitPerMin: 2 });
     const src = h.serverFor('198.51.100.7');
-    await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A), src);
+    await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A), src);
 
     const read = () =>
       h.handler(
@@ -354,7 +354,7 @@ describe('authenticated reads and deletes are throttled too', () => {
     expect((await read()).status).toBe(404);
     expect((await read()).status).toBe(429); // read budget spent
     // ...and ingest from that same source is untouched.
-    expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A), src)).status).toBe(202);
+    expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A), src)).status).toBe(202);
   });
 
   test('a flood of no-op deletes from one source exhausts its bucket', async () => {
@@ -378,7 +378,7 @@ describe('authenticated reads and deletes are throttled too', () => {
   test('the throttle sits AFTER the identity proof, so it cannot mask a 403', async () => {
     const h = makeHarness({ rateLimitPerMin: 1 });
     const src = h.serverFor('198.51.100.7');
-    await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A), src); // spends the token
+    await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A), src); // spends the token
     // An unauthenticated caller still gets 403, not 429 — the answer must not
     // depend on someone else's traffic.
     const r = await h.handler(
@@ -437,9 +437,9 @@ describe('the operator metrics surface', () => {
 
   test('the operator key grants NO data access — only counters', async () => {
     const h = makeHarness({ opsKey: 'ops-secret' });
-    await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A));
+    await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A));
     // It is not a write credential...
-    const write = await h.handler(ingestReq(makeV2('brokkr', INSTANCE_B), 'ops-secret'));
+    const write = await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_B), 'ops-secret'));
     expect(write.status).toBe(403);
     // ...nor a read one.
     const read = await h.handler(
@@ -452,7 +452,7 @@ describe('the operator metrics surface', () => {
 
   test('the snapshot carries every counter, the store gauges, and the migration report', async () => {
     const h = makeHarness({ opsKey: 'ops-secret' });
-    await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A));
+    await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A));
     await h.handler(ingestReq('{{{', SECRET_A));
 
     const body = await (await h.handler(getReq('/metrics', { 'x-mythical-ops-key': 'ops-secret' }))).json() as any;
@@ -463,14 +463,17 @@ describe('the operator metrics surface', () => {
     expect(body.store.new_instances_today).toBe(1);
     expect(body.throttle.trusted_proxy_hops).toBe(0);
     expect(body.migration.createdFresh).toBe(true);
-    expect(body.accept_wire_v1).toBe(true);
+    // No wire-version gauge exists: there is one schema, so there is nothing
+    // for an operator to switch on or watch drain.
+    expect(body).not.toHaveProperty('accept_wire_v1');
+    expect(Object.keys(body.counters).filter((k) => /wire_v|window_closed/.test(k))).toEqual([]);
     // No installation identity appears anywhere in it.
     expect(JSON.stringify(body)).not.toContain(INSTANCE_A);
   });
 
   test('the metrics response never contains an address', async () => {
     const h = makeHarness({ opsKey: 'ops-secret' });
-    await h.handler(ingestReq(makeV2('brokkr', INSTANCE_C), SECRET_C), h.serverFor('198.51.100.7'));
+    await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_C), SECRET_C), h.serverFor('198.51.100.7'));
     const text = await (await h.handler(getReq('/metrics', { 'x-mythical-ops-key': 'ops-secret' }))).text();
     expect(text).not.toContain('198.51.100.7');
   });

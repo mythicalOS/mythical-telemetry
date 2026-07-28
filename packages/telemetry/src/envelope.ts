@@ -1,11 +1,11 @@
-// The v2 envelope + THE canonical runtime validator.
+// The heartbeat envelope + THE canonical runtime validator.
 //
 // There is exactly ONE runtime validator in this repo and this is it. The collector imports it
 // from here rather than keeping its own: the class of defect this package exists to prevent is
 // client/collector drift, and two hand-maintained validators are two chances to disagree about
 // what a payload means. A mismatch is silently harmful in both directions.
 //
-// It is hand-written rather than derived from heartbeat.v2.json ON PURPOSE — a validator generated
+// It is hand-written rather than derived from heartbeat.v1.json ON PURPOSE — a validator generated
 // from the schema could not disagree with it, so the lockstep test would prove nothing. The
 // lockstep test compares this independent implementation against the JSON Schema over a corpus of
 // valid documents and systematic mutations, and against real emitter output.
@@ -14,7 +14,7 @@
 
 import { MODEL_ID_ALLOWLIST, MODEL_OTHER } from "./model-id-allowlist.ts";
 
-export const SCHEMA_VERSION = 2 as const;
+export const SCHEMA_VERSION = 1 as const;
 
 export const PRODUCT_NAMES = ["brokkr", "saga", "skuld"] as const;
 export type ProductName = (typeof PRODUCT_NAMES)[number];
@@ -51,8 +51,8 @@ export interface BrokkrMetrics {
   tokens: { input: number; cache_read: number; cache_creation: number; output: number };
   review: { runs: number };
   /**
-   * `classes` is a closed taxonomy whose members are OPTIONAL — that is how the frozen v1 section
-   * is written and it is ported verbatim. Our builders always emit `session_failed`; a document
+   * `classes` is a closed taxonomy whose members are OPTIONAL — that is how the frozen section is
+   * written. Our builders always emit `session_failed`; a document
    * from elsewhere may omit it, and a consumer must read it as `?? 0` rather than assume it.
    */
   errors: { classes: { session_failed?: number } };
@@ -310,7 +310,7 @@ function validateBrokkr(c: Checker, raw: unknown): void {
   const errors = c.object(m.errors, "metrics.errors", ["classes"]);
   if (errors !== undefined) {
     // `errors.classes` is a CLOSED key taxonomy that declares no `required` list — that is how the
-    // frozen v1 section is written, and it is ported verbatim. So `{}` is a valid classes object
+    // frozen section is written. So `{}` is a valid classes object
     // and an absent class reads as zero. Requiring the key here would reject documents the schema
     // accepts, which is precisely the drift the lockstep test exists to catch.
     const classes = c.object(errors.classes, "metrics.errors.classes", ["session_failed"], { requireAll: false });
@@ -415,7 +415,7 @@ function validateSkuld(c: Checker, raw: unknown): void {
 }
 
 /**
- * THE canonical runtime validator for a v2 heartbeat. Structural + closed-set + cross-field.
+ * THE canonical runtime validator for a heartbeat. Structural + closed-set + cross-field.
  *
  * Returns every error it finds rather than the first, so an operator's rejected payload produces
  * an actionable message instead of a guessing game.
@@ -451,7 +451,7 @@ export function validateHeartbeat(value: unknown): ValidationResult<Heartbeat> {
   return { ok: true, value: value as Heartbeat };
 }
 
-/** True iff the value is a valid v2 heartbeat. */
+/** True iff the value is a valid heartbeat. */
 export function isHeartbeat(value: unknown): value is Heartbeat {
   return validateHeartbeat(value).ok;
 }

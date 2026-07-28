@@ -29,7 +29,6 @@ export interface HarnessOptions {
   maxInstances?: number;
   newInstancesPerDay?: number;
   minAggregateCell?: number;
-  acceptWireV1?: boolean;
   opsKey?: string | null;
   schemaJson?: string | null;
   validator?: HeartbeatValidator;
@@ -56,7 +55,6 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
     trustedProxyHops: opts.trustedProxyHops,
     trustedProxies: opts.trustedProxies,
     minAggregateCell: opts.minAggregateCell ?? 1,
-    acceptWireV1: opts.acceptWireV1,
     opsKey: opts.opsKey ?? null,
     nowUtcDay: () => today,
     nowMs: () => ms,
@@ -81,7 +79,7 @@ export function ingestReq(payload: unknown, secret?: string, headers: Record<str
   });
 }
 
-/** Ingest using the historical header name, as a v1 client would. */
+/** Ingest using the historical header name, as an older client would. */
 export function legacyIngestReq(payload: unknown, secret: string): Request {
   return new Request('http://telemetry.local/v1/ingest', {
     method: 'POST',

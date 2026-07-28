@@ -81,7 +81,7 @@ const CONFIG: BrokkrConfigView = {
 
 function wrap(product: "brokkr" | "saga" | "skuld", metrics: unknown): unknown {
   return {
-    schema_version: 2,
+    schema_version: 1,
     instance_id: FIXTURE_INSTANCE_ID,
     day: FIXTURE_DAY,
     product: { name: product, version: "1.0.0" },

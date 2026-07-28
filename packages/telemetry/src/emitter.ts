@@ -19,6 +19,7 @@ import {
   normalizePlatform,
   utcDayOf,
   validateHeartbeat,
+  SCHEMA_VERSION,
   type Heartbeat,
   type ProductMetrics,
   type ProductName,
@@ -112,7 +113,7 @@ export class HeartbeatEmitter<P extends ProductName> {
     const platform = this.deps.platform ?? { os: process.platform, arch: process.arch };
     const normalized = normalizePlatform(platform.os, platform.arch);
     return {
-      schema_version: 2,
+      schema_version: SCHEMA_VERSION,
       instance_id: instanceId,
       day,
       product: { name: this.deps.product, version: normalizeProductVersion(this.deps.version) },

@@ -6,7 +6,7 @@
 import { describe, expect, test } from 'bun:test';
 import { renderAggregatePage, escapeHtml } from '../src/page';
 import { getReq, ingestReq, makeHarness } from './helpers';
-import { INSTANCE_A, INSTANCE_B, INSTANCE_C, makeV2, SECRET_A, SECRET_B, SECRET_C } from './fixtures';
+import { INSTANCE_A, INSTANCE_B, INSTANCE_C, makeHeartbeat, SECRET_A, SECRET_B, SECRET_C } from './fixtures';
 
 const IDS = [
   [INSTANCE_A, SECRET_A],
@@ -16,7 +16,7 @@ const IDS = [
 
 async function seed(h: ReturnType<typeof makeHarness>, product: 'brokkr' | 'saga' | 'skuld', n: number) {
   for (const [id, secret] of IDS.slice(0, n)) {
-    expect((await h.handler(ingestReq(makeV2(product, id), secret))).status).toBe(202);
+    expect((await h.handler(ingestReq(makeHeartbeat(product, id), secret))).status).toBe(202);
   }
 }
 

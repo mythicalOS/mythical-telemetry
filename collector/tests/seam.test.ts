@@ -76,7 +76,7 @@ describe('loadCanonicalValidator — wired to the real thing', () => {
 
   test('REJECTS an invalid payload, and reports it as schema-invalid rather than a validator fault', async () => {
     const validator = await loadCanonicalValidator();
-    const result = validator.validate({ schema_version: 2, nonsense: true });
+    const result = validator.validate({ schema_version: 1, nonsense: true });
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error('unreachable');
     // The server splits its rejection counters on this prefix: `validator_*`
@@ -93,7 +93,7 @@ describe('loadCanonicalValidator — wired to the real thing', () => {
     // constant rather than adapted through. The package removed an equivalent
     // field after it was bypassed four separate ways; this keeps it closed.
     const marker = 'zzattackerpropzz';
-    const result = validator.validate({ schema_version: 2, [marker]: 1 });
+    const result = validator.validate({ schema_version: 1, [marker]: 1 });
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error('unreachable');
     expect(result.error).not.toContain(marker);
@@ -103,7 +103,7 @@ describe('loadCanonicalValidator — wired to the real thing', () => {
 
 describe('safeValidate — the collector never trusts the injected validator to behave', () => {
   const valid = {
-    schema_version: 2 as const,
+    schema_version: 1 as const,
     instance_id: INSTANCE_A,
     day: '2026-07-09',
     product: { name: 'brokkr', version: '0.1.0' },

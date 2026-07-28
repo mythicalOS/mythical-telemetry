@@ -11,7 +11,7 @@ export const FIXTURE_DAY = "2026-07-26";
 
 export function brokkrFixture(): BrokkrHeartbeat {
   return {
-    schema_version: 2,
+    schema_version: 1,
     instance_id: FIXTURE_INSTANCE_ID,
     day: FIXTURE_DAY,
     product: { name: "brokkr", version: "0.1.37" },
@@ -43,7 +43,7 @@ export function brokkrFixture(): BrokkrHeartbeat {
 
 export function sagaFixture(): SagaHeartbeat {
   return {
-    schema_version: 2,
+    schema_version: 1,
     instance_id: FIXTURE_INSTANCE_ID,
     day: FIXTURE_DAY,
     product: { name: "saga", version: "0.3.0" },
@@ -62,7 +62,7 @@ export function sagaFixture(): SagaHeartbeat {
 
 export function skuldFixture(): SkuldHeartbeat {
   return {
-    schema_version: 2,
+    schema_version: 1,
     instance_id: FIXTURE_INSTANCE_ID,
     day: FIXTURE_DAY,
     product: { name: "skuld", version: "0.2.1" },
