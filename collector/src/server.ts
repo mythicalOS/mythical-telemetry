@@ -485,7 +485,12 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
     if (daysParam !== null) {
       if (!/^\d+$/.test(daysParam)) return json(400, { ok: false, error: 'invalid_request' });
       const n = Number(daysParam);
-      if (n < 1 || n > 400) return json(400, { ok: false, error: 'invalid_request' });
+      // Capped at the CONFIGURED retention rather than a second hardcoded
+      // number: the window a caller may ask for and the window we actually keep
+      // are the same fact, and two literals would drift the moment one moved.
+      // Accepting `days` beyond retention would promise a window that cannot be
+      // satisfied and quietly return a shorter one.
+      if (n < 1 || n > db.retentionDays) return json(400, { ok: false, error: 'invalid_request' });
       recentDays = n;
     }
 

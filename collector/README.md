@@ -69,7 +69,7 @@ open to anyone holding the id, and the unauthenticated per-installation page tha
 | Route | Method | Auth | Notes |
 |---|---|---|---|
 | `/v1/ingest` | POST | instance secret | 32 KB body cap; day window (≤ today UTC, ≥ today−30); upsert per (instance, product, day), last write wins; `202 {ok:true}` |
-| `/v1/instances/<uuid>/stats?product=<name>` | GET | instance secret | that installation's own days, totals and per-day rates; optional `&days=N` (1–400) |
+| `/v1/instances/<uuid>/stats?product=<name>` | GET | instance secret | that installation's own days, totals and per-day rates; optional `&days=N` (1 – the configured retention, 90 by default) |
 | `/v1/instances/<uuid>` | DELETE | instance secret | purges the identity across **every** product; idempotent `204` |
 
 Every authenticated route is per-source throttled. Anyone can mint a valid (secret, id) pair, so an
@@ -384,7 +384,7 @@ volumes:
 | `MYTHICAL_TELEMETRY_NEW_INSTANCE_PER_SOURCE_PER_HOUR` | `20` | per-source budget for FRESH identities |
 | `MYTHICAL_TELEMETRY_NEW_INSTANCES_PER_DAY` | `5000` | global daily budget for fresh identities (0 disables) |
 | `MYTHICAL_TELEMETRY_MAX_INSTANCES` | `100000` | absolute ceiling on stored identities |
-| `MYTHICAL_TELEMETRY_RETENTION_DAYS` | `400` | per-(instance, product) row cap, pruned daily. **Must be ≥ 1** — the service refuses to start at 0, which would delete every heartbeat on the next prune |
+| `MYTHICAL_TELEMETRY_RETENTION_DAYS` | `90` | per-(instance, product) row cap, pruned daily. **Must be ≥ 1** — the service refuses to start at 0, which would delete every heartbeat on the next prune |
 | `MYTHICAL_TELEMETRY_TRUSTED_PROXY_HOPS` | `0` | proxies in the chain; 0 = never trust `X-Forwarded-For` |
 | `MYTHICAL_TELEMETRY_TRUSTED_PROXIES` | *(unset)* | which peers those are: comma-separated addresses/CIDRs. **Required** when hops > 0; the service refuses to start otherwise |
 | `MYTHICAL_TELEMETRY_MIN_AGGREGATE_CELL` | `5` | small-cell floor for the public aggregate |

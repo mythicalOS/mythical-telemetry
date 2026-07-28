@@ -7,6 +7,7 @@
 // exists to keep that from coming back.
 
 import { describe, expect, test } from 'bun:test';
+import { DEFAULT_RETENTION_DAYS } from '../src/db';
 import { foldRates, foldTotals, type TotalsValue } from '../src/totals';
 import { ingestReq, makeHarness, statsReq } from './helpers';
 import { INSTANCE_A, makeHeartbeat, SECRET_A } from './fixtures';
@@ -211,8 +212,8 @@ describe('stats: temporal classes', () => {
 });
 
 describe('stats: window trimming', () => {
-  async function seedThreeDays() {
-    const h = makeHarness();
+  async function seedThreeDays(opts?: Parameters<typeof makeHarness>[0]) {
+    const h = makeHarness(opts);
     const days = ['2026-07-07', '2026-07-08', '2026-07-09'];
     const counts = [10, 5, 3];
     for (const [i, day] of days.entries()) {
@@ -243,13 +244,32 @@ describe('stats: window trimming', () => {
 
   test('?days out of range or malformed => 400, and never reveals anything', async () => {
     const h = await seedThreeDays();
-    for (const bad of ['0', '401', 'abc', '-1', '1.5', '']) {
+    // The upper bound is the CONFIGURED retention, not a literal: a caller may
+    // ask for exactly the window we keep and no more. Deriving both edges from
+    // DEFAULT_RETENTION_DAYS means changing the retention cannot leave this
+    // test asserting a boundary the service no longer has — which is precisely
+    // what happened when retention moved from 400 to 90 and this line still
+    // said 400.
+    const overRetention = String(DEFAULT_RETENTION_DAYS + 1);
+    for (const bad of ['0', overRetention, 'abc', '-1', '1.5', '']) {
       const r = await h.handler(statsReq(INSTANCE_A, 'brokkr', { secret: SECRET_A, days: bad }));
       expect(r.status, bad).toBe(400);
       expect(await r.json()).toEqual({ ok: false, error: 'invalid_request' });
     }
     expect((await h.handler(statsReq(INSTANCE_A, 'brokkr', { secret: SECRET_A, days: '1' }))).status).toBe(200);
-    expect((await h.handler(statsReq(INSTANCE_A, 'brokkr', { secret: SECRET_A, days: '400' }))).status).toBe(200);
+    expect(
+      (await h.handler(statsReq(INSTANCE_A, 'brokkr', { secret: SECRET_A, days: String(DEFAULT_RETENTION_DAYS) })))
+        .status,
+    ).toBe(200);
+  });
+
+  test('the days cap TRACKS retention rather than a hardcoded number', async () => {
+    // A collector configured with a shorter retention must refuse a longer
+    // window. Without this, the cap and the retention are two independent
+    // literals and nothing notices when they disagree.
+    const h = await seedThreeDays({ retentionDays: 7 });
+    expect((await h.handler(statsReq(INSTANCE_A, 'brokkr', { secret: SECRET_A, days: '7' }))).status).toBe(200);
+    expect((await h.handler(statsReq(INSTANCE_A, 'brokkr', { secret: SECRET_A, days: '8' }))).status).toBe(400);
   });
 
   test('a bad ?days from an UNAUTHENTICATED caller is still 403 — auth is checked first', async () => {

@@ -33,7 +33,18 @@
 import { Database, type Statement } from 'bun:sqlite';
 import { migrate, type MigrationReport } from './migrate';
 
-export const DEFAULT_RETENTION_DAYS = 400;
+/**
+ * How many daily rows are kept per (instance, product) before the oldest are
+ * pruned. 90 days is a DECLARED privacy commitment, not a capacity tuning knob
+ * — the published notice states this number, so lengthening it silently would
+ * make that notice false. Change it only alongside the notice.
+ *
+ * The trade was made deliberately: 400 days would allow year-on-year comparison,
+ * 90 does not. The shorter window was chosen because it also makes the opt-out
+ * honest — telemetry off stops collection and everything already held expires
+ * within a quarter, which is a sentence worth being able to write.
+ */
+export const DEFAULT_RETENTION_DAYS = 90;
 export const DEFAULT_MAX_INSTANCES = 100_000;
 export const DEFAULT_NEW_INSTANCES_PER_DAY = 5_000;
 
