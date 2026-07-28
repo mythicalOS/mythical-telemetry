@@ -51,13 +51,12 @@ never carried to a new destination.
 
 ## Collector compatibility
 
-The central collector accepts both **v1** and **v2** payloads for a stated support window, so
-an installation pinned to an older client keeps working. *(Window length: to be published here
-before the first release — gate G15.)*
+There is **one** heartbeat schema and one wire shape. There is no version negotiation, no
+support window, and nothing to migrate — no ingest has ever received a payload, so no older
+shape is in service anywhere.
 
 An operator's own collector must be at least the minimum version stated in the client's release
-notes. A copy always sends v2; there is no version negotiation, and a version rejection
-surfaces as an actionable delivery error rather than silent loss.
+notes. A version rejection surfaces as an actionable delivery error rather than silent loss.
 
 ## Development
 

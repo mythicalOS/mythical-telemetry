@@ -1,7 +1,7 @@
 {
   "name": "@mythicalos/telemetry",
   "version": "0.1.0",
-  "description": "The shared mythicalOS heartbeat client: the frozen v2 envelope and per-product bodies, the canonical runtime validator, derived instance identity, consent state with provenance, and an SSRF-isolated dual-send transport. Pseudonymous by design and honest about it. Apache-2.0.",
+  "description": "The shared mythicalOS heartbeat client: the frozen envelope and per-product bodies, the canonical runtime validator, derived instance identity, consent state with provenance, and an SSRF-isolated dual-send transport. Pseudonymous by design and honest about it. Apache-2.0.",
   "type": "module",
   "license": "Apache-2.0",
   "publishConfig": {
@@ -25,7 +25,6 @@
       "types": "./src/index.ts",
       "default": "./src/index.ts"
     },
-    "./schema/heartbeat.v2.json": "./schema/heartbeat.v2.json",
     "./schema/heartbeat.v1.json": "./schema/heartbeat.v1.json",
     "./schema/field-classes.json": "./schema/field-classes.json"
   },

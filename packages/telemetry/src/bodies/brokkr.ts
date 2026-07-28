@@ -1,4 +1,4 @@
-// The brokkr body — v1's ten sections, unchanged, now under `metrics`.
+// The brokkr body — its ten sections, under `metrics`.
 //
 // This product already produces COMPLETED-DAY deltas, so it needs no delta normalisation; its
 // rollup folds are the producer. What this builder owns is the string and range discipline that

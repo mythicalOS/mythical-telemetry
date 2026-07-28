@@ -1,8 +1,8 @@
 // Per-product totals for the authenticated per-install read (gate G5).
 //
-// The pre-v2 collector folded brokkr's `sessions`, `spine` and `models` as if
-// they were top-level facts about every payload. Under v2 they live under
-// `metrics`, and saga and skuld do not have them at all — so that fold does
+// An earlier collector folded brokkr's `sessions`, `spine` and `models` as if
+// they were top-level facts about every payload. They live under `metrics`,
+// and saga and skuld do not have them at all — so that fold does
 // not merely produce wrong numbers for another product, it dereferences absent
 // objects and 500s. This file replaces it with a declarative, total fold:
 //

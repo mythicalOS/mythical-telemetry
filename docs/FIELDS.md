@@ -1,11 +1,11 @@
-# What the heartbeat carries — the v2 field contract
+# What the heartbeat carries — the field contract
 
 This is the authoritative list of every field a mythicalOS product may send. It is the
 **G4 sign-off artifact**: each leaf names the producer that generates it, its value class, and
 its temporal class. Nothing outside this list is emitted, and the schema rejects undeclared
 fields structurally.
 
-Read this alongside `packages/telemetry/schema/heartbeat.v2.json` (the machine-checked form)
+Read this alongside `packages/telemetry/schema/heartbeat.v1.json` (the machine-checked form)
 and `packages/telemetry/schema/field-classes.json` (the manifest CI validates against).
 
 ## The rules this list obeys
@@ -13,7 +13,7 @@ and `packages/telemetry/schema/field-classes.json` (the manifest CI validates ag
 1. **Counts, buckets, booleans, enums and version strings only.** No names, paths, hostnames,
    emails, prompts, source, SQL, job names, database/schema/table names, or identifiers of any
    kind — for any product.
-2. **Temporal class is `delta` or `gauge`. `cumulative` is not a valid class on any v2 leaf.**
+2. **Temporal class is `delta` or `gauge`. `cumulative` is not a valid class on any leaf.**
    Products holding lifetime counters normalise to per-day deltas *at the emitter* before the
    value reaches the wire (see "Delta normalisation" below).
 3. **Gauges mean "last sample of the day wins."** A multi-day window reads the latest sample
@@ -27,11 +27,11 @@ and `packages/telemetry/schema/field-classes.json` (the manifest CI validates ag
 
 | Field | Class | Temporal | Producer | Notes |
 |---|---|---|---|---|
-| `schema_version` | `version` | — | constant `2` | |
+| `schema_version` | `version` | — | constant `1` | There is one heartbeat schema; a second would be a new file and a new number, never a widening of this one. |
 | `instance_id` | — | — | `deriveInstanceId(secret)` | UUIDv4 *format*, derived as `sha256(secret utf-8)[0..16]` with v4 version nibble + variant bits stamped. **Per product** — the three products never share one (gate G1a). |
 | `day` | — | — | emitter | `YYYY-MM-DD`, UTC. |
 | `product.name` | `enum` | — | constant per product | `brokkr` \| `saga` \| `skuld`. Closed set; this is the discriminator. |
-| `product.version` | `version` | — | package version | Renamed from v1's `product.daemon_version`. |
+| `product.version` | `version` | — | package version | |
 | `platform.os` | `enum` | gauge | `process.platform` | `darwin` \| `linux` \| `win32` \| `other`. |
 | `platform.arch` | `enum` | gauge | `process.arch` | `arm64` \| `x64` \| `other`. |
 | `metrics` | — | — | per product | Discriminated on `product.name`; the three bodies below. |
@@ -81,10 +81,8 @@ inflated row never ages out of a lifetime average.
 
 ## `brokkr` body
 
-**v1's ten sections, moved verbatim under `metrics`.** No leaf is added, removed, renamed or
-reclassified — the only change from v1 is the nesting and the `product.daemon_version` →
-`product.version` rename in the envelope. Port them from `heartbeat.v1.json` rather than
-retyping.
+**Ten sections under `metrics`,** pinned as a set by the lockstep test so a leaf cannot be
+added, removed, renamed or reclassified without the build saying so.
 
 Sections: `config`, `features`, `sessions`, `context_fill`, `mode_split`, `spine`, `models`,
 `tokens`, `review`, `errors`.
@@ -127,9 +125,9 @@ CODE only — never an error message.** `MISSING_CREDENTIAL` maps to `auth_faile
 the host, but that is the class an operator would act on); `TLS_FAILED` maps to `other`, not
 `unreachable`, because TCP did connect and "unreachable" would be false.
 
-`connections.by_engine` **supersedes** v1's `engines_used` booleans — a count per engine family
-is strictly more informative and no less safe, and it is derivable from the registry today with
-no new instrumentation. Engine family is a closed set; an unrecognised engine is not emitted.
+`connections.by_engine` is a count per engine family rather than a set of `engines_used`
+booleans — strictly more informative and no less safe, and derivable from the registry today
+with no new instrumentation. Engine family is a closed set; an unrecognised engine is not emitted.
 
 **Database size buckets are NOT in this list.** The plan's §4 target named them, but no producer
 exists and adding one means reading per-database size — a step toward per-database granularity

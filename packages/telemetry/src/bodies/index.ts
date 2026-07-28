@@ -4,7 +4,7 @@
 // WHY NORMALISATION LIVES HERE AND NOT IN THE COLLECTOR. Two products hold LIFETIME counters:
 // `runs_total` reading 100 → 105 → 110 over three days sums to 315 if the collector treats each
 // row as a daily figure, when the truth is 10. The wire therefore carries per-day deltas only —
-// `cumulative` is not a legal temporal class on any v2 leaf.
+// `cumulative` is not a legal temporal class on any leaf.
 //
 // The load-bearing case is a counter that went BACKWARDS. Only the producer can tell a process
 // restart (the counter began again from zero, and the new value IS the day's activity) from a

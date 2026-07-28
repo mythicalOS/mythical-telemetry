@@ -36,7 +36,9 @@ describe("validateHeartbeat — the canonical runtime validator", () => {
   });
 
   test("rejects a wrong schema_version", () => {
-    expect(errorsOf({ ...brokkrFixture(), schema_version: 1 }).join(" ")).toContain("schema_version");
+    for (const wrong of [0, 2, "1", null, undefined]) {
+      expect(errorsOf({ ...brokkrFixture(), schema_version: wrong }).join(" ")).toContain("schema_version");
+    }
   });
 
   test("rejects an instance_id that is not the pinned UUIDv4 grammar", () => {

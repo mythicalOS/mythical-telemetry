@@ -26,8 +26,11 @@ Three privacy properties are **schema-level**, not promises in a code comment:
 - **`received_day` is day granularity.** An exact receive timestamp would fingerprint an
   installation's check-in cadence.
 
-`schema_version` records the version the payload arrived as **on the wire**; `payload` is always
-the normalized v2 document.
+`schema_version` records which heartbeat schema the stored `payload` is. There is exactly one, so
+today it only ever holds `1`. The column stays because it is the durable evidence a future second
+schema would need — a store whose rows cannot say what shape they are is a store that has to guess.
+Nothing is normalized on the way in or at rest: a document is stored exactly as the validator
+accepted it.
 
 ### It is pseudonymous, not anonymous
 
@@ -59,13 +62,13 @@ open to anyone holding the id, and the unauthenticated per-installation page tha
 | Header | Meaning |
 |---|---|
 | `X-Mythical-Instance-Secret` | the installation secret — canonical name |
-| `X-Mythical-Write-Key` | the same credential under its historical name; still accepted so older clients keep working. When both are present the canonical one wins. |
+| `X-Mythical-Write-Key` | the same credential under its historical name; still accepted so a client built against the older name keeps working. When both are present the canonical one wins. |
 
 ## Routes
 
 | Route | Method | Auth | Notes |
 |---|---|---|---|
-| `/v1/ingest` | POST | instance secret | v1 and v2 accepted; 32 KB body cap; day window (≤ today UTC, ≥ today−30); upsert per (instance, product, day), last write wins; `202 {ok:true}` |
+| `/v1/ingest` | POST | instance secret | 32 KB body cap; day window (≤ today UTC, ≥ today−30); upsert per (instance, product, day), last write wins; `202 {ok:true}` |
 | `/v1/instances/<uuid>/stats?product=<name>` | GET | instance secret | that installation's own days, totals and per-day rates; optional `&days=N` (1–400) |
 | `/v1/instances/<uuid>` | DELETE | instance secret | purges the identity across **every** product; idempotent `204` |
 
@@ -160,23 +163,19 @@ default 5). A product below it is withheld entirely; an individual figure below 
 shown, one withheld" names the withheld product and states that it is under the floor — the
 suppression would announce exactly the fact it exists to hide.
 
-## Compatibility window
+## One shape, no negotiation
 
-The collector accepts **v1 and v2** payloads. v1 is normalized into the v2 shape on ingest and is
-brokkr-only by construction. Set `MYTHICAL_TELEMETRY_ACCEPT_V1=0` to close the window; v1 payloads
-then reject like any other invalid payload, and the `ingest_rejected_v1_window_closed` counter says
-so.
+The collector accepts exactly one document shape: the schema published by the client package. There
+is no second version, no accept-both mode, and no normalization anywhere in the service — a payload
+is handed to the one injected validator and is either stored as it arrived or refused.
 
-> **The window's length is not yet decided** and must be published here before the client package's
-> first release. Operators cannot plan an upgrade against a deadline that does not exist.
-
-Normalization is a structural move only — sections move under `metrics`, `product.daemon_version`
-becomes `product.version` — and it deliberately moves *every* non-envelope key, including ones the
-schema does not declare, so an undeclared section stays rejectable. Copying a known list of
-sections across would silently discard the rest and turn a rejectable payload into an acceptable
-one. For the same reason every key is written with `defineProperty` rather than plain assignment:
-`JSON.parse` produces a genuine own `__proto__` property, and assigning it back would invoke the
-inherited setter and make the field vanish mid-move.
+A document that is not that shape — including the retired pre-collapse shape, whose body sections
+sat at the top level rather than under `metrics` — is refused like any other invalid payload and
+counted as `ingest_rejected_schema_invalid`. Note that the retired shape declared the SAME
+`schema_version: 1` as the current one, so the version discriminator does not distinguish them and
+nothing here may be built as though it did: what refuses it is the shape, `metrics` being required
+and every top-level section being undeclared under `additionalProperties: false`. That rejection is
+pinned by test rather than left to inspection.
 
 ---
 
@@ -392,7 +391,6 @@ volumes:
 | `MYTHICAL_TELEMETRY_TRUSTED_PROXIES` | *(unset)* | which peers those are: comma-separated addresses/CIDRs. **Required** when hops > 0; the service refuses to start otherwise |
 | `MYTHICAL_TELEMETRY_MIN_AGGREGATE_CELL` | `5` | small-cell floor for the public aggregate |
 | *(not configurable)* | 60s | how long a computed public aggregate is reused before recomputing |
-| `MYTHICAL_TELEMETRY_ACCEPT_V1` | `1` | accept v1 payloads (the compatibility window) |
 | `MYTHICAL_TELEMETRY_OPS_KEY` | *(unset)* | gates `/metrics`; unset means the route does not exist |
 
 ## Upgrading an existing volume
@@ -405,18 +403,16 @@ collector ships a **transactional rebuild** that runs at boot:
   not hand today's budget back in full;
 - `instances.first_report_day` is added and derived from the earliest surviving heartbeat (see
   above);
-- stored v1 payloads are normalized to v2 **at rest**, so the read path has one shape — leaving
-  them would not crash, it would silently fold zeros into every historical total;
+- **no stored document is ever rewritten.** There is one heartbeat schema, so there is no at-rest
+  conversion to perform; the rebuild moves rows between table definitions and leaves every payload
+  byte-identical;
 - the whole thing is one `IMMEDIATE` transaction: it lands completely or not at all, and a second
   process booting on the same file waits rather than racing;
 - the shape is detected from the tables' actual **primary keys**, not from a version marker and not
   merely from a column's presence, so re-running is a no-op while a naive `ALTER TABLE ... ADD
   COLUMN product` hand-upgrade — which leaves the legacy key in place — is still completed rather
   than mistaken for done. Any product values such an upgrade had already set are kept;
-- the payload pass has its **own** durable marker, separate from the shape version, so a database
-  whose tables were converted by other means still gets its stored v1 documents normalized rather
-  than silently folding zeros into every historical total;
-- nothing is dropped. A payload that will not parse is carried over verbatim and counted.
+- nothing is dropped. A payload that will not parse is carried over verbatim.
 
 The report is logged at boot and served on `/metrics`. **Back up the volume first anyway** — this
 rewrites tables in place, and no test is a substitute for a copy of the file.

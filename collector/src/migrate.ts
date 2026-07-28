@@ -11,24 +11,22 @@
 //
 //   • every existing row is carried over and backfilled as product `brokkr`
 //     (the only product that could have written to a pre-product database);
-//   • stored v1 payloads are normalized to the v2 shape at rest, so the read
-//     path has exactly one shape to handle — leaving them un-normalized would
-//     not crash, it would silently fold zeros into every historical total,
-//     which is worse;
 //   • the whole thing runs inside one IMMEDIATE transaction, so it either
 //     lands completely or not at all, and a second process booting against the
 //     same file waits rather than racing;
 //   • state is detected from the actual table shape INSIDE that transaction,
 //     never from `PRAGMA user_version` alone, so re-running is a no-op and a
 //     hand-edited version marker cannot skip a rebuild that is genuinely
-//     needed;
-//   • the PAYLOAD pass has its own durable marker, separate from the shape
-//     version, so a database whose tables were converted by other means still
-//     gets its stored v1 documents normalized.
+//     needed.
 //
-// NO ROW IS DROPPED. A payload that cannot be parsed is carried over verbatim
-// and counted, never discarded, and a rebuild that would carry fewer rows than
-// it found aborts the whole transaction instead of completing.
+// A STORED PAYLOAD IS NEVER REWRITTEN. There is one heartbeat schema, so there
+// is no at-rest conversion to perform and no second shape the read path has to
+// handle; the migration moves rows between table definitions and touches the
+// document text not at all.
+//
+// NO ROW IS DROPPED either. A payload that cannot be parsed is carried over
+// verbatim, never discarded, and a rebuild that would carry fewer rows than it
+// found aborts the whole transaction instead of completing.
 //
 // That guarantee is about ROWS, and deliberately not about schema objects
 // ATTACHED to the rebuilt tables. A rebuild is `DROP TABLE` + `RENAME`, and
@@ -42,25 +40,16 @@
 // than this store needs to make.
 
 import type { Database } from 'bun:sqlite';
-import { v1ToV2 } from './normalize';
-
-/** Bumped when the table shape changes. */
-export const SCHEMA_USER_VERSION = 2;
 
 /**
- * Bumped when stored payloads need a further rewrite.
+ * Bumped when the TABLE shape changes.
  *
- * Tracked SEPARATELY from the shape version, in a table only this code writes.
- * Conflating the two means a database whose tables already carry `product` —
- * a hand-completed or partially-scripted upgrade — but whose payloads are
- * still raw v1 gets its normalization pass skipped, because the shape marker
- * already says "done". The read path then folds zeros out of documents it
- * cannot see into: wrong numbers, no error, nobody notices.
+ * This is SQLite's `PRAGMA user_version` for this store's DDL and has nothing
+ * to do with the heartbeat schema version — the two numbers are independent and
+ * must not be conflated. Lowering it would make a current volume look
+ * un-migrated on the next boot.
  */
-export const NORMALIZATION_PASS = 1;
-
-/** Key under which the completed normalization pass is recorded. */
-const NORMALIZATION_KEY = 'normalization_pass';
+export const SCHEMA_USER_VERSION = 2;
 
 /**
  * Bumped when `instances.first_report_day` needs (re)deriving for existing rows.
@@ -79,9 +68,6 @@ const FIRST_REPORT_KEY = 'first_report_backfill';
 /** The product every pre-product row is backfilled as. */
 export const LEGACY_PRODUCT = 'brokkr';
 
-/** Rows rewritten per statement batch during the payload pass (bounds memory). */
-const PAYLOAD_BATCH = 500;
-
 export interface MigrationReport {
   /** `user_version` found before anything ran. */
   fromUserVersion: number;
@@ -93,14 +79,8 @@ export interface MigrationReport {
   /** Rows carried across the rebuild. */
   heartbeatRowsCarried: number;
   instanceRowsCarried: number;
-  /** Stored v1 payloads rewritten into the v2 shape. */
-  payloadsNormalized: number;
-  /** Rows whose payload could not be parsed — carried over verbatim, never dropped. */
-  payloadsUnparseable: number;
   /** The admission ledger was created and back-filled from existing rows. */
   admissionsSeeded: boolean;
-  /** The stored-payload normalization pass ran (rather than being skipped as already done). */
-  normalizationPassRan: boolean;
   /** `instances.first_report_day` was added to an existing table. */
   addedFirstReportColumn: boolean;
   /** Rows whose first-report day was derived from surviving heartbeats. */
@@ -246,10 +226,7 @@ export function migrate(db: Database): MigrationReport {
     rebuiltInstances: false,
     heartbeatRowsCarried: 0,
     instanceRowsCarried: 0,
-    payloadsNormalized: 0,
-    payloadsUnparseable: 0,
     admissionsSeeded: false,
-    normalizationPassRan: false,
     addedFirstReportColumn: false,
     firstReportBackfilled: 0,
   };
@@ -309,18 +286,6 @@ export function migrate(db: Database): MigrationReport {
       );
       report.admissionsSeeded = true;
     }
-
-    // The payload pass is O(rows) and must not run on every boot — but the
-    // thing that decides is the marker for THIS pass, written only by the code
-    // below, never the table-shape version. See NORMALIZATION_PASS.
-    const passDone = readMetaInt(db, NORMALIZATION_KEY);
-    if (report.rebuiltHeartbeats || passDone < NORMALIZATION_PASS) {
-      const pass = normalizeStoredV1Payloads(db);
-      report.payloadsNormalized = pass.normalized;
-      report.payloadsUnparseable = pass.unparseable;
-      report.normalizationPassRan = true;
-    }
-    writeMeta(db, NORMALIZATION_KEY, String(NORMALIZATION_PASS));
 
     // Derive the first-report day for rows that predate the column. MIN(day)
     // over the surviving heartbeats is the best evidence available; where no
@@ -421,70 +386,4 @@ function rebuildInstances(db: Database): number {
   db.exec('DROP TABLE instances');
   db.exec('ALTER TABLE instances_migration_tmp RENAME TO instances');
   return after;
-}
-
-/**
- * Rewrite stored v1 documents into the v2 shape, in bounded batches.
- *
- * `heartbeats.schema_version` records the version the payload arrived as on
- * the wire; `heartbeats.payload` is always the normalized v2 document. Rows
- * written by the pre-product collector hold a raw v1 document, and this pass
- * brings them to that invariant.
- *
- * A row whose payload will not parse, or which is already v2, is left exactly
- * as it is. This pass never deletes.
- */
-function normalizeStoredV1Payloads(db: Database): { normalized: number; unparseable: number } {
-  // Paged on the PRIMARY KEY, not on `rowid`. A `WITHOUT ROWID` heartbeats
-  // table passes every shape check above and is not rebuilt — and would then
-  // make this pass fail on `rowid`, rolling the whole migration back and
-  // leaving the service unable to start. The composite key exists by
-  // definition and is stable while only `payload` is rewritten.
-  interface Row {
-    instance_id: string;
-    product: string;
-    day: string;
-    payload: string;
-  }
-  const COLS = 'instance_id, product, day, payload';
-  const ORDER = 'ORDER BY instance_id, product, day LIMIT ';
-  const selectFirst = db.query<Row, [number]>(`SELECT ${COLS} FROM heartbeats ${ORDER}?1`);
-  const selectNext = db.query<Row, [string, string, string, number]>(
-    `SELECT ${COLS} FROM heartbeats WHERE (instance_id, product, day) > (?1, ?2, ?3) ${ORDER}?4`,
-  );
-  const update = db.query(
-    'UPDATE heartbeats SET payload = ?4 WHERE instance_id = ?1 AND product = ?2 AND day = ?3',
-  );
-
-  let cursor: { instance_id: string; product: string; day: string } | null = null;
-  let normalized = 0;
-  let unparseable = 0;
-
-  for (;;) {
-    const rows: Row[] = cursor === null
-      ? selectFirst.all(PAYLOAD_BATCH)
-      : selectNext.all(cursor.instance_id, cursor.product, cursor.day, PAYLOAD_BATCH);
-    if (rows.length === 0) break;
-    for (const row of rows) {
-      cursor = { instance_id: row.instance_id, product: row.product, day: row.day };
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(row.payload);
-      } catch {
-        unparseable += 1;
-        continue;
-      }
-      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-        unparseable += 1;
-        continue;
-      }
-      const doc = parsed as Record<string, unknown>;
-      if (doc['schema_version'] !== 1) continue; // already v2 (or unknown) — leave it alone
-      update.run(row.instance_id, row.product, row.day, JSON.stringify(v1ToV2(doc)));
-      normalized += 1;
-    }
-    if (rows.length < PAYLOAD_BATCH) break;
-  }
-
-  return { normalized, unparseable };
 }

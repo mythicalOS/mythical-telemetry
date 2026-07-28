@@ -19,14 +19,25 @@
 // this file, called only from `src/cli/server.ts`.
 
 /**
- * The v2 envelope, as far as the collector is concerned.
+ * The one and only heartbeat schema version.
+ *
+ * There is a single wire shape, so this is a constant rather than something
+ * read off a payload. It is what goes into the stored `schema_version` column:
+ * taking it from the document would mean trusting an INJECTED validator for the
+ * value of a stored column, and the seam exists precisely because that
+ * implementation is a third party.
+ */
+export const HEARTBEAT_SCHEMA_VERSION = 1;
+
+/**
+ * The heartbeat envelope, as far as the collector is concerned.
  *
  * These are the only fields the collector reads directly; `metrics` is opaque
  * — the collector stores it, echoes it back to its owner, and folds declared
  * paths out of it (see `totals.ts`) without ever asserting its shape.
  */
 export interface Heartbeat {
-  schema_version: 2;
+  schema_version: typeof HEARTBEAT_SCHEMA_VERSION;
   instance_id: string;
   day: string;
   product: { name: string; version: string };

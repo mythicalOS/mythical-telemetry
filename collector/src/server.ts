@@ -40,11 +40,10 @@ import type { TelemetryDb } from './db';
 import { authorizesInstance, UUID_V4_RE } from './identity';
 import { Counters, type CounterName } from './counters';
 import { parseTrustedProxies } from './ip';
-import { normalizeToV2 } from './normalize';
 import { renderAggregatePage, type AggregateProductView, type AggregateView } from './page';
 import { resolveSourceKey, TokenBucketLimiter, type ServerLike } from './throttle';
 import { decorateDay, foldRates, foldTotals, type TotalsValue } from './totals';
-import { safeValidate, type HeartbeatValidator } from './validator';
+import { HEARTBEAT_SCHEMA_VERSION, safeValidate, type HeartbeatValidator } from './validator';
 
 export type { ServerLike } from './throttle';
 
@@ -72,10 +71,9 @@ const HOUR_MS = 3_600_000;
 
 /**
  * The canonical secret header. `x-mythical-write-key` is the historical name
- * for the same credential and stays accepted: v1 clients send it, and the
- * whole point of the compatibility window is that they keep working. When both
- * are present the canonical one wins — documented, so neither side has to
- * guess.
+ * for the same credential and stays accepted, so a client built against the
+ * older name keeps working. When both are present the canonical one wins —
+ * documented, so neither side has to guess.
  */
 const SECRET_HEADER = 'x-mythical-instance-secret';
 const LEGACY_SECRET_HEADER = 'x-mythical-write-key';
@@ -116,8 +114,6 @@ export interface TelemetryServerConfig {
   trustedProxies?: readonly string[];
   /** Gates GET /metrics. Absent/empty ⇒ the route does not exist. */
   opsKey?: string | null;
-  /** Accept v1 payloads (the stated compatibility window). */
-  acceptWireV1?: boolean;
   /** Small-cell floor for the public aggregate. */
   minAggregateCell?: number;
   /** How long a computed aggregate is reused. 0 recomputes every request (tests). */
@@ -185,7 +181,6 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
   const { db, validator } = config;
   const schemaJson = config.schemaJson ?? null;
   const maxBody = config.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
-  const acceptWireV1 = config.acceptWireV1 ?? true;
   const minCell = config.minAggregateCell ?? DEFAULT_MIN_AGGREGATE_CELL;
   const trustedProxyHops = config.trustedProxyHops ?? 0;
   // Throws on a malformed entry — a silently dropped proxy means the header is
@@ -272,9 +267,9 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
     // Pinned check order — each step is cheaper than or a precondition of the
     // next, and nothing touches the database before identity is proven:
     //   secret PRESENCE ⇒ 403, per-source throttle ⇒ 429, intake cap ⇒ 413,
-    //   JSON parse ⇒ 400, wire version + normalize ⇒ 400, schema ⇒ 400,
-    //   storable product ⇒ 400, day window ⇒ 400, derived identity ⇒ 403,
-    //   new-identity throttle ⇒ 429, admission ⇒ 429, upsert ⇒ 202.
+    //   JSON parse ⇒ 400, schema ⇒ 400, storable product ⇒ 400,
+    //   day window ⇒ 400, derived identity ⇒ 403, new-identity throttle ⇒ 429,
+    //   admission ⇒ 429, upsert ⇒ 202.
 
     // (1) the secret header must be PRESENT before anything else.
     const secret = readSecret(req);
@@ -309,18 +304,17 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
       return rejectIngest(400, 'invalid_payload', 'ingest_rejected_malformed_json');
     }
 
-    // (5) wire version + structural normalization into the v2 shape.
-    const normalized = normalizeToV2(parsed);
-    if (!normalized.ok) {
-      return rejectIngest(400, 'invalid_payload', 'ingest_rejected_unsupported_schema_version');
-    }
-    if (normalized.wireVersion === 1 && !acceptWireV1) {
-      return rejectIngest(400, 'invalid_payload', 'ingest_rejected_v1_window_closed');
-    }
-
-    // (6) the ONE validator. Everything past this point treats the document as
+    // (5) the ONE validator. Everything past this point treats the document as
     // schema-valid; nothing before it does.
-    const validated = safeValidate(validator, normalized.value);
+    //
+    // There is no pre-check on `schema_version` and no shape negotiation ahead
+    // of this line. ONE schema exists, so a document that is not it — including
+    // the pre-collapse shape, which declared the SAME version number while
+    // putting the body at the top level — is refused here, by the validator,
+    // on `metrics` being required and every undeclared section being refused.
+    // A version pre-check would be schema knowledge in a service that
+    // deliberately holds none, and a second place a payload could be accepted.
+    const validated = safeValidate(validator, parsed);
     if (!validated.ok) {
       const internal = validated.error.startsWith('validator_')
         ? 'ingest_rejected_validator_error'
@@ -329,13 +323,13 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
     }
     const hb = validated.value;
 
-    // (7) storable product — the partition key must be one this service knows.
+    // (6) storable product — the partition key must be one this service knows.
     const product = hb.product.name;
     if (!STORABLE_PRODUCTS.has(product)) {
       return rejectIngest(400, 'invalid_payload', 'ingest_rejected_unknown_product');
     }
 
-    // (8) day window: day ≤ today UTC and ≥ today−30. Heartbeats are recent by
+    // (7) day window: day ≤ today UTC and ≥ today−30. Heartbeats are recent by
     // construction, and this also rejects regex-passing non-calendar days.
     const today = nowUtcDay();
     const dayEpoch = dayToEpochUtc(hb.day);
@@ -348,27 +342,27 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
       return rejectIngest(400, 'invalid_payload', 'ingest_rejected_day_out_of_window');
     }
 
-    // (9) stateless derived-identity check, constant-time. No registration, no
+    // (8) stateless derived-identity check, constant-time. No registration, no
     // stored key material, no first-writer claim race.
     if (!authorizesInstance(secret, hb.instance_id)) {
       return rejectIngest(403, 'write_key_mismatch', 'ingest_rejected_identity_mismatch');
     }
 
-    // (10) admission control for never-seen identities. The first database read
+    // (9) admission control for never-seen identities. The first database read
     // of the request happens HERE, after identity is proven, so it cannot be
     // used as an existence oracle.
     const known = db.isKnownInstance(hb.instance_id, product);
     if (!known && !newInstanceLimiter.allow(source)) {
       return rejectIngest(429, 'rate_limited', 'ingest_rejected_new_instance_source_limit');
     }
-    // (11) the authoritative admission decision and the write are ONE
+    // (10) the authoritative admission decision and the write are ONE
     // transaction — see TelemetryDb.recordHeartbeat. `schema_version` records
-    // the WIRE version; the payload is always the normalized v2 document.
+    // which schema the stored document is; there is one, so it is a constant.
     const admission = db.recordHeartbeat(
       hb.instance_id,
       product,
       hb.day,
-      normalized.wireVersion,
+      HEARTBEAT_SCHEMA_VERSION,
       JSON.stringify(hb),
       today,
     );
@@ -383,7 +377,6 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
     }
 
     counters.inc('ingest_accepted_total');
-    counters.inc(normalized.wireVersion === 1 ? 'ingest_accepted_wire_v1' : 'ingest_accepted_wire_v2');
     if (!admission.existing) counters.inc('ingest_accepted_new_instance');
     return json(202, { ok: true });
   }
@@ -623,7 +616,6 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
         new_instance_keys: newInstanceLimiter.size(),
       },
       migration: db.migration,
-      accept_wire_v1: acceptWireV1,
     });
   }
 

@@ -16,7 +16,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 import { uuidFromSecret } from '../src/identity';
-import type { Heartbeat, HeartbeatValidator, ValidationResult } from '../src/validator';
+import { HEARTBEAT_SCHEMA_VERSION, type Heartbeat, type HeartbeatValidator, type ValidationResult } from '../src/validator';
 
 export const SECRET_A = 'a'.repeat(64);
 export const SECRET_B = 'b'.repeat(64);
@@ -51,12 +51,12 @@ function sameKeys(obj: Record<string, unknown>, expected: readonly string[]): bo
   return expected.every((k) => Object.hasOwn(obj, k));
 }
 
-/** A stand-in for the canonical v2 validator. See the banner above. */
+/** A stand-in for the canonical validator. See the banner above. */
 export class StubValidator implements HeartbeatValidator {
   validate(raw: unknown): ValidationResult {
     if (!isObj(raw)) return { ok: false, error: 'not_an_object' };
     if (!sameKeys(raw, ENVELOPE_KEYS)) return { ok: false, error: 'envelope_keys' };
-    if (raw['schema_version'] !== 2) return { ok: false, error: 'schema_version' };
+    if (raw['schema_version'] !== HEARTBEAT_SCHEMA_VERSION) return { ok: false, error: 'schema_version' };
 
     const instanceId = raw['instance_id'];
     if (typeof instanceId !== 'string' || !UUID_RE.test(instanceId)) return { ok: false, error: 'instance_id' };
@@ -85,7 +85,7 @@ export class StubValidator implements HeartbeatValidator {
     return {
       ok: true,
       value: {
-        schema_version: 2,
+        schema_version: HEARTBEAT_SCHEMA_VERSION,
         instance_id: instanceId,
         day,
         product: { name, version },
@@ -168,8 +168,8 @@ const METRIC_BUILDERS: Record<string, () => Record<string, unknown>> = {
   skuld: skuldMetrics,
 };
 
-/** A valid v2 heartbeat for any product. */
-export function makeV2(
+/** A valid heartbeat for any product. */
+export function makeHeartbeat(
   product: 'brokkr' | 'saga' | 'skuld' = 'brokkr',
   instanceId: string = INSTANCE_A,
   day = '2026-07-09',
@@ -177,7 +177,7 @@ export function makeV2(
   const build = METRIC_BUILDERS[product];
   if (!build) throw new Error(`no metrics builder for ${product}`);
   return {
-    schema_version: 2,
+    schema_version: HEARTBEAT_SCHEMA_VERSION,
     instance_id: instanceId,
     day,
     product: { name: product, version: '0.1.0' },
@@ -187,12 +187,26 @@ export function makeV2(
 }
 
 /**
- * A valid v1 heartbeat — the pre-v2 wire shape, brokkr-only: sections at the
- * top level, and `product.daemon_version` rather than `product.version`.
+ * The LEGACY pre-collapse wire shape — brokkr-only: the ten body sections at
+ * the TOP level rather than under `metrics`, and `product.daemon_version`
+ * rather than `product.version`. Reconstructed from the retired schema's own
+ * `required` list, which was:
+ *
+ *   schema_version, instance_id, day, product, platform, config, features,
+ *   sessions, context_fill, mode_split, spine, models, tokens, review, errors
+ *
+ * It exists for exactly ONE purpose: proving this shape is REJECTED. It is not
+ * a supported input and there is no path that accepts it.
+ *
+ * Note the version number. The legacy shape declared `schema_version: 1`, and
+ * so does the current one — the collapse renumbered v2 down to 1 rather than
+ * launching a public project at v2 for a version that never had a consumer. So
+ * the discriminator does NOT distinguish the two, and nothing in the collector
+ * may be built as though it did: the rejection has to come from the shape.
  */
-export function makeV1(instanceId: string = INSTANCE_A, day = '2026-07-09'): Record<string, any> {
+export function makeLegacyShape(instanceId: string = INSTANCE_A, day = '2026-07-09'): Record<string, any> {
   return {
-    schema_version: 1,
+    schema_version: HEARTBEAT_SCHEMA_VERSION,
     instance_id: instanceId,
     day,
     product: { name: 'brokkr', daemon_version: '0.1.0' },

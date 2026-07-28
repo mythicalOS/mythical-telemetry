@@ -16,10 +16,10 @@ type Json = Record<string, unknown>;
 
 function runCheck(mutate: (schema: Json, manifest: Json) => void): { code: number; output: string } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mythical-telemetry-check-"));
-  const schema = JSON.parse(fs.readFileSync(path.join(SCHEMA_DIR, "heartbeat.v2.json"), "utf8")) as Json;
+  const schema = JSON.parse(fs.readFileSync(path.join(SCHEMA_DIR, "heartbeat.v1.json"), "utf8")) as Json;
   const manifest = JSON.parse(fs.readFileSync(path.join(SCHEMA_DIR, "field-classes.json"), "utf8")) as Json;
   mutate(schema, manifest);
-  fs.writeFileSync(path.join(dir, "heartbeat.v2.json"), JSON.stringify(schema, null, 2));
+  fs.writeFileSync(path.join(dir, "heartbeat.v1.json"), JSON.stringify(schema, null, 2));
   fs.writeFileSync(path.join(dir, "field-classes.json"), JSON.stringify(manifest, null, 2));
 
   const result = Bun.spawnSync(["bun", "run", SCRIPT], {

@@ -9,17 +9,18 @@
 // — not merely against the hand-written validator, which could share the same misconception.
 //
 // It also holds the two structural guarantees that cannot be re-derived by reading the file:
-//   - brokkr's ten v2 sections DEEP-EQUAL v1's, proving "ported verbatim" is still true;
 //   - the model-id allowlist in code equals the enum in the schema, which is the pair that has
-//     already existed twice and been hand-synced.
+//     already existed twice and been hand-synced;
+//   - the pre-collapse LEGACY document shape is rejected by both layers. There is now exactly one
+//     heartbeat shape and it is version 1; the shape that preceded it also called itself version 1,
+//     so "the version number disagrees" is NOT what rejects it. See the legacy-shape block below.
 
 import { describe, expect, test } from "bun:test";
 import Ajv, { type ValidateFunction } from "ajv";
-import v1Schema from "./schema/heartbeat.v1.json" with { type: "json" };
-import v2Schema from "./schema/heartbeat.v2.json" with { type: "json" };
+import heartbeatSchema from "./schema/heartbeat.v1.json" with { type: "json" };
 import manifest from "./schema/field-classes.json" with { type: "json" };
 import { MODEL_ID_ALLOWLIST, MODEL_OTHER } from "./src/model-id-allowlist.ts";
-import { PRODUCT_NAMES, UPTIME_BUCKETS, DETECTION_STATES, validateHeartbeat } from "./src/envelope.ts";
+import { PRODUCT_NAMES, SCHEMA_VERSION, UPTIME_BUCKETS, DETECTION_STATES, validateHeartbeat } from "./src/envelope.ts";
 import { HeartbeatEmitter } from "./src/emitter.ts";
 import { IdentityStore } from "./src/identity.ts";
 import { Transport } from "./src/transport.ts";
@@ -34,7 +35,7 @@ import os from "node:os";
 import path from "node:path";
 
 const ajv = new Ajv({ strict: false, allErrors: true });
-const schemaCheck: ValidateFunction = ajv.compile(v2Schema as object);
+const schemaCheck: ValidateFunction = ajv.compile(heartbeatSchema as object);
 
 /** True iff the JSON Schema itself accepts the document. */
 function schemaAccepts(value: unknown): boolean {
@@ -144,7 +145,7 @@ describe("REAL emitter output validates against the JSON SCHEMA (not just the va
   test("a body key renamed in the schema and the validator but NOT the emitter is caught", () => {
     // The exact historical failure, reproduced: the emitter still says `sessions`, so a schema
     // that has moved on rejects real output even though schema and validator agree with each other.
-    const renamed = JSON.parse(JSON.stringify(v2Schema)) as {
+    const renamed = JSON.parse(JSON.stringify(heartbeatSchema)) as {
       definitions: { brokkr_metrics: { required: string[]; properties: Record<string, unknown> } };
     };
     const brokkr = renamed.definitions.brokkr_metrics;
@@ -233,55 +234,141 @@ describe("mutation lockstep — the schema and the validator reject the SAME doc
 
 // ── structural guarantees ──────────────────────────────────────────────────────────────────
 
-describe("brokkr's ten sections are v1's, VERBATIM", () => {
+describe("the envelope and brokkr's ten sections are pinned", () => {
   const SECTIONS = ["config", "features", "sessions", "context_fill", "mode_split", "spine", "models", "tokens", "review", "errors"] as const;
-  const v1 = v1Schema as unknown as { properties: Record<string, unknown> };
-  const v2 = v2Schema as unknown as { definitions: { brokkr_metrics: { properties: Record<string, unknown>; required: string[] } } };
+  const schema = heartbeatSchema as unknown as {
+    required: string[];
+    properties: { schema_version: { const: number }; product: { properties: Record<string, unknown>; required: string[] } };
+    definitions: { brokkr_metrics: { properties: Record<string, unknown>; required: string[] } };
+  };
 
-  for (const section of SECTIONS) {
-    test(section, () => {
-      expect(v2.definitions.brokkr_metrics.properties[section]).toEqual(v1.properties[section]);
-    });
-  }
-
-  test("all ten are present and required, and nothing else is", () => {
-    expect(Object.keys(v2.definitions.brokkr_metrics.properties).sort()).toEqual([...SECTIONS].sort());
-    expect([...v2.definitions.brokkr_metrics.required].sort()).toEqual([...SECTIONS].sort());
+  test("the envelope is exactly its six keys, and product is exactly {name, version}", () => {
+    expect([...schema.required].sort()).toEqual(
+      ["day", "instance_id", "metrics", "platform", "product", "schema_version"].sort(),
+    );
+    expect(Object.keys(schema.properties.product.properties).sort()).toEqual(["name", "version"]);
+    expect([...schema.properties.product.required].sort()).toEqual(["name", "version"]);
   });
 
-  test("the ONLY envelope change is daemon_version -> version", () => {
-    const v1Product = (v1.properties.product as { properties: Record<string, unknown>; required: string[] }).properties;
-    const v2Product = (v2Schema as unknown as { properties: { product: { properties: Record<string, unknown> } } }).properties.product
-      .properties;
-    expect(Object.keys(v1Product).sort()).toEqual(["daemon_version", "name"]);
-    expect(Object.keys(v2Product).sort()).toEqual(["name", "version"]);
-    expect((v2Product.version as { pattern: string }).pattern).toBe((v1Product.daemon_version as { pattern: string }).pattern);
+  test("the schema, the code constant and the emitter agree on the version number", () => {
+    expect(schema.properties.schema_version.const).toBe(SCHEMA_VERSION);
+    expect(SCHEMA_VERSION).toBe(1);
+    for (const product of PRODUCT_NAMES) {
+      expect((emitterPayloadFor(product) as { schema_version: number }).schema_version).toBe(SCHEMA_VERSION);
+    }
+  });
+
+  test("brokkr's ten sections are present and required, and nothing else is", () => {
+    expect(Object.keys(schema.definitions.brokkr_metrics.properties).sort()).toEqual([...SECTIONS].sort());
+    expect([...schema.definitions.brokkr_metrics.required].sort()).toEqual([...SECTIONS].sort());
+  });
+});
+
+// ── the LEGACY document shape, which must fail cleanly rather than be misread ───────────────
+//
+// Before the collapse to a single schema there was an earlier heartbeat shape, and it ALSO
+// declared `schema_version: 1`. It was never received by any deployed ingest, so nothing had to be
+// migrated — but a product build predating the collapse, pointed at a current collector, would put
+// that shape on the wire. It must be REJECTED, and the rejection must not depend on the version
+// discriminator, because the discriminator agrees.
+//
+// The document below is reconstructed from the legacy schema's own `required` list, verbatim:
+//   schema_version, instance_id, day, product, platform, config, features, sessions,
+//   context_fill, mode_split, spine, models, tokens, review, errors
+// — the ten body sections at the TOP level rather than under `metrics`, and
+// `product.daemon_version` rather than `product.version`. Its leaf values are valid ones, so
+// nothing but the SHAPE can be what rejects it.
+
+function legacyShapedPayload(): Record<string, unknown> {
+  const current = brokkrFixture();
+  const { metrics, product, ...envelope } = current;
+  return {
+    ...envelope,
+    schema_version: 1,
+    product: { name: "brokkr", daemon_version: product.version },
+    ...metrics,
+  };
+}
+
+describe("the legacy pre-collapse shape is rejected, and not because of its version number", () => {
+  test("its version discriminator is INDISTINGUISHABLE from a current document's", () => {
+    // Stated as an assertion rather than a comment: if a future change made the versions differ,
+    // every test below would start passing for a reason that has nothing to do with shape.
+    expect(legacyShapedPayload().schema_version).toBe(SCHEMA_VERSION);
+  });
+
+  test("it really is the legacy shape: the sections are top-level and there is no `metrics`", () => {
+    const legacy = legacyShapedPayload();
+    const LEGACY_REQUIRED = [
+      "schema_version", "instance_id", "day", "product", "platform", "config", "features",
+      "sessions", "context_fill", "mode_split", "spine", "models", "tokens", "review", "errors",
+    ];
+    for (const key of LEGACY_REQUIRED) expect(Object.hasOwn(legacy, key)).toBe(true);
+    expect(Object.hasOwn(legacy, "metrics")).toBe(false);
+    expect(Object.keys(legacy.product as object).sort()).toEqual(["daemon_version", "name"]);
+  });
+
+  test("the JSON Schema rejects it, on the missing `metrics` AND on every undeclared section", () => {
+    const legacy = legacyShapedPayload();
+    expect(schemaAccepts(legacy)).toBe(false);
+    const errors = schemaCheck.errors ?? [];
+    // Guaranteed by construction, not incidentally: `metrics` is required, and
+    // additionalProperties:false at the root refuses each top-level section.
+    expect(errors.some((e) => e.keyword === "required" && (e.params as { missingProperty?: string }).missingProperty === "metrics")).toBe(true);
+    const refused = new Set(
+      errors
+        .filter((e) => e.keyword === "additionalProperties")
+        .map((e) => (e.params as { additionalProperty?: string }).additionalProperty),
+    );
+    for (const section of ["config", "features", "sessions", "context_fill", "mode_split", "spine", "models", "tokens", "review", "errors"]) {
+      expect(refused.has(section)).toBe(true);
+    }
+  });
+
+  test("the runtime validator rejects it too, naming metrics and the product rename", () => {
+    const result = validateHeartbeat(legacyShapedPayload());
+    expect(result.ok).toBe(false);
+    const joined = (result.ok ? [] : result.errors).join(" ");
+    expect(joined).toContain("metrics");
+    expect(joined).toContain("product");
+  });
+
+  test("no partial reading happens: a legacy document is never repaired into a valid one", () => {
+    // The failure this forbids is a silent one — a legacy payload accepted with an empty body, so
+    // an installation reports zeros forever and looks alive. Both layers must simply refuse.
+    const legacy = legacyShapedPayload();
+    expect(validateHeartbeat(legacy).ok).toBe(false);
+    expect(schemaAccepts(legacy)).toBe(false);
+    // ...and the same document with ONLY the version bumped is still rejected, proving the version
+    // is not carrying the rejection.
+    expect(schemaAccepts({ ...legacy, schema_version: 2 })).toBe(false);
+    expect(validateHeartbeat({ ...legacy, schema_version: 2 }).ok).toBe(false);
   });
 });
 
 describe("closed sets in code equal closed sets in the schema", () => {
-  const v2 = v2Schema as unknown as {
+  const doc = heartbeatSchema as unknown as {
     properties: Record<string, { enum?: string[]; properties?: Record<string, { enum?: string[] }> }>;
     definitions: Record<string, { properties: Record<string, { enum?: string[]; items?: { properties: { name: { enum: string[] } } } }> }>;
   };
 
   test("MODEL_ID_ALLOWLIST — the pair that has already existed twice and been hand-synced", () => {
-    const schemaEnum = v2.definitions.brokkr_metrics!.properties.models!.items!.properties.name.enum;
+    const schemaEnum = doc.definitions.brokkr_metrics!.properties.models!.items!.properties.name.enum;
     expect([...schemaEnum].sort()).toEqual([...MODEL_ID_ALLOWLIST, MODEL_OTHER].sort());
   });
 
   test("product.name", () => {
-    expect(v2.properties.product!.properties!.name!.enum!.slice().sort()).toEqual([...PRODUCT_NAMES].sort());
+    expect(doc.properties.product!.properties!.name!.enum!.slice().sort()).toEqual([...PRODUCT_NAMES].sort());
   });
 
   test("uptime buckets, in both products that carry them", () => {
     for (const product of ["saga_metrics", "skuld_metrics"]) {
-      expect(v2.definitions[product]!.properties.uptime_bucket!.enum!.slice().sort()).toEqual([...UPTIME_BUCKETS].sort());
+      expect(doc.definitions[product]!.properties.uptime_bucket!.enum!.slice().sort()).toEqual([...UPTIME_BUCKETS].sort());
     }
   });
 
   test("detection_state is a closed enum, never an integer", () => {
-    const leaf = v2.definitions.skuld_metrics!.properties.detection_state!;
+    const leaf = doc.definitions.skuld_metrics!.properties.detection_state!;
     expect(leaf.enum!.slice().sort()).toEqual([...DETECTION_STATES].sort());
   });
 });
@@ -307,7 +394,7 @@ describe("the field-class manifest is bound to THIS schema", () => {
 
   test("it declares a body for every product the schema discriminates", () => {
     expect(Object.keys(m.metrics).sort()).toEqual([...PRODUCT_NAMES].sort());
-    expect(m.schema_version).toBe(2);
+    expect(m.schema_version).toBe(SCHEMA_VERSION);
   });
 });
 
@@ -354,7 +441,7 @@ describe("fixtures stay representative", () => {
 // "the plan says three severities" edit fails the build instead of the review.
 
 describe("amended contract: no leaf without a producer", () => {
-  const v2 = v2Schema as unknown as {
+  const doc = heartbeatSchema as unknown as {
     definitions: Record<string, { required: string[]; properties: Record<string, { required?: string[]; properties?: Record<string, unknown> }> }>;
   };
   const m = manifest as unknown as { metrics: Record<string, Record<string, unknown>> };
@@ -363,7 +450,7 @@ describe("amended contract: no leaf without a producer", () => {
     // `events.deferrals` was drafted against a producer that had been removed. It was dropped, and
     // four leaves whose producers were verified durable were added in its place — an ADDITION, not
     // a repointing: reusing the old name would have silently changed what a frozen field meant.
-    const events = v2.definitions.skuld_metrics!.properties.events!;
+    const events = doc.definitions.skuld_metrics!.properties.events!;
     expect([...(events.required ?? [])].sort()).toEqual(["asks_delivered", "rate_limit_deferred", "route_errors", "runs_enqueued"]);
     expect(Object.keys(events.properties ?? {})).not.toContain("deferrals");
     expect(Object.keys(m.metrics.skuld!).filter((k) => k.startsWith("events.")).sort()).toEqual([
@@ -374,7 +461,7 @@ describe("amended contract: no leaf without a producer", () => {
     ]);
     // No leaf named `deferrals` anywhere in the body — the word survives only in a description,
     // which records WHY it is absent so the next author does not re-add it.
-    for (const section of Object.values(v2.definitions.skuld_metrics!.properties)) {
+    for (const section of Object.values(doc.definitions.skuld_metrics!.properties)) {
       expect(Object.keys(section.properties ?? {})).not.toContain("deferrals");
     }
     const smuggled = skuldFixture();
@@ -384,7 +471,7 @@ describe("amended contract: no leaf without a producer", () => {
   });
 
   test("saga's advisories.by_severity is exactly {info, warn} — no `critical` exists upstream", () => {
-    const bySeverity = v2.definitions.saga_metrics!.properties.advisories!.properties!.by_severity as { required: string[] };
+    const bySeverity = doc.definitions.saga_metrics!.properties.advisories!.properties!.by_severity as { required: string[] };
     expect([...bySeverity.required].sort()).toEqual(["info", "warn"]);
     expect(Object.keys(m.metrics.saga!).filter((k) => k.startsWith("advisories.by_severity")).sort()).toEqual([
       "advisories.by_severity.info",

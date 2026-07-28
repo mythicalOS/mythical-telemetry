@@ -164,10 +164,9 @@ can, which is why this belongs at the emitter.
 
 ## Schema and the field-class manifest
 
-- `schema/heartbeat.v2.json` — the canonical schema. `additionalProperties: false` at every level,
-  including inside `metrics`. brokkr's ten sections are v1's, **verbatim**; the lockstep test
-  re-asserts that deep equality on every run.
-- `schema/heartbeat.v1.json` — retained unchanged for the record and for dual ingest.
+- `schema/heartbeat.v1.json` — the canonical schema, and the only one. `additionalProperties: false`
+  at every level, including inside `metrics`. There is no second version and no dual ingest: a
+  document either is this shape or is refused.
 - `schema/field-classes.json` — every leaf's value class and temporal class. `cumulative` is not a
   legal temporal value; there is no `opaque-id` value class.
 - `scripts/check-field-classes.ts` — the CI gate.
@@ -177,7 +176,7 @@ emitted them.** skuld's `events.deferrals` was drafted against a counter whose c
 removed, and saga's `advisories.by_severity.critical` names a severity the advisor does not have.
 Freezing either would have shipped a field that reads zero forever, which nobody can distinguish
 from "this install has none". Re-adding one is a **new leaf in a new schema version**, not an edit
-to v2 — `lockstep.test.ts` pins both absences so the build fails rather than the review.
+to this one — `lockstep.test.ts` pins both absences so the build fails rather than the review.
 
 > **The check enforces SHAPE, not privacy.** It cannot distinguish `database_oid: integer` from a
 > legitimate count. Any new or reclassified leaf needs a **named human privacy review recorded in

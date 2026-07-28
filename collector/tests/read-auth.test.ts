@@ -6,10 +6,10 @@
 
 import { describe, expect, test } from 'bun:test';
 import { deleteReq, getReq, ingestReq, makeHarness, statsReq } from './helpers';
-import { INSTANCE_A, INSTANCE_B, INSTANCE_C, makeV2, SECRET_A, SECRET_B, SECRET_C } from './fixtures';
+import { INSTANCE_A, INSTANCE_B, INSTANCE_C, makeHeartbeat, SECRET_A, SECRET_B, SECRET_C } from './fixtures';
 
 async function seed(h: ReturnType<typeof makeHarness>): Promise<void> {
-  expect((await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A))).status).toBe(202);
+  expect((await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A))).status).toBe(202);
 }
 
 describe('the instance id is no longer a bearer read capability', () => {
@@ -171,8 +171,8 @@ describe('DELETE — authenticated, idempotent, no existence oracle', () => {
 
   test('the owner purges => 204 with no body; the read then 404s', async () => {
     const h = makeHarness();
-    await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-08'), SECRET_A));
-    await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-09'), SECRET_A));
+    await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A, '2026-07-08'), SECRET_A));
+    await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A, '2026-07-09'), SECRET_A));
     const r = await h.handler(deleteReq(INSTANCE_A, SECRET_A));
     expect(r.status).toBe(204);
     expect(await r.text()).toBe('');
@@ -182,7 +182,7 @@ describe('DELETE — authenticated, idempotent, no existence oracle', () => {
   test('the purge spans EVERY product for that identity', async () => {
     const h = makeHarness();
     for (const product of ['brokkr', 'saga', 'skuld'] as const) {
-      await h.handler(ingestReq(makeV2(product, INSTANCE_A), SECRET_A));
+      await h.handler(ingestReq(makeHeartbeat(product, INSTANCE_A), SECRET_A));
     }
     expect((await h.handler(deleteReq(INSTANCE_A, SECRET_A))).status).toBe(204);
     for (const product of ['brokkr', 'saga', 'skuld'] as const) {
@@ -203,7 +203,7 @@ describe('DELETE — authenticated, idempotent, no existence oracle', () => {
   test('the purge is scoped: deleting A leaves B intact', async () => {
     const h = makeHarness();
     await seed(h);
-    await h.handler(ingestReq(makeV2('brokkr', INSTANCE_B, '2026-07-08'), SECRET_B));
+    await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_B, '2026-07-08'), SECRET_B));
     await h.handler(deleteReq(INSTANCE_A, SECRET_A));
     expect((await h.handler(statsReq(INSTANCE_A, 'brokkr', { secret: SECRET_A }))).status).toBe(404);
     expect((await h.handler(statsReq(INSTANCE_B, 'brokkr', { secret: SECRET_B }))).status).toBe(200);

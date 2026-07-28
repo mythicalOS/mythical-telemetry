@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 //
-// check-field-classes.ts — the CI gate over schema/heartbeat.v2.json + schema/field-classes.json.
+// check-field-classes.ts — the CI gate over schema/heartbeat.v1.json + schema/field-classes.json.
 //
 // WHAT THIS ENFORCES: SHAPE. NOT PRIVACY. Read that again before adding a field.
 //
@@ -28,7 +28,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCHEMA_DIR = process.env.TELEMETRY_SCHEMA_DIR ?? path.join(HERE, "..", "schema");
 
 const VALUE_CLASSES = new Set(["count", "ratio", "bucket", "enum", "bool", "version", "duration"]);
-/** delta | gauge ONLY. `cumulative` is not legal on any v2 leaf — normalisation is at the emitter (G2). */
+/** delta | gauge ONLY. `cumulative` is not legal on any leaf — normalisation is at the emitter (G2). */
 const TEMPORAL_CLASSES = new Set(["delta", "gauge"]);
 /** Classes whose string leaves may be fenced by a bounded anchored pattern instead of a closed enum. */
 const PATTERN_FENCEABLE = new Set(["version", "bucket"]);
@@ -128,7 +128,7 @@ function isBoundedAnchoredPattern(pattern: string): boolean {
 
 // ── load ───────────────────────────────────────────────────────────────────────────────────
 
-const schema = JSON.parse(fs.readFileSync(path.join(SCHEMA_DIR, "heartbeat.v2.json"), "utf8")) as Json;
+const schema = JSON.parse(fs.readFileSync(path.join(SCHEMA_DIR, "heartbeat.v1.json"), "utf8")) as Json;
 const manifest = JSON.parse(fs.readFileSync(path.join(SCHEMA_DIR, "field-classes.json"), "utf8")) as Json;
 
 // The schema must be a schema: compile it before reasoning about it.
@@ -136,7 +136,7 @@ try {
   const ajv = new Ajv({ strict: false, allErrors: true });
   ajv.compile(schema);
 } catch (err) {
-  fail(`heartbeat.v2.json does not compile as a JSON Schema: ${err instanceof Error ? err.message : String(err)}`);
+  fail(`heartbeat.v1.json does not compile as a JSON Schema: ${err instanceof Error ? err.message : String(err)}`);
 }
 
 const envelopeProps = (schema.properties ?? {}) as Record<string, Json>;
@@ -156,7 +156,7 @@ type Product = (typeof PRODUCTS)[number];
   }
   const branches = schema.oneOf;
   if (!Array.isArray(branches) || branches.length !== PRODUCTS.length) {
-    fail(`heartbeat.v2.json must carry exactly ${PRODUCTS.length} oneOf branches, one per product`);
+    fail(`heartbeat.v1.json must carry exactly ${PRODUCTS.length} oneOf branches, one per product`);
   } else {
     const seen = new Set<string>();
     for (const raw of branches) {
@@ -214,7 +214,7 @@ function checkEntry(where: string, leafPath: string, entry: Json, leaf: Json): v
   }
   if (temporal === "cumulative") {
     fail(
-      `${where} "${leafPath}": temporal "cumulative" is FORBIDDEN on every v2 leaf — normalise to a per-day delta at the emitter (gate G2), never on the wire`,
+      `${where} "${leafPath}": temporal "cumulative" is FORBIDDEN on every leaf — normalise to a per-day delta at the emitter (gate G2), never on the wire`,
     );
   } else if (typeof temporal !== "string" || !TEMPORAL_CLASSES.has(temporal)) {
     fail(`${where} "${leafPath}": temporal ${JSON.stringify(temporal)} is not one of ${[...TEMPORAL_CLASSES].join(" | ")}`);

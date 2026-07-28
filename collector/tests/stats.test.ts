@@ -1,15 +1,15 @@
 // Gate G5 — per-product stats.
 //
-// The failure this replaces: the pre-v2 fold read brokkr's `sessions`, `spine`
-// and `models` as though every payload had them. Under v2 they live under
-// `metrics`, and saga and skuld do not have them at all — so the old fold does
+// The failure this replaces: an earlier fold read brokkr's `sessions`, `spine`
+// and `models` as though every payload had them. They live under `metrics`,
+// and saga and skuld do not have them at all — so the old fold does
 // not just produce wrong numbers for another product, it 500s. Every test here
 // exists to keep that from coming back.
 
 import { describe, expect, test } from 'bun:test';
 import { foldRates, foldTotals, type TotalsValue } from '../src/totals';
 import { ingestReq, makeHarness, statsReq } from './helpers';
-import { INSTANCE_A, makeV1, makeV2, SECRET_A } from './fixtures';
+import { INSTANCE_A, makeHeartbeat, SECRET_A } from './fixtures';
 
 async function statsFor(
   h: ReturnType<typeof makeHarness>,
@@ -24,7 +24,7 @@ async function statsFor(
 describe('stats: the day echo', () => {
   test('a day is the stored document minus instance_id, plus brokkr’s computed tokens_saved', async () => {
     const h = makeHarness();
-    const hb = makeV2('brokkr', INSTANCE_A);
+    const hb = makeHeartbeat('brokkr', INSTANCE_A);
     expect((await h.handler(ingestReq(hb, SECRET_A))).status).toBe(202);
 
     const body = await statsFor(h, 'brokkr');
@@ -37,7 +37,7 @@ describe('stats: the day echo', () => {
 
   test('tokens_saved floors at zero when the compacted form is larger', async () => {
     const h = makeHarness();
-    const hb = makeV2('brokkr', INSTANCE_A);
+    const hb = makeHeartbeat('brokkr', INSTANCE_A);
     hb['metrics'].spine = { joints: 1, tokens_before: 100, tokens_after: 500, estimated: false };
     await h.handler(ingestReq(hb, SECRET_A));
     const body = await statsFor(h, 'brokkr');
@@ -45,11 +45,14 @@ describe('stats: the day echo', () => {
     expect(body.totals.spine_tokens_saved).toBe(0);
   });
 
-  test('a v1 heartbeat reads back in the v2 shape', async () => {
+  test('a stored day reads back byte-for-byte as it was accepted', async () => {
+    // No normalization exists on either side of the store, so the read path
+    // must hand back exactly what the validator accepted (minus instance_id,
+    // plus brokkr's computed tokens_saved).
     const h = makeHarness();
-    await h.handler(ingestReq(makeV1(INSTANCE_A), SECRET_A));
+    await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A));
     const body = await statsFor(h, 'brokkr');
-    expect(body.days[0].schema_version).toBe(2);
+    expect(body.days[0].schema_version).toBe(1);
     expect(body.days[0].product).toEqual({ name: 'brokkr', version: '0.1.0' });
     expect(body.days[0].metrics.sessions.count).toBe(12);
     expect(body.totals.sessions).toBe(12);
@@ -59,7 +62,7 @@ describe('stats: the day echo', () => {
 describe('stats: totals per product — and NO 500 when a section is absent', () => {
   test('saga stats do not touch brokkr’s sections', async () => {
     const h = makeHarness();
-    expect((await h.handler(ingestReq(makeV2('saga', INSTANCE_A), SECRET_A))).status).toBe(202);
+    expect((await h.handler(ingestReq(makeHeartbeat('saga', INSTANCE_A), SECRET_A))).status).toBe(202);
     const body = await statsFor(h, 'saga');
     expect(body.product).toBe('saga');
     expect(body.totals).toEqual({
@@ -80,7 +83,7 @@ describe('stats: totals per product — and NO 500 when a section is absent', ()
 
   test('skuld stats likewise', async () => {
     const h = makeHarness();
-    await h.handler(ingestReq(makeV2('skuld', INSTANCE_A), SECRET_A));
+    await h.handler(ingestReq(makeHeartbeat('skuld', INSTANCE_A), SECRET_A));
     const body = await statsFor(h, 'skuld');
     expect(body.totals.runs_total).toBe(20);
     expect(body.totals.runs_succeeded).toBe(18);
@@ -144,13 +147,13 @@ describe('stats: totals per product — and NO 500 when a section is absent', ()
     // A product this collector has no summary for must not become a crash
     // path. (No route can reach this state today — ingest and read both gate
     // on the storable set — which is exactly why it is asserted at the unit.)
-    expect(foldTotals('newthing', [makeV2('brokkr')])).toEqual({});
+    expect(foldTotals('newthing', [makeHeartbeat('brokkr')])).toEqual({});
     expect(foldTotals('', [])).toEqual({});
   });
 
   test('a stored payload with none of the product’s sections yields zeros, and still serves its days', async () => {
     const h = makeHarness();
-    await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A), SECRET_A));
+    await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A));
     h.db.recordHeartbeat(INSTANCE_A, 'saga', '2026-07-09', 2, JSON.stringify({ weird: true }), '2026-07-09');
     const r = await h.handler(statsReq(INSTANCE_A, 'saga', { secret: SECRET_A }));
     expect(r.status).toBe(200);
@@ -162,7 +165,7 @@ describe('stats: totals per product — and NO 500 when a section is absent', ()
 
   test('a corrupt stored row degrades to a placeholder rather than denying the whole history', async () => {
     const h = makeHarness();
-    await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-08'), SECRET_A));
+    await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A, '2026-07-08'), SECRET_A));
     h.db.recordHeartbeat(INSTANCE_A, 'brokkr', '2026-07-09', 2, 'not json', '2026-07-09');
     const body = await statsFor(h, 'brokkr');
     expect(body.days.length).toBe(2);
@@ -174,10 +177,10 @@ describe('stats: totals per product — and NO 500 when a section is absent', ()
 describe('stats: temporal classes', () => {
   test('delta leaves sum across the window; gauges take the LAST sample', async () => {
     const h = makeHarness();
-    const d1 = makeV2('saga', INSTANCE_A, '2026-07-07');
+    const d1 = makeHeartbeat('saga', INSTANCE_A, '2026-07-07');
     d1['metrics'].collect = { runs: 10, errors: 1 };
     d1['metrics'].connections = { total: 9, by_engine: { postgres: 9 } };
-    const d2 = makeV2('saga', INSTANCE_A, '2026-07-08');
+    const d2 = makeHeartbeat('saga', INSTANCE_A, '2026-07-08');
     d2['metrics'].collect = { runs: 5, errors: 0 };
     d2['metrics'].connections = { total: 4, by_engine: { postgres: 4 } };
     for (const d of [d1, d2]) expect((await h.handler(ingestReq(d, SECRET_A))).status).toBe(202);
@@ -197,8 +200,8 @@ describe('stats: temporal classes', () => {
 
   test('booleans OR across the window', async () => {
     const h = makeHarness();
-    const d1 = makeV2('brokkr', INSTANCE_A, '2026-07-08');
-    const d2 = makeV2('brokkr', INSTANCE_A, '2026-07-09');
+    const d1 = makeHeartbeat('brokkr', INSTANCE_A, '2026-07-08');
+    const d2 = makeHeartbeat('brokkr', INSTANCE_A, '2026-07-09');
     d2['metrics'].spine.estimated = true;
     for (const d of [d1, d2]) await h.handler(ingestReq(d, SECRET_A));
     const body = await statsFor(h, 'brokkr');
@@ -213,7 +216,7 @@ describe('stats: window trimming', () => {
     const days = ['2026-07-07', '2026-07-08', '2026-07-09'];
     const counts = [10, 5, 3];
     for (const [i, day] of days.entries()) {
-      const hb = makeV2('brokkr', INSTANCE_A, day);
+      const hb = makeHeartbeat('brokkr', INSTANCE_A, day);
       hb['metrics'].sessions = { count: counts[i], minutes: counts[i]! * 10, failed: 1 };
       hb['metrics'].models = [{ name: 'claude-sonnet-5', sessions: counts[i] }];
       expect((await h.handler(ingestReq(hb, SECRET_A))).status).toBe(202);
@@ -265,11 +268,11 @@ describe('service plumbing', () => {
   });
 
   test('GET /v1/schema serves the operator-supplied text verbatim, and 404s when none is wired', async () => {
-    const withSchema = makeHarness({ schemaJson: '{"title":"heartbeat v2"}' });
+    const withSchema = makeHarness({ schemaJson: '{"title":"heartbeat v1"}' });
     const r = await withSchema.handler(new Request('http://telemetry.local/v1/schema'));
     expect(r.status).toBe(200);
     expect(r.headers.get('content-type')).toContain('application/json');
-    expect(await r.text()).toBe('{"title":"heartbeat v2"}');
+    expect(await r.text()).toBe('{"title":"heartbeat v1"}');
 
     const without = makeHarness();
     expect((await without.handler(new Request('http://telemetry.local/v1/schema'))).status).toBe(404);
@@ -304,11 +307,11 @@ describe('the FIRST heartbeat is not a one-day delta, and is excluded from every
 
   async function seedActivation(h: ReturnType<typeof makeHarness>) {
     // Day 1: the lifetime dump. Days 2 and 3: real daily deltas.
-    const first = makeV2('brokkr', INSTANCE_A, '2026-07-07');
+    const first = makeHeartbeat('brokkr', INSTANCE_A, '2026-07-07');
     first['metrics'].sessions = { count: 900, minutes: 9000, failed: 0 };
-    const second = makeV2('brokkr', INSTANCE_A, '2026-07-08');
+    const second = makeHeartbeat('brokkr', INSTANCE_A, '2026-07-08');
     second['metrics'].sessions = { count: 10, minutes: 100, failed: 0 };
-    const third = makeV2('brokkr', INSTANCE_A, '2026-07-09');
+    const third = makeHeartbeat('brokkr', INSTANCE_A, '2026-07-09');
     third['metrics'].sessions = { count: 20, minutes: 200, failed: 0 };
     for (const d of [first, second, third]) {
       expect((await h.handler(ingestReq(d, SECRET_A))).status).toBe(202);
@@ -363,7 +366,7 @@ describe('the FIRST heartbeat is not a one-day delta, and is excluded from every
     // Not zeros: "nothing representative to average" and "averaged to zero"
     // are different claims, and the second one is a lie.
     const h = makeHarness();
-    const first = makeV2('brokkr', INSTANCE_A, '2026-07-09');
+    const first = makeHeartbeat('brokkr', INSTANCE_A, '2026-07-09');
     first['metrics'].sessions = { count: 900, minutes: 9000, failed: 0 };
     await h.handler(ingestReq(first, SECRET_A));
     const body = await statsFor(h, 'brokkr');
@@ -377,10 +380,10 @@ describe('the FIRST heartbeat is not a one-day delta, and is excluded from every
     // A backfilled earlier day is an ordinary delta; the lifetime dump was the
     // first emission, whatever day it covered.
     const h = makeHarness({ today: '2026-07-09' });
-    const first = makeV2('brokkr', INSTANCE_A, '2026-07-09');
+    const first = makeHeartbeat('brokkr', INSTANCE_A, '2026-07-09');
     first['metrics'].sessions = { count: 900, minutes: 9000, failed: 0 };
     await h.handler(ingestReq(first, SECRET_A));
-    const earlier = makeV2('brokkr', INSTANCE_A, '2026-07-05');
+    const earlier = makeHeartbeat('brokkr', INSTANCE_A, '2026-07-05');
     earlier['metrics'].sessions = { count: 4, minutes: 40, failed: 0 };
     await h.handler(ingestReq(earlier, SECRET_A));
 
@@ -394,7 +397,7 @@ describe('the FIRST heartbeat is not a one-day delta, and is excluded from every
   test('re-sending the first day does not move the marker', async () => {
     const h = makeHarness();
     await seedActivation(h);
-    const resent = makeV2('brokkr', INSTANCE_A, '2026-07-07');
+    const resent = makeHeartbeat('brokkr', INSTANCE_A, '2026-07-07');
     resent['metrics'].sessions = { count: 950, minutes: 9500, failed: 0 };
     await h.handler(ingestReq(resent, SECRET_A));
     const body = await statsFor(h, 'brokkr');
@@ -404,16 +407,16 @@ describe('the FIRST heartbeat is not a one-day delta, and is excluded from every
 
   test('each (instance, product) has its OWN first-report day', async () => {
     const h = makeHarness();
-    await h.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-07'), SECRET_A));
-    await h.handler(ingestReq(makeV2('saga', INSTANCE_A, '2026-07-09'), SECRET_A));
+    await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A, '2026-07-07'), SECRET_A));
+    await h.handler(ingestReq(makeHeartbeat('saga', INSTANCE_A, '2026-07-09'), SECRET_A));
     expect((await statsFor(h, 'brokkr')).instance.first_report_day).toBe('2026-07-07');
     expect((await statsFor(h, 'saga')).instance.first_report_day).toBe('2026-07-09');
   });
 
   test('gauges are not rated, and neither is the model breakdown', async () => {
     const h = makeHarness();
-    await h.handler(ingestReq(makeV2('saga', INSTANCE_A, '2026-07-08'), SECRET_A));
-    await h.handler(ingestReq(makeV2('saga', INSTANCE_A, '2026-07-09'), SECRET_A));
+    await h.handler(ingestReq(makeHeartbeat('saga', INSTANCE_A, '2026-07-08'), SECRET_A));
+    await h.handler(ingestReq(makeHeartbeat('saga', INSTANCE_A, '2026-07-09'), SECRET_A));
     const body = await statsFor(h, 'saga');
     // A mean of snapshots is not a rate of anything.
     expect(body.rates.per_day.connections_total).toBeUndefined();
@@ -421,8 +424,8 @@ describe('the FIRST heartbeat is not a one-day delta, and is excluded from every
     expect(body.totals.connections_total).toBe(4);
     // ...and brokkr's model table is a breakdown, not a quantity per day.
     const b = makeHarness();
-    await b.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-08'), SECRET_A));
-    await b.handler(ingestReq(makeV2('brokkr', INSTANCE_A, '2026-07-09'), SECRET_A));
+    await b.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A, '2026-07-08'), SECRET_A));
+    await b.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A, '2026-07-09'), SECRET_A));
     expect((await statsFor(b, 'brokkr')).rates.per_day.models).toBeUndefined();
   });
 });
