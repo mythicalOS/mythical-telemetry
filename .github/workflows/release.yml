@@ -5,9 +5,22 @@ name: Release
 # npmjs.com (Settings -> package -> Trusted Publisher):
 #   repository = mythicalOS/mythical-telemetry, workflow = release.yml
 #
-# NOTE: the FIRST publish of a brand-new package name cannot use trusted
-# publishing — npm has no package to attach a publisher to yet. That first
-# release is a deliberate human step; every subsequent one runs from here.
+# NOTE — the bootstrap, recorded so nobody repeats the investigation:
+# the FIRST publish of a brand-new package name cannot use trusted publishing.
+# npm's own prerequisite is that "the package you're configuring must already
+# exist on the npm registry", so there is nothing to attach a publisher to, and
+# a publish with no publisher is refused with a 404 (npm answers 404 rather than
+# 403 so an unauthorised publish cannot probe for a name).
+#
+# 0.1.1 was therefore published with a short-lived classic Automation token held
+# as a repository secret and read here, in CI — never from a laptop. A GRANULAR
+# token is not enough: it does not bypass the account's 2FA-on-write, and fails
+# with EOTP. That token has since been revoked and the secret deleted; this
+# workflow now runs on OIDC alone, and a token reappearing here would be a
+# regression.
+#
+# Note 0.1.1 still carries provenance despite the token: `--provenance` needs the
+# OIDC id-token PERMISSION, not OIDC authentication.
 #
 # Why npm and not `bun publish`: provenance is an npm feature; bun cannot emit it.
 
@@ -118,31 +131,3 @@ jobs:
           fi
           echo "publishing ${name}@${version} (with provenance)"
           cd packages/telemetry && npm publish --provenance --access public
-        env:
-          # ── ONE-TIME BOOTSTRAP — REMOVE THIS ENV BLOCK AFTER THE FIRST RELEASE ──
-          #
-          # Trusted publishing cannot create a package. npm's own rule is
-          # "the package you're configuring must already exist on the registry",
-          # so a publisher cannot be attached to a name that has never been
-          # published, and the first release of a new name has nowhere to
-          # authenticate from. v0.1.0 proved it: every gate passed, the
-          # provenance statement was signed and logged, and the registry then
-          # refused the upload with a 404.
-          #
-          # So the first release authenticates with a short-lived granular
-          # token, held as a repository secret and used HERE, inside the
-          # workflow — never from a laptop. Once the package exists, a trusted
-          # publisher is attached to it, the secret is deleted, and this block
-          # goes with it; `id-token: write` above then carries every subsequent
-          # release on OIDC alone.
-          #
-          # Note this still emits provenance: `--provenance` needs the OIDC
-          # id-token permission, not OIDC *authentication*. The sibling repo's
-          # first releases lack provenance only because they used a publisher
-          # that cannot emit it, not because they used a token.
-          #
-          # When the secret is absent this is empty and npm falls back to OIDC,
-          # so leaving it in place does not silently pin the repo to token auth
-          # — but remove it anyway, so the next reader is not left wondering
-          # which path a release actually took.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
