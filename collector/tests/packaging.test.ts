@@ -76,6 +76,10 @@ describe('operator artifacts are present', () => {
       /MYTHICAL_TELEMETRY_ACCEPT_V1/,
       /\bnormali[sz]ed to (?:the )?v2\b/i,
       /ingest_accepted_wire_v|ingest_rejected_v1_window_closed/,
+      // The prose form, not just the identifier: a bullet promising counts
+      // "split by wire version" outlived the counters once already.
+      /\bwire version\b/i,
+      /\bv1 and v2\b/i,
     ]) {
       expect(stale.test(readme), `README describes a retired compatibility path: ${stale}`).toBe(false);
     }

@@ -299,8 +299,6 @@ high is the dangerous direction: it selects a position an attacker can write.
   and a zero are indistinguishable otherwise, and a rejection class that silently never registers
   is the failure this exists to prevent;
 - aggregate serves versus aggregate recomputes, so the cache's effectiveness is visible;
-- accepted counts split by wire version, which is the number the compatibility-window decision
-  actually needs;
 - store gauges (identities total, identities admitted today) against their configured budgets;
 - the boot-time migration report;
 - throttle map sizes.

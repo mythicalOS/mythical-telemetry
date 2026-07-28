@@ -5,6 +5,7 @@
 
 import { describe, expect, test } from 'bun:test';
 import { ingestReq, legacyIngestReq, makeHarness, statsReq } from './helpers';
+import { loadCanonicalValidator } from '../src/validator';
 import {
   AlwaysOkValidator,
   INSTANCE_A,
@@ -361,6 +362,42 @@ describe('ingest: the retired legacy shape is refused, never misread', () => {
     expect(text).not.toContain('someone');
     expect(text).not.toContain('repo_name');
     expect(text).not.toContain('daemon_version');
+  });
+
+  // Every test above runs against the injected StubValidator, which proves the
+  // ROUTE behaves — but would keep passing if the canonical validator in the
+  // client package started accepting the retired shape, because the stub is
+  // this repository's own approximation. This one closes that gap end to end:
+  // the REAL validator, wired the way production wires it, through the real
+  // handler. The positive control is what makes the rejection mean something —
+  // without it, a validator that refused everything would look identical.
+  test('the CANONICAL validator, wired as production wires it, refuses it too', async () => {
+    const validator = await loadCanonicalValidator();
+    const { handler, db } = makeHarness({ validator });
+
+    // Positive control: the current shape is accepted by the real validator.
+    const current = makeHeartbeat('brokkr', INSTANCE_A);
+    expect((await handler(ingestReq(current, SECRET_A))).status).toBe(202);
+    expect(db.countHeartbeats(INSTANCE_A, 'brokkr')).toBe(1);
+
+    // Proof this really is the CANONICAL validator and not the stub, which
+    // would make the rejection below prove nothing about the shipped package:
+    // the stub only checks that a body carries the right SECTION NAMES, so it
+    // accepts this skuld fixture, while the canonical validator refuses it on
+    // `events.deferrals` (a leaf that does not exist) and on `detection_state`
+    // being outside its closed enum.
+    const stubWouldAccept = makeHeartbeat('skuld', INSTANCE_A);
+    expect((await handler(ingestReq(stubWouldAccept, SECRET_A))).status).toBe(400);
+    expect(db.countHeartbeats(INSTANCE_A, 'skuld')).toBe(0);
+
+    // ...and the retired shape, carrying the SAME schema_version, is not.
+    const legacy = makeLegacyShape(INSTANCE_B);
+    expect(legacy['schema_version']).toBe(current['schema_version']);
+    const r = await handler(ingestReq(legacy, SECRET_B));
+    expect(r.status).toBe(400);
+    expect(await r.json()).toEqual({ ok: false, error: 'invalid_payload' });
+    expect(db.countHeartbeats(INSTANCE_B, 'brokkr')).toBe(0);
+    expect(db.countInstances()).toBe(1); // only the accepted one
   });
 });
 

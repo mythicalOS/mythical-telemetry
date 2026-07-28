@@ -282,7 +282,7 @@ describe("postPinned", () => {
   test("a non-2xx surfaces the STATUS and nothing else", async () => {
     const { port } = await serve((_req, res) => {
       res.writeHead(400, { "content-type": "text/plain" });
-      res.end("schema_version 2 not supported");
+      res.end("rejected, and here is a body you must not repeat");
     });
     const result = await postPinned({ endpoint: await pinnedTo(port), body: "{}", headers: {}, timeoutMs: 2000 });
     expect(result.ok).toBe(false);
