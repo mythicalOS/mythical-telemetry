@@ -552,6 +552,31 @@ describe('migration against a REAL old-schema database', () => {
     expect(userVersion(path)).toBe(SCHEMA_USER_VERSION);
   });
 
+  test('a carried-over identity with no heartbeats is dropped by the first prune', () => {
+    // The old row cap could leave an identity behind after every heartbeat of it
+    // had gone — a stable id, its first and last seen days, and nothing it
+    // describes. Those rows are exactly what an upgraded volume is full of, and
+    // the first prune must take them however recent their last-seen day looks.
+    const path = tempDbPath();
+    seedOldDatabase(path, [{ instanceId: 'stranded', day: '2026-07-27', payload: '{"a":1}' }]);
+    const raw = new Database(path);
+    raw.query('DELETE FROM heartbeats').run(); // as the old cap could have left it
+    raw.close();
+
+    const db = new TelemetryDb({ path });
+    try {
+      expect(db.getInstance('stranded', LEGACY_PRODUCT)).not.toBeNull();
+      // Its last-seen day is yesterday, so no arrival-age rule would touch it.
+      const report = db.pruneRetention('2026-07-28');
+      expect(report.expired_heartbeats).toBe(0);
+      expect(report.expired_instances).toBe(1);
+      expect(db.getInstance('stranded', LEGACY_PRODUCT)).toBeNull();
+      expect(db.countInstances()).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
   test('an existing volume gains the retention index at boot — no operator step, no rebuild', () => {
     // This is the whole answer to "what does an existing database need on first
     // boot after the retention clock landed": nothing. The index DDL is

@@ -446,18 +446,24 @@ start-up and every 24 hours, so "deleted by the next daily pass" is the exact cl
 the ninetieth day" is not. State whatever you configure in your privacy notice; it is a published
 property, not an implementation detail.
 
-Two things expire, on the same clock:
+Two things expire:
 
 | Row | Deleted when |
 |---|---|
 | a `heartbeats` row | its `received_day` is older than the window |
-| an `instances` row | its last arrival is older than the window **and** no heartbeat of that identity is left |
+| an `instances` row | **no heartbeat of that identity remains** |
 
 The `instances` row expires because it is pseudonymous personal data in its own right — a stable id
 plus the days it was active — and keeping it after everything it described was deleted would leave
-an indefinite record of who reported and when. The `NOT EXISTS` half of the condition is what makes
-that safe: the identity row is the only way to read the heartbeats keyed to it, so it always
-outlives the last of them, and no heartbeat is ever orphaned.
+an indefinite record of who reported and when. Its condition is *only* that nothing of the identity
+is left, which says both halves of what that row is for: it must outlive every heartbeat keyed to it
+(it is the only way to read them, so nothing is ever orphaned) and it must not outlive the last one.
+
+Adding "…and its last arrival is older than the window" to that condition looks like belt and braces
+and is a hole: the row cap deletes by the day a record *describes*, so it can remove the heartbeat
+that carried the newest *arrival*, leaving `last_seen_day` pointing at a row that no longer exists.
+The identity would then be kept for up to a whole window after the last thing it described was
+deleted, and would be published in the aggregate as an installation with nothing held for it.
 
 **The cutoff is on arrival (`received_day`), not on the day the data describes (`day`).** Retention
 is a promise about how long *we* hold a record, so its clock starts when the record reaches us.
