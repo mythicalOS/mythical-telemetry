@@ -78,6 +78,15 @@ function columns(path: string, table: string): Array<{ name: string; pk: number 
   return rows;
 }
 
+function indexNames(path: string): string[] {
+  const db = new Database(path, { readonly: true });
+  const rows = db
+    .query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+    .all();
+  db.close();
+  return rows.map((r) => r.name);
+}
+
 function userVersion(path: string): number {
   const db = new Database(path, { readonly: true });
   const v = db.query<{ user_version: number }, []>('PRAGMA user_version').get()?.user_version ?? 0;
@@ -541,6 +550,33 @@ describe('migration against a REAL old-schema database', () => {
       db.close();
     }
     expect(userVersion(path)).toBe(SCHEMA_USER_VERSION);
+  });
+
+  test('an existing volume gains the retention index at boot — no operator step, no rebuild', () => {
+    // This is the whole answer to "what does an existing database need on first
+    // boot after the retention clock landed": nothing. The index DDL is
+    // idempotent and runs on every boot, and an index is not a table shape, so
+    // no user_version bump and no rebuild are involved. The FIRST prune
+    // afterwards may delete a great deal at once — everything already past the
+    // window — which is the fix working, not a fault.
+    const path = tempDbPath();
+    seedOldDatabase(path, [{ instanceId: 'id-1', day: '2026-01-01', payload: '{"a":1}' }]);
+    const db = new TelemetryDb({ path });
+    try {
+      expect(indexNames(path)).toContain('idx_heartbeats_received_day');
+      // ...and the clock reaches the carried-over rows immediately.
+      expect(db.pruneRetention('2026-07-28').expired_heartbeats).toBe(1);
+    } finally {
+      db.close();
+    }
+    // Re-opening is a no-op that still leaves the index in place.
+    const again = new TelemetryDb({ path });
+    try {
+      expect(indexNames(path)).toContain('idx_heartbeats_received_day');
+      expect(again.migration.rebuiltHeartbeats).toBe(false);
+    } finally {
+      again.close();
+    }
   });
 
   test('a failure inside the migration leaves the old database untouched', () => {

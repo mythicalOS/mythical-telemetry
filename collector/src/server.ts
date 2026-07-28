@@ -35,7 +35,7 @@
 // and never-existed instances are indistinguishable.
 
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { dayToEpochUtc, MS_PER_DAY, shiftDay } from './day';
+import { dayToEpochUtc, INGEST_DAY_WINDOW_DAYS, MS_PER_DAY, shiftDay } from './day';
 import type { TelemetryDb } from './db';
 import { authorizesInstance, UUID_V4_RE } from './identity';
 import { Counters, type CounterName } from './counters';
@@ -65,7 +65,6 @@ export const DEFAULT_ACTIVE_WINDOW_DAYS = 28;
  */
 export const DEFAULT_AGGREGATE_CACHE_MS = 60_000;
 
-const DAY_WINDOW_DAYS = 30;
 const MINUTE_MS = 60_000;
 const HOUR_MS = 3_600_000;
 
@@ -329,8 +328,10 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
       return rejectIngest(400, 'invalid_payload', 'ingest_rejected_unknown_product');
     }
 
-    // (7) day window: day ≤ today UTC and ≥ today−30. Heartbeats are recent by
-    // construction, and this also rejects regex-passing non-calendar days.
+    // (7) day window: day ≤ today UTC and ≥ today − INGEST_DAY_WINDOW_DAYS.
+    // Heartbeats are recent by construction, and this also rejects
+    // regex-passing non-calendar days. The bound is shared with the retention
+    // arithmetic (see day.ts) because the row cap has to allow for it.
     const today = nowUtcDay();
     const dayEpoch = dayToEpochUtc(hb.day);
     const todayEpoch = dayToEpochUtc(today);
@@ -338,7 +339,7 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
       return rejectIngest(400, 'invalid_payload', 'ingest_rejected_day_out_of_window');
     }
     const age = (todayEpoch - dayEpoch) / MS_PER_DAY;
-    if (age < 0 || age > DAY_WINDOW_DAYS) {
+    if (age < 0 || age > INGEST_DAY_WINDOW_DAYS) {
       return rejectIngest(400, 'invalid_payload', 'ingest_rejected_day_out_of_window');
     }
 
@@ -558,6 +559,11 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
     return {
       generated_day: today,
       active_window_days: DEFAULT_ACTIVE_WINDOW_DAYS,
+      // Published because it changes what the figures MEAN. Identity rows expire
+      // with the last heartbeat of that identity, so "installations seen" counts
+      // installations seen within the retention window — not since the beginning.
+      // An unqualified "seen" would read as all-time and quietly overstate.
+      retention_days: db.retentionDays,
       min_cell: minCell,
       products,
     };
@@ -579,6 +585,7 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
       contract_version: 2,
       generated_day: view.generated_day,
       active_window_days: view.active_window_days,
+      retention_days: view.retention_days,
       min_cell: view.min_cell,
       products: view.products,
       // Stated in the payload, not only in prose, so a consumer cannot treat
@@ -612,6 +619,13 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
         max_instances: db.maxInstances,
         new_instances_per_day: db.newInstancesPerDay,
         retention_days: db.retentionDays,
+        max_rows_per_instance: db.maxRowsPerInstance,
+        // The retention clock's own receipt: what the last prune deleted, and the
+        // window it used. Null until one has run in this process. Without this an
+        // operator has no way to see whether retention is actually happening —
+        // and a retention control nobody can observe is how the previous one went
+        // years without deleting anything.
+        last_prune: db.lastPrune,
       },
       throttle: {
         trusted_proxy_hops: trustedProxyHops,

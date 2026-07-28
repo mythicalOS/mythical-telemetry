@@ -7,7 +7,8 @@ import { Database } from 'bun:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { TelemetryDb } from '../src/db';
+import { INGEST_DAY_WINDOW_DAYS } from '../src/day';
+import { maxRowsFor, TelemetryDb } from '../src/db';
 
 const payload = (day: string) => JSON.stringify({ day, schema_version: 1, metrics: {} });
 
@@ -116,16 +117,154 @@ describe('TelemetryDb basics', () => {
   });
 });
 
-describe('retention prune (per-instance, per-product row cap)', () => {
+describe('retention is a CLOCK — rows expire by age, whether or not an install still reports', () => {
+  test('an install that STOPPED reporting has its rows deleted once they age past the window', () => {
+    // THE REGRESSION THIS FILE EXISTS FOR. Before the clock, the prune was a
+    // per-(instance, product) row cap and nothing else: this installation has
+    // ten rows, far fewer than the cap, so no prune ever deleted one of them and
+    // its data was kept indefinitely — three years after it last said anything.
+    // The published commitment ("everything already held expires within a
+    // quarter") was therefore false for exactly the population least able to
+    // notice: the ones who stopped.
+    const db = new TelemetryDb({ path: ':memory:', retentionDays: 90 });
+    const days = Array.from({ length: 10 }, (_, i) => `2023-01-${String(i + 1).padStart(2, '0')}`);
+    for (const day of days) db.recordHeartbeat('gone-quiet', 'brokkr', day, 2, payload(day), day);
+    expect(db.countHeartbeats('gone-quiet', 'brokkr')).toBe(10);
+
+    const report = db.pruneRetention('2026-07-28');
+    expect(report.expired_heartbeats).toBe(10);
+    // ...and the cap deleted NOTHING, which is the point: with only the cap
+    // there was no control that could ever have touched these rows.
+    expect(report.capped_heartbeats).toBe(0);
+    expect(db.countHeartbeats('gone-quiet', 'brokkr')).toBe(0);
+    // The identity row goes too — it is pseudonymous personal data by itself.
+    expect(report.expired_instances).toBe(1);
+    expect(db.getInstance('gone-quiet', 'brokkr')).toBeNull();
+    expect(db.countInstances()).toBe(0);
+    db.close();
+  });
+
+  test('the boundary: the window counts the arrival day, and the day after it is gone', () => {
+    const db = new TelemetryDb({ path: ':memory:', retentionDays: 90 });
+    // 90 days ending 2026-07-28 inclusive starts on 2026-04-30. One row on the
+    // first day inside the window, one on the last day outside it.
+    db.recordHeartbeat('edge', 'brokkr', '2026-04-30', 2, payload('in'), '2026-04-30');
+    db.recordHeartbeat('edge', 'brokkr', '2026-04-29', 2, payload('out'), '2026-04-29');
+
+    const report = db.pruneRetention('2026-07-28');
+    expect(report.cutoff_day).toBe('2026-04-30');
+    expect(report.expired_heartbeats).toBe(1);
+    expect(db.getHeartbeats('edge', 'brokkr').map((r) => r.day)).toEqual(['2026-04-30']);
+    // One day later the surviving row is on the wrong side of the cutoff.
+    expect(db.pruneRetention('2026-07-29').expired_heartbeats).toBe(1);
+    expect(db.countHeartbeats('edge', 'brokkr')).toBe(0);
+    db.close();
+  });
+
+  test('the clock is on ARRIVAL, so a late backfill gets its full window', () => {
+    // A heartbeat for an old `day` that arrived today has been held for one day,
+    // not for a month, and retention is a promise about how long WE hold it.
+    // Keying on `day` would give this row two months of window instead of three,
+    // purely because delivery was late.
+    const db = new TelemetryDb({ path: ':memory:', retentionDays: 90 });
+    db.recordHeartbeat('backfiller', 'brokkr', '2026-06-28', 2, payload('late'), '2026-07-28');
+    expect(db.pruneRetention('2026-07-28').expired_heartbeats).toBe(0);
+    expect(db.countHeartbeats('backfiller', 'brokkr')).toBe(1);
+    // It survives until 90 days after it ARRIVED...
+    expect(db.pruneRetention('2026-10-25').expired_heartbeats).toBe(0);
+    // ...and no longer. (Had `day` been the basis it would already have gone.)
+    expect(db.pruneRetention('2026-10-26').expired_heartbeats).toBe(1);
+    db.close();
+  });
+
+  test('no stored value outlives the window — not even one that is not a date', () => {
+    // Nothing in this service writes such a value (`received_day` is always the
+    // server's own UTC day), but the survival rule has to be TOTAL: the failure
+    // mode of an unrecognised date is a row no cutoff ever passes, which is the
+    // defect all over again in a different costume.
+    const db = new TelemetryDb({ path: ':memory:', retentionDays: 90 });
+    db.recordHeartbeat('sorts-high', 'brokkr', '2026-07-20', 2, payload('a'), 'not-a-day');
+    db.recordHeartbeat('empty', 'brokkr', '2026-07-20', 2, payload('c'), '');
+    db.recordHeartbeat('far-future', 'brokkr', '2026-07-20', 2, payload('d'), '2099-01-01');
+    // Malformed but sorting INSIDE today's window, and a stamp only slightly
+    // ahead of today — a replica a few minutes fast, which is real data.
+    db.recordHeartbeat('malformed-in-range', 'brokkr', '2026-07-20', 2, payload('b'), '2026-07-2X');
+    db.recordHeartbeat('bit-fast', 'brokkr', '2026-07-20', 2, payload('e'), '2026-07-29');
+
+    // Anything below the cutoff or above the horizon goes at once.
+    expect(db.pruneRetention('2026-07-28').expired_heartbeats).toBe(3);
+    expect(db.countHeartbeats('malformed-in-range', 'brokkr')).toBe(1);
+    expect(db.countHeartbeats('bit-fast', 'brokkr')).toBe(1);
+
+    // Both survivors expire on the ordinary clock, because the cutoff rises past
+    // every fixed string: `2026-07-2X` sorts alongside its well-formed
+    // neighbours, so it goes with them rather than living for ever.
+    expect(db.pruneRetention('2026-10-26').expired_heartbeats).toBe(0);
+    expect(db.pruneRetention('2026-10-27').expired_heartbeats).toBe(2);
+    expect(db.countHeartbeats('malformed-in-range', 'brokkr')).toBe(0);
+    expect(db.countHeartbeats('bit-fast', 'brokkr')).toBe(0);
+    expect(db.countInstances()).toBe(0); // and every identity row with them
+    db.close();
+  });
+
+  test('an identity row is never orphaned: it outlives every heartbeat keyed to it', () => {
+    const db = new TelemetryDb({ path: ':memory:', retentionDays: 90 });
+    db.recordHeartbeat('mixed', 'brokkr', '2026-01-01', 2, payload('old'), '2026-01-01');
+    db.recordHeartbeat('mixed', 'brokkr', '2026-07-20', 2, payload('new'), '2026-07-20');
+
+    const report = db.pruneRetention('2026-07-28');
+    expect(report.expired_heartbeats).toBe(1);
+    // Still reporting, so the identity row stays — it is the only way to read
+    // the row that survived, and first_report_day rides on it.
+    expect(report.expired_instances).toBe(0);
+    expect(db.getInstance('mixed', 'brokkr')).not.toBeNull();
+    expect(db.getHeartbeats('mixed', 'brokkr').map((r) => r.day)).toEqual(['2026-07-20']);
+    db.close();
+  });
+
+  test('a stopped install is fully forgotten: no identity row, and no way back to it', () => {
+    const db = new TelemetryDb({ path: ':memory:', retentionDays: 30 });
+    db.recordHeartbeat('forgotten', 'brokkr', '2026-01-01', 2, payload('a'), '2026-01-01');
+    db.recordHeartbeat('forgotten', 'saga', '2026-01-01', 2, payload('a'), '2026-01-01');
+    db.pruneRetention('2026-07-28');
+
+    // Both products' rows are gone, and the ONLY trace left anywhere in the
+    // store is the admission ledger's count for that day — a number, with no
+    // identity in it. That is the one thing deliberately retained.
+    expect(db.countInstances()).toBe(0);
+    expect(db.getInstance('forgotten', 'brokkr')).toBeNull();
+    expect(db.getInstance('forgotten', 'saga')).toBeNull();
+    expect(db.admittedOnDay('2026-01-01')).toBe(2);
+    db.close();
+  });
+
+  test('pruneRetention REFUSES a day it cannot parse rather than computing a garbage cutoff', () => {
+    // An unparseable day would flow into a text comparison and delete everything
+    // or nothing. Both are silent; neither is acceptable in a delete path.
+    const db = new TelemetryDb({ path: ':memory:' });
+    db.recordHeartbeat('id-1', 'brokkr', '2026-07-20', 2, payload('a'), '2026-07-20');
+    for (const bad of ['', 'today', '2026-7-1', '2026-02-30', '20260728']) {
+      expect(() => db.pruneRetention(bad)).toThrow(/real UTC calendar day/);
+    }
+    expect(db.countHeartbeats('id-1', 'brokkr')).toBe(1);
+    db.close();
+  });
+});
+
+describe('the row cap behind the clock (a pathology bound, NOT retention)', () => {
   test('keeps the newest N rows per (instance, product), drops the oldest', () => {
-    const db = new TelemetryDb({ path: ':memory:', retentionDays: 3 });
+    // Note the explicit cap: the retention window no longer doubles as one, so a
+    // test about the cap has to say which control it is exercising.
+    const db = new TelemetryDb({ path: ':memory:', retentionDays: 90, maxRowsPerInstance: 3 });
     for (const day of ['2026-07-01', '2026-07-02', '2026-07-03', '2026-07-04', '2026-07-05']) {
       db.recordHeartbeat('id-1', 'brokkr', day, 2, payload(day), day);
       db.recordHeartbeat('id-1', 'saga', day, 2, payload(day), day);
     }
     db.recordHeartbeat('id-2', 'brokkr', '2026-06-01', 2, payload('x'), '2026-06-01');
 
-    expect(db.pruneRetention()).toBe(4); // 2 per (id-1, product)
+    const report = db.pruneRetention('2026-07-05');
+    expect(report.capped_heartbeats).toBe(4); // 2 per (id-1, product)
+    expect(report.expired_heartbeats).toBe(0); // nothing is old enough
     expect(db.getHeartbeats('id-1', 'brokkr').map((r) => r.day)).toEqual([
       '2026-07-03', '2026-07-04', '2026-07-05',
     ]);
@@ -135,6 +274,32 @@ describe('retention prune (per-instance, per-product row cap)', () => {
     ]);
     expect(db.getHeartbeats('id-2', 'brokkr').map((r) => r.day)).toEqual(['2026-06-01']);
     db.close();
+  });
+
+  test('the default cap allows a whole ingest window of backfill, so it cannot pass for retention', () => {
+    // A cap equal to the retention window would trim a backfilling install's
+    // oldest days before the clock reached them — the cap doing retention's job,
+    // which is the conflation this change exists to end.
+    expect(maxRowsFor(90)).toBe(90 + INGEST_DAY_WINDOW_DAYS + 1);
+    expect(new TelemetryDb({ path: ':memory:', retentionDays: 90 }).maxRowsPerInstance).toBe(maxRowsFor(90));
+
+    const db = new TelemetryDb({ path: ':memory:', retentionDays: 5 });
+    // Six distinct days, every one arriving today: more than the retention
+    // window's worth of rows, all of them inside the window by arrival.
+    for (const day of ['2026-07-23', '2026-07-24', '2026-07-25', '2026-07-26', '2026-07-27', '2026-07-28']) {
+      db.recordHeartbeat('backfiller', 'brokkr', day, 2, payload(day), '2026-07-28');
+    }
+    const report = db.pruneRetention('2026-07-28');
+    expect(report.capped_heartbeats).toBe(0);
+    expect(report.expired_heartbeats).toBe(0);
+    expect(db.countHeartbeats('backfiller', 'brokkr')).toBe(6);
+    db.close();
+  });
+
+  test('a cap below 1 is refused, like a retention below 1', () => {
+    expect(() => new TelemetryDb({ path: ':memory:', maxRowsPerInstance: 0 })).toThrow(/at least 1/);
+    expect(() => new TelemetryDb({ path: ':memory:', maxRowsPerInstance: -1 })).toThrow(/at least 1/);
+    expect(() => new TelemetryDb({ path: ':memory:', maxRowsPerInstance: 2.5 })).toThrow(/at least 1/);
   });
 });
 
@@ -267,18 +432,24 @@ describe('admission control — the decision and the write are one transaction',
   });
 
   test('the ledger is NEVER pruned, so no clock movement can hand back a spent budget', () => {
-    // Pruning it is the only operation that can free budget, and a
-    // clock-driven prune is exactly the lever: jump forward past the horizon,
-    // let the prune drop a day, move back, and that day is fresh again.
+    // Pruning it is the only operation that can free budget, and a clock-driven
+    // prune is exactly the lever: jump forward past the horizon, let the prune
+    // drop a day, move back, and that day is fresh again. The heartbeat and
+    // identity prunes ARE clock-driven — they have to be, a time-based promise
+    // needs a clock — but neither can refund anything, because the ledger they
+    // are checked against only ever increases.
     const db = new TelemetryDb({ path: ':memory:', retentionDays: 1, newInstancesPerDay: 1 });
     db.recordHeartbeat('id-1', 'brokkr', '2026-07-09', 2, payload('a'), '2026-07-09');
     for (const day of ['2026-07-10', '2026-07-11', '2027-01-01', '2030-01-01']) {
       db.recordHeartbeat(`id-${day}`, 'brokkr', day, 2, payload('a'), day);
     }
-    db.pruneRetention();
-    db.pruneRetention();
-    // The original day's row is still there, however far the clock has moved.
+    // Prune far past every one of those days, then move the clock back.
+    db.pruneRetention('2031-01-01');
+    db.pruneRetention('2026-07-09');
+    // The original day's row is still there, however far the clock has moved,
+    // and every identity admitted on it has long since been expired.
     expect(db.admittedOnDay('2026-07-09')).toBe(1);
+    expect(db.countInstances()).toBe(0);
     expect(db.recordHeartbeat('id-2', 'brokkr', '2026-07-09', 2, payload('a'), '2026-07-09')).toEqual({
       ok: false,
       reason: 'daily_admission_budget',
@@ -291,7 +462,7 @@ describe('admission control — the decision and the write are one transaction',
     for (const day of ['2026-07-01', '2026-07-02', '2026-07-03', '2026-07-04']) {
       db.recordHeartbeat('id-1', 'brokkr', day, 2, payload(day), day);
     }
-    expect(db.pruneRetention()).toBe(2);
+    expect(db.pruneRetention('2026-07-04').expired_heartbeats).toBe(2);
     expect(db.getHeartbeats('id-1', 'brokkr').map((r) => r.day)).toEqual(['2026-07-03', '2026-07-04']);
     expect(db.admittedOnDay('2026-07-01')).toBe(1);
     db.close();
@@ -313,7 +484,7 @@ describe('admission control — the decision and the write are one transaction',
       newInstancesPerDay: 1,
     });
     db.recordHeartbeat('id-1', 'brokkr', '2026-07-09', 2, payload('a'), '2026-07-09');
-    db.pruneRetention(); // as the boot path does
+    db.pruneRetention('2026-07-09'); // as the boot path does
     expect(db.admittedOnDay('2026-07-09')).toBe(1);
     expect(db.recordHeartbeat('id-2', 'brokkr', '2026-07-09', 2, payload('a'), '2026-07-09')).toEqual({
       ok: false,

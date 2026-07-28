@@ -471,6 +471,32 @@ describe('the operator metrics surface', () => {
     expect(JSON.stringify(body)).not.toContain(INSTANCE_A);
   });
 
+  test('the retention clock is OBSERVABLE: the last prune is reported, receipts and all', async () => {
+    // A retention control whose operation leaves no trace is a control nobody
+    // can check — which is how a row cap passed for a 90-day clock for as long
+    // as it did. `last_prune` is the receipt.
+    const h = makeHarness({ opsKey: 'ops-secret', retentionDays: 30 });
+    await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A));
+
+    const before = await (await h.handler(getReq('/metrics', { 'x-mythical-ops-key': 'ops-secret' }))).json() as any;
+    expect(before.store.retention_days).toBe(30);
+    expect(before.store.max_rows_per_instance).toBe(30 + 31);
+    expect(before.store.last_prune).toBeNull(); // nothing has run yet in this process
+
+    h.db.recordHeartbeat('long-gone', 'brokkr', '2026-01-01', 1, '{}', '2026-01-01');
+    h.db.pruneRetention('2026-07-09');
+    const after = await (await h.handler(getReq('/metrics', { 'x-mythical-ops-key': 'ops-secret' }))).json() as any;
+    expect(after.store.last_prune).toEqual({
+      cutoff_day: '2026-06-10',
+      horizon_day: '2026-08-08',
+      expired_heartbeats: 1,
+      capped_heartbeats: 0,
+      expired_instances: 1,
+    });
+    // Still counts only — no identity travels in the receipt.
+    expect(JSON.stringify(after)).not.toContain('long-gone');
+  });
+
   test('the metrics response never contains an address', async () => {
     const h = makeHarness({ opsKey: 'ops-secret' });
     await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_C), SECRET_C), h.serverFor('198.51.100.7'));

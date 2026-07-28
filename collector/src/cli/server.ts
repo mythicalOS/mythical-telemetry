@@ -8,6 +8,7 @@
 // This file is the ONE place that names the canonical validator package. See
 // src/validator.ts for the seam.
 
+import { todayUtc } from '../day';
 import { TelemetryDb, DEFAULT_MAX_INSTANCES, DEFAULT_NEW_INSTANCES_PER_DAY, DEFAULT_RETENTION_DAYS } from '../db';
 import {
   buildFetchHandler,
@@ -72,12 +73,20 @@ const handler = buildFetchHandler({
   opsKey: process.env.MYTHICAL_TELEMETRY_OPS_KEY ?? null,
 });
 
-db.pruneRetention();
+// Retention runs BEFORE the first request is served, and a failure here is
+// deliberately fatal: a collector that cannot delete must not start accepting
+// data it has promised to delete. `todayUtc()` is read per tick, never captured —
+// a cutoff frozen at boot would stop moving and the clock would stall silently,
+// which is the whole failure this prune exists to end.
+db.pruneRetention(todayUtc());
 setInterval(() => {
   try {
-    db.pruneRetention();
-  } catch {
-    // Retention is best-effort; never take the service down over it.
+    db.pruneRetention(todayUtc());
+  } catch (err) {
+    // Never take a running service down over a prune, but never lose the failure
+    // either: an unreported one leaves data past the window with nothing to show
+    // for it. No request data or address is involved in this line.
+    console.error(`retention prune failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }, PRUNE_INTERVAL_MS).unref();
 

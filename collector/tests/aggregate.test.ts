@@ -145,6 +145,7 @@ describe('aggregate page', () => {
     const page = renderAggregatePage({
       generated_day: '2026-07-09',
       active_window_days: 28,
+      retention_days: 90,
       min_cell: 5,
       products: [{ product: 'brokkr', installs_seen: 40, installs_active: null, days_reported: 900 }],
     });
@@ -158,10 +159,29 @@ describe('aggregate page', () => {
     const page = renderAggregatePage({
       generated_day: '2026-07-09',
       active_window_days: 28,
+      retention_days: 90,
       min_cell: 5,
       products: [],
     });
     expect(page).toContain('Nothing to report yet.');
+  });
+
+  test('the page says the figures cover the retention window, not all time', async () => {
+    // Identity rows expire, so "installations seen" counts installations seen
+    // WITHIN the window. An unqualified "seen" reads as all-time and overstates,
+    // which is the same class of quiet falsehood as a retention with no clock.
+    const h = makeHarness({ minAggregateCell: 1, retentionDays: 45 });
+    await seed(h, 'brokkr', 1);
+    const page = await (await h.handler(getReq('/'))).text();
+    expect(page).toContain('Installations seen (45d)');
+    expect(page).toContain('Every figure covers the last 45 days');
+    expect(page).toContain('deleted 45 days after it arrives');
+    // The heading must never be unqualified again: bare "Installations seen"
+    // reads as all-time, and the store no longer holds all time.
+    expect(page).not.toMatch(/Installations seen<\/th>/);
+
+    const body = await (await h.handler(getReq('/v1/stats'))).json() as any;
+    expect(body.retention_days).toBe(45);
   });
 });
 
@@ -180,6 +200,7 @@ describe('the ONE escape function', () => {
     const page = renderAggregatePage({
       generated_day: '<script>alert(1)</script>',
       active_window_days: 28,
+      retention_days: 90,
       min_cell: 5,
       products: [
         { product: '<script>alert(2)</script>', installs_seen: 9, installs_active: 9, days_reported: 9 },

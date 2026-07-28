@@ -24,7 +24,12 @@ Three privacy properties are **schema-level**, not promises in a code comment:
 - **No key material at rest.** Authorization is recomputed per request from the presented secret.
   Nothing derived from a secret is stored.
 - **`received_day` is day granularity.** An exact receive timestamp would fingerprint an
-  installation's check-in cadence.
+  installation's check-in cadence. It is also what the retention clock runs on — see
+  [Retention](#retention).
+
+**Both tables expire.** Neither a heartbeat nor an identity row is held indefinitely, including for
+an installation that stopped reporting years ago. The only thing that outlives an installation is
+the `admissions` ledger, which holds per-day counts and no identity.
 
 `schema_version` records which heartbeat schema the stored `payload` is. There is exactly one, so
 today it only ever holds `1`. The column stays because it is the durable evidence a future second
@@ -147,6 +152,14 @@ How this collector implements it:
   Where no heartbeat survives it stays `NULL`, meaning *unknown* — it is never filled in from a
   later heartbeat, which would stamp an ordinary day as the first and exclude it from every rate
   from then on.
+- **It is lost when the identity row expires**, and that is deliberate: keeping a stable id for
+  years after everything it described was deleted, purely to annotate rates, would re-create the
+  indefinite record retention exists to end. The cost mostly cancels — the row is only dropped once
+  every heartbeat of that identity has gone too, so no *surviving* row loses its annotation. An
+  installation that returns after that long is treated as new, which for a product that normalises
+  cumulative counters is right rather than merely convenient: its first day back really is another
+  whole-gap accumulation. For a product already emitting completed-day deltas it costs one
+  representative day, and `rates.excluded_day` says so out loud.
 
 ## Statistics, and why there is no family total
 
@@ -300,6 +313,9 @@ high is the dangerous direction: it selects a position an attacker can write.
   is the failure this exists to prevent;
 - aggregate serves versus aggregate recomputes, so the cache's effectiveness is visible;
 - store gauges (identities total, identities admitted today) against their configured budgets;
+- both retention controls (`retention_days`, `max_rows_per_instance`) and `last_prune` — what the
+  most recent prune deleted and the window it used, so the clock's operation is observable rather
+  than assumed. `null` until one has run in this process;
 - the boot-time migration report;
 - throttle map sizes.
 
@@ -384,7 +400,7 @@ volumes:
 | `MYTHICAL_TELEMETRY_NEW_INSTANCE_PER_SOURCE_PER_HOUR` | `20` | per-source budget for FRESH identities |
 | `MYTHICAL_TELEMETRY_NEW_INSTANCES_PER_DAY` | `5000` | global daily budget for fresh identities (0 disables) |
 | `MYTHICAL_TELEMETRY_MAX_INSTANCES` | `100000` | absolute ceiling on stored identities |
-| `MYTHICAL_TELEMETRY_RETENTION_DAYS` | `90` | per-(instance, product) row cap, pruned daily. **Must be ≥ 1** — the service refuses to start at 0, which would delete every heartbeat on the next prune |
+| `MYTHICAL_TELEMETRY_RETENTION_DAYS` | `90` | how many days after **arrival** a record is kept, for heartbeats and identity rows alike; pruned at start-up and daily. **Must be ≥ 1** — the service refuses to start at 0, which would delete every heartbeat on the next prune |
 | `MYTHICAL_TELEMETRY_TRUSTED_PROXY_HOPS` | `0` | proxies in the chain; 0 = never trust `X-Forwarded-For` |
 | `MYTHICAL_TELEMETRY_TRUSTED_PROXIES` | *(unset)* | which peers those are: comma-separated addresses/CIDRs. **Required** when hops > 0; the service refuses to start otherwise |
 | `MYTHICAL_TELEMETRY_MIN_AGGREGATE_CELL` | `5` | small-cell floor for the public aggregate |
@@ -412,24 +428,89 @@ collector ships a **transactional rebuild** that runs at boot:
   than mistaken for done. Any product values such an upgrade had already set are kept;
 - nothing is dropped. A payload that will not parse is carried over verbatim.
 
+**Nothing needs doing for the retention clock.** The index it uses (`received_day`) is created by
+the same boot-time DDL, which is idempotent — an index is not a table shape, so there is no version
+bump and no rebuild. Expect the **first prune to delete a great deal at once**, though: on a volume
+that predates the clock, everything already past the window goes on that first pass. That is the
+control working. Take the backup first, as above.
+
 The report is logged at boot and served on `/metrics`. **Back up the volume first anyway** — this
 rewrites tables in place, and no test is a substitute for a copy of the file.
 
 ## Retention
 
-Up to `MYTHICAL_TELEMETRY_RETENTION_DAYS` daily rows per (instance, product), pruned daily. State
-whatever you configure in your privacy notice; it is a published property, not an implementation
-detail.
+**Retention is an age, and it has a clock.** A heartbeat row is deleted
+`MYTHICAL_TELEMETRY_RETENTION_DAYS` days after it **arrives**, whether or not that installation is
+still reporting. The prune runs at start-up and every 24 hours. State whatever you configure in
+your privacy notice; it is a published property, not an implementation detail.
+
+Two things expire, on the same clock:
+
+| Row | Deleted when |
+|---|---|
+| a `heartbeats` row | its `received_day` is older than the window |
+| an `instances` row | its last arrival is older than the window **and** no heartbeat of that identity is left |
+
+The `instances` row expires because it is pseudonymous personal data in its own right — a stable id
+plus the days it was active — and keeping it after everything it described was deleted would leave
+an indefinite record of who reported and when. The `NOT EXISTS` half of the condition is what makes
+that safe: the identity row is the only way to read the heartbeats keyed to it, so it always
+outlives the last of them, and no heartbeat is ever orphaned.
+
+**The cutoff is on arrival (`received_day`), not on the day the data describes (`day`).** Retention
+is a promise about how long *we* hold a record, so its clock starts when the record reaches us.
+Keying on `day` would hand two installations reporting identical data different retention purely
+because one delivered late — a heartbeat backfilled for an older day would arrive with part of its
+window already spent, or none of it left. `day` is not ignored: ingest bounds it to
+`today−30 … today`, so keying on arrival still bounds the **age of the data** at retention + 30
+days, and a future `day` is refused at ingest rather than surviving in the store.
+
+A row survives a prune only while its `received_day` falls inside the window, and **no stored value
+outlives that window — not even one that is not a date**. The cutoff rises every day and the
+comparison is plain text, so any fixed value eventually falls below it; anything sorting above every
+real date is already past the far end and goes on the first prune. A stamp slightly *ahead* of today
+is kept (two replicas either side of midnight, a host a few minutes fast) and expires on its own
+once the clock passes it; a stamp more than a whole window ahead could never expire on time, so it
+goes immediately.
+
+**What the clock does not promise to the second.** The prune is daily, so a row can outlive its
+window by up to a day before the next run reaches it, and a collector that is not running cannot
+prune — the start-up prune is what closes that gap, and it runs before the first request is served.
+A prune failure at start-up is fatal on purpose: a collector that cannot delete should not be
+accepting data it has promised to delete.
+
+**Behind the clock there is a row cap, and it is not retention.**
+`maxRowsPerInstance` — `retention + 31` by default, derived and not a second literal — bounds what
+one `(instance, product)` can hold irrespective of dates. Its remaining job is pathology the clock
+cannot reason about: an operator's bulk import, a hand-edited volume, a future widening of the
+ingest window. The default deliberately allows a whole ingest window of backfill on top of the
+retention window, because a cap set at the retention window itself would trim a backfilling
+installation's oldest days before the clock reached them — the cap doing retention's job, which is
+exactly the conflation this design ended. `GET /metrics` reports both controls and the last prune's
+receipt (`store.last_prune`), so which one is doing the work is observable rather than assumed.
 
 **The admission ledger is deliberately never pruned.** It is one small row per UTC day the service
 has ever seen — a few tens of kilobytes per decade, nothing beside the heartbeat rows — and
-deleting from it is the only operation that can hand back a spent budget. Any clock-driven prune
-reintroduces exactly that: jump the clock past the horizon, let the prune drop a day, move it back,
-and that day's budget is fresh. Not pruning removes the whole class for a cost that does not
-matter.
+deleting from it is the only operation that can hand back a spent budget. A clock-driven prune of
+*that* table would reintroduce exactly this: jump the clock past the horizon, let the prune drop a
+day, move it back, and that day's budget is fresh. Expiring heartbeats and identities cannot be
+abused that way, because the ledger only ever increases — an expired identity has still spent its
+day's budget for ever. Capacity against `MYTHICAL_TELEMETRY_MAX_INSTANCES` *is* returned, correctly:
+that ceiling bounds what is stored, and the storage really is gone.
+
+The ledger's day-by-day counts are therefore **the only thing that outlives an installation**, and
+they contain no identity — a number of first-time admissions per day, which cannot be turned back
+into who they were.
 
 A retention of `0` is refused at startup: "store nothing" is not a supported configuration, and
 silently deleting every heartbeat on the next prune would be worse than saying so.
+
+### What this changes about the published figures
+
+Identity rows expire, so `installs_seen` on `/` and `/v1/stats` counts installations seen **within
+the retention window**, never since the beginning. The page carries the window in the column heading
+and in prose, and the JSON carries `retention_days`, because an unqualified "seen" reads as all-time
+and would overstate the population.
 
 ## Deleting your data
 

@@ -8,6 +8,20 @@
 
 const MS_PER_DAY = 86_400_000;
 
+/**
+ * How many days BEFORE today an ingested `day` may be. Ingest accepts
+ * `today − INGEST_DAY_WINDOW_DAYS … today` inclusive, so a stored row's `day` is
+ * never more than this many days older than its `received_day`.
+ *
+ * It lives here, next to the retention arithmetic, because two controls derive
+ * from it and they must not drift apart: the ingest window check itself, and the
+ * per-(instance, product) row cap, which has to allow for a whole window of
+ * backfill or it silently becomes the binding control and truncates history the
+ * retention promise says is kept (see db.ts `maxRowsFor`). Widen this and the
+ * cap widens with it.
+ */
+export const INGEST_DAY_WINDOW_DAYS = 30;
+
 /** YYYY-MM-DD → UTC epoch ms, or null if it is not a real calendar day (e.g. 2026-02-30). */
 export function dayToEpochUtc(day: string): number | null {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);

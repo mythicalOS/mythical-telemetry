@@ -94,4 +94,26 @@ describe('operator artifacts are present', () => {
       expect(claim.test(readme), `README claims anonymity: ${claim}`).toBe(false);
     }
   });
+
+  test('the README describes retention as a CLOCK, and never as a row cap', () => {
+    // The retention claim was false in code for months while this README
+    // described the row cap accurately — a document can be honest about the
+    // wrong control. Both halves are pinned here: the section has to name the
+    // basis the code actually uses, and the environment table must not sell the
+    // window as a row cap again.
+    const readme = readFileSync(join(COLLECTOR, 'README.md'), 'utf8');
+    const section = readme.slice(readme.indexOf('\n## Retention'));
+    expect(section.length).toBeGreaterThan(0);
+    for (const required of ['received_day', 'arrives', 'instances', 'admission ledger']) {
+      expect(section.toLowerCase(), `the Retention section must explain ${required}`).toContain(
+        required.toLowerCase(),
+      );
+    }
+    const envRow = readme
+      .split('\n')
+      .find((l) => l.startsWith('|') && l.includes('MYTHICAL_TELEMETRY_RETENTION_DAYS'));
+    expect(envRow, 'the retention variable must be documented in the environment table').toBeDefined();
+    expect(envRow).not.toMatch(/row cap/i);
+    expect(envRow).toMatch(/arrival/i);
+  });
 });

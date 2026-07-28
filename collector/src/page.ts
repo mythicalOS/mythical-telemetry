@@ -13,6 +13,11 @@
 // server-rendered, inline CSS only, zero JS, zero external assets, and every
 // interpolated value through the ONE escape function below.
 //
+// The page also states the retention window, because retention changes what the
+// figures MEAN: identity rows expire, so "installations seen" is seen-within-the-
+// window and never an all-time count. That qualifier is on the column heading and
+// in the notes, not left for a reader to infer.
+//
 // TWO disclosure rules bind this page:
 //
 //   1. SMALL-CELL SUPPRESSION. A product with fewer installs than the floor is
@@ -53,6 +58,12 @@ export interface AggregateProductView {
 export interface AggregateView {
   generated_day: string;
   active_window_days: number;
+  /**
+   * The retention window. Rendered, not decoration: records expire on it, so
+   * every figure on this page describes that window rather than all of time, and
+   * a column headed only "seen" would be read as all-time.
+   */
+  retention_days: number;
   min_cell: number;
   products: AggregateProductView[];
 }
@@ -114,7 +125,7 @@ export function renderAggregatePage(view: AggregateView): string {
 
   const table = `
 <table>
-<thead><tr><th>Product</th><th class="num">Installations seen</th><th class="num">Active (${esc(view.active_window_days)}d)</th><th class="num">Days reported</th></tr></thead>
+<thead><tr><th>Product</th><th class="num">Installations seen (${esc(view.retention_days)}d)</th><th class="num">Active (${esc(view.active_window_days)}d)</th><th class="num">Days reported</th></tr></thead>
 <tbody>${rows || '<tr><td colspan="4">Nothing to report yet.</td></tr>'}</tbody>
 </table>`;
 
@@ -123,6 +134,10 @@ export function renderAggregatePage(view: AggregateView): string {
 <p class="sub">Aggregate figures only, as of ${esc(view.generated_day)} (UTC).</p>
 ${table}
 <h2>How to read this</h2>
+<p class="note"><strong>Every figure covers the last ${esc(view.retention_days)} days.</strong> A record
+is deleted ${esc(view.retention_days)} days after it arrives, and an installation's identity row goes
+with the last record of it &mdash; so an installation that stopped reporting before then is not
+counted here, and nothing above is an all-time total.</p>
 <p class="note"><strong>There is no family total, by design.</strong> Each product derives its own
 installation identity, and nothing joins them. Adding these columns would count anyone running two
 products twice, so no such figure is published.</p>

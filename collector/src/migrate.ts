@@ -137,8 +137,14 @@ const META_DDL = `
   );
 `;
 
+// `idx_heartbeats_received_day` serves the retention clock: the daily prune
+// deletes on `received_day`, and without it that is a full scan of every
+// heartbeat ever stored. Added with the clock itself (2026-07) — an index is not
+// a schema shape, so it needs no user_version bump and no rebuild: this DDL is
+// idempotent and runs on every boot, so an existing volume simply gains it.
 const INDEX_DDL = `
   CREATE INDEX IF NOT EXISTS idx_heartbeats_product_day ON heartbeats (product, day);
+  CREATE INDEX IF NOT EXISTS idx_heartbeats_received_day ON heartbeats (received_day);
   CREATE INDEX IF NOT EXISTS idx_instances_product ON instances (product);
   CREATE INDEX IF NOT EXISTS idx_instances_first_seen ON instances (first_seen_day);
 `;
