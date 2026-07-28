@@ -501,6 +501,10 @@ describe('the operator metrics surface', () => {
       expired_heartbeats: 1,
       capped_heartbeats: 0,
       expired_instances: 1,
+      // The flag records that the checkpoint RAN without error, not that bytes
+      // were reclaimed — this harness is an in-memory store with no log to fold
+      // back, and the pragma succeeds there with nothing to do.
+      wal_truncated: true,
     });
     // The identity that is still reporting is untouched by the same prune.
     expect(after.store.instances_total).toBe(1);

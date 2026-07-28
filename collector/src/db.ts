@@ -134,6 +134,14 @@ export interface PruneReport {
   capped_heartbeats: number;
   /** `instances` rows deleted because nothing of that identity is held any more. */
   expired_instances: number;
+  /**
+   * Whether the write-ahead log was folded back and truncated after this prune.
+   *
+   * Storage hygiene, not retention: the rows are deleted either way. False means
+   * deleted content may still sit in the log — worth an operator's attention, but
+   * deliberately not worth failing a prune that has already committed.
+   */
+  wal_truncated: boolean;
 }
 
 export interface InstanceRow {
@@ -583,6 +591,7 @@ export class TelemetryDb {
       expired_heartbeats: 0,
       capped_heartbeats: 0,
       expired_instances: 0,
+      wal_truncated: false,
     };
     // IMMEDIATE, like `recordHeartbeat` and the migration, and for the same
     // reason: the watermark is read and then written, so under a DEFERRED
@@ -630,18 +639,32 @@ export class TelemetryDb {
       }
       throw err;
     }
+    // The deletes are COMMITTED at this point. Retention has happened, so the
+    // receipt is published before anything else can go wrong — see below.
+    this.lastPrune = report;
     // Fold the WAL back into the database and TRUNCATE it, so rows this prune
     // deleted are not left sitting in the log: that is what `secure_delete`
     // alone does not cover, since it overwrites freed pages in the main file and
     // knows nothing about log frames. Run on EVERY prune, not only one that
-    // deleted something — a checkpoint blocked by a reader reports busy rather
-    // than throwing, and if it only ran after a deleting prune, one busy moment
+    // deleted something — a checkpoint blocked by a reader yields rather than
+    // throwing, and if it only ran after a deleting prune, one blocked moment
     // could leave those frames in the log until the next deletion, which may be
     // months away. Unconditional makes "the next prune catches up" true. It is
     // not media-level erasure and is not claimed as such; see the README on
     // backups and replicas.
-    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
-    this.lastPrune = report;
+    //
+    // A checkpoint that fails outright is RECORDED, not thrown. Throwing here
+    // would report a prune that has already committed as a failed one, and the
+    // caller counts failures towards taking the service down — so a storage
+    // hygiene step could stop a collector whose retention was working perfectly.
+    // The flag rides the receipt onto /metrics instead, where it is a fact an
+    // operator can see rather than an exception that misrepresents the prune.
+    try {
+      this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+      report.wal_truncated = true;
+    } catch {
+      report.wal_truncated = false;
+    }
     return report;
   }
 

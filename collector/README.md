@@ -504,10 +504,12 @@ code already cannot fully trust. Watch for that line, and for `store.last_prune.
 **What deletion does and does not physically do.** The store runs with `secure_delete`, so a pruned
 payload is overwritten in the database's freed pages rather than left legible there, and **every**
 prune checkpoints and **truncates** the write-ahead log, which is where those changes land first and
-where `secure_delete` has no reach. Both are best effort: a checkpoint blocked by an active reader
-reports busy rather than failing the prune. It runs on every prune — not only one that deleted
-something — precisely so that a busy moment is retried the next day instead of waiting for the next
-deletion, which could be months away.
+where `secure_delete` has no reach. Both are best effort. A checkpoint blocked by an active reader
+simply yields and leaves the log in place; one that fails outright is recorded as
+`store.last_prune.wal_truncated: false` on `/metrics` rather than failing the prune, because the rows
+are deleted either way and a hygiene step must not be able to stop a collector whose retention is
+working. It runs on every prune — not only one that deleted something — precisely so a blocked
+moment is retried the next day instead of waiting for the next deletion, which could be months away.
 
 Neither is **media-level erasure**, and this is not claimed as such. Truncating a file does not
 scrub the blocks it occupied, a copy-on-write filesystem or SSD may retain them, and — the part that

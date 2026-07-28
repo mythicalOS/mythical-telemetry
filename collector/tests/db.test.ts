@@ -4,7 +4,7 @@
 
 import { describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { INGEST_DAY_WINDOW_DAYS, shiftDay } from '../src/day';
@@ -275,6 +275,28 @@ describe('retention is a CLOCK — rows expire by age, whether or not an install
     db.close();
   });
 
+  test('a prune folds the write-ahead log back and truncates it, and says whether it did', () => {
+    // Deleted rows land in the WAL first, where secure_delete has no reach. This
+    // is storage hygiene rather than retention — the rows are deleted either
+    // way — so the outcome rides the receipt instead of failing the prune, which
+    // would report a committed prune as a failure and count towards taking the
+    // service down.
+    const dir = mkdtempSync(join(tmpdir(), 'collector-db-'));
+    try {
+      const path = join(dir, 'telemetry.db');
+      const db = new TelemetryDb({ path, retentionDays: 30 });
+      db.recordHeartbeat('id-1', 'brokkr', '2026-01-01', 2, payload('a'), '2026-01-01');
+      const report = db.pruneRetention('2026-07-28');
+      expect(report.expired_heartbeats).toBe(1);
+      expect(report.wal_truncated).toBe(true);
+      // Truncated means truncated: the log file is empty on disk.
+      expect(statSync(`${path}-wal`).size).toBe(0);
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('a clock moved BACK cannot suspend retention — the cutoff is one-way', () => {
     // The one direction that would silently stop the promise: the cutoff
     // retreats, rows past the window are kept, and nothing anywhere says so.
@@ -318,17 +340,23 @@ describe('retention is a CLOCK — rows expire by age, whether or not an install
       seed.recordHeartbeat('id-1', 'brokkr', '2026-07-20', 2, payload('a'), '2026-07-20');
       seed.close();
 
-      const raw = new Database(path);
-      raw.query("INSERT INTO meta (key, value) VALUES ('retention_watermark_day', 'zzz')").run();
-      raw.close();
+      // 'zzz' sorts above every real date; '2026-02-30' has the right SHAPE and
+      // is still not a day, so a regex would wave it through.
+      for (const bad of ['zzz', '2026-02-30', '2026-7-1', '']) {
+        const raw = new Database(path);
+        raw
+          .query('INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+          .run('retention_watermark_day', bad);
+        raw.close();
 
-      const db = new TelemetryDb({ path, retentionDays: 30 });
-      const report = db.pruneRetention('2026-07-28');
-      expect(report.effective_day).toBe('2026-07-28'); // today, not the garbage
-      expect(report.cutoff_day).toBe('2026-06-29');
-      expect(report.expired_heartbeats).toBe(0);
-      expect(db.countHeartbeats('id-1', 'brokkr')).toBe(1);
-      db.close();
+        const db = new TelemetryDb({ path, retentionDays: 30 });
+        const report = db.pruneRetention('2026-07-28');
+        expect(report.effective_day).toBe('2026-07-28'); // today, not the garbage
+        expect(report.cutoff_day).toBe('2026-06-29');
+        expect(report.expired_heartbeats).toBe(0);
+        expect(db.countHeartbeats('id-1', 'brokkr')).toBe(1);
+        db.close();
+      }
 
       // ...and the unusable value is replaced rather than re-read every prune.
       const check = new Database(path, { readonly: true });
@@ -362,8 +390,10 @@ describe('retention is a CLOCK — rows expire by age, whether or not an install
       expect(report.effective_day).toBe('2026-07-28');
       expect(report.clamp_day).toBe('2026-07-29'); // from the watermark, not from 2026-07-01
       expect(report.clamped_heartbeats).toBe(0); // so nothing was "corrected"...
+      expect(report.clamped_instances).toBe(0); // ...on either table...
       expect(report.expired_heartbeats).toBe(0); // ...and nothing was destroyed
       expect(second.getHeartbeats('later', 'brokkr')[0]!.received_day).toBe('2026-07-26');
+      expect(second.getInstance('later', 'brokkr')!.last_seen_day).toBe('2026-07-26');
       second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
