@@ -68,8 +68,23 @@ bun run typecheck
 bun run check:manifest
 ```
 
-## Licence
+## Licence and the paid tier
 
 **Apache-2.0** — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). The licence covers the code,
-not the names and branding; see [`TRADEMARK.md`](TRADEMARK.md). Contributions are accepted
-under the same licence with a [DCO](https://developercertificate.org/) sign-off and **no CLA**.
+not the names and branding — see [`TRADEMARK.md`](TRADEMARK.md).
+
+Everything here is open and stays open. This is not a reduced build of a paid one, and no field,
+schema, or rule is held back for a commercial tier. **The collector you can run is the collector
+we run** — the point of publishing it is that you can read exactly what receives your data, and
+host it yourself instead if you would rather.
+
+mythicalOS does sell a hosted, multi-user tier. That is separate, private software, and it
+consumes these packages on exactly the terms you do.
+
+Apache-2.0 lets you use, modify, redistribute, and build commercial products on this code —
+including products that compete with ours — provided you keep the licence and attribution
+notices intact. Contributions are accepted under the same licence with a
+[DCO](https://developercertificate.org/) sign-off and **no CLA** (see
+[`CONTRIBUTING.md`](CONTRIBUTING.md)): we take no copyright assignment and no relicensing right,
+so this project cannot be moved off Apache-2.0 without every contributor's agreement, and
+anything already released under it stays available under it.

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/mythicalOS/mythical-telemetry/security/advisories/new
+    about: Never file a vulnerability as a public issue — use private vulnerability reporting.
+  - name: Question or usage help
+    url: https://github.com/mythicalOS/mythical-telemetry/blob/main/SUPPORT.md
+    about: How to ask for help and what to include.
+  - name: Code of Conduct
+    url: https://github.com/mythicalOS/mythical-telemetry/blob/main/CODE_OF_CONDUCT.md
+    about: How we expect participants to behave, and how to report a problem.
