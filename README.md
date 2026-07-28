@@ -74,9 +74,14 @@ bun run check:manifest
 not the names and branding — see [`TRADEMARK.md`](TRADEMARK.md).
 
 Everything here is open and stays open. This is not a reduced build of a paid one, and no field,
-schema, or rule is held back for a commercial tier. **The collector you can run is the collector
-we run** — the point of publishing it is that you can read exactly what receives your data, and
-host it yourself instead if you would rather.
+schema, or rule is held back for a commercial tier. **The collector in this repository is the one
+intended to receive central heartbeats** — there is no separate, closed ingest. The point of
+publishing it is that you can read exactly what receives your data, and run your own instead if
+you would rather.
+
+*(As of this writing no central collector is deployed, so nothing is being received anywhere yet.
+This section will say so plainly whenever that stops being true — a claim about where your data
+goes is not one to leave stale.)*
 
 mythicalOS does sell a hosted, multi-user tier. That is separate, private software, and it
 consumes these packages on exactly the terms you do.
