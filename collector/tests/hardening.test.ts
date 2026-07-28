@@ -488,7 +488,9 @@ describe('the operator metrics surface', () => {
     const after = await (await h.handler(getReq('/metrics', { 'x-mythical-ops-key': 'ops-secret' }))).json() as any;
     expect(after.store.last_prune).toEqual({
       cutoff_day: '2026-06-10',
-      horizon_day: '2026-08-08',
+      clamp_day: '2026-07-10',
+      clamped_heartbeats: 0,
+      clamped_instances: 0,
       expired_heartbeats: 1,
       capped_heartbeats: 0,
       expired_instances: 1,

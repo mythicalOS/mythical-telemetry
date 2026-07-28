@@ -465,19 +465,34 @@ window already spent, or none of it left. `day` is not ignored: ingest bounds it
 `today−30 … today`, so keying on arrival still bounds the **age of the data** at retention + 30
 days, and a future `day` is refused at ingest rather than surviving in the store.
 
-A row survives a prune only while its `received_day` falls inside the window, and **no stored value
-outlives that window — not even one that is not a date**. The cutoff rises every day and the
-comparison is plain text, so any fixed value eventually falls below it; anything sorting above every
-real date is already past the far end and goes on the first prune. A stamp slightly *ahead* of today
-is kept (two replicas either side of midnight, a host a few minutes fast) and expires on its own
-once the clock passes it; a stamp more than a whole window ahead could never expire on time, so it
-goes immediately.
+**An impossible arrival day is corrected, not believed and not destroyed.** A record cannot arrive
+after today, and believing one that claims to would let it outlive the window twice over — the
+cutoff has to climb past the stamp before it even starts counting, so a stamp a year out would buy a
+year *plus* the window. Deleting it instead is the opposite error: one day of clock skew between two
+replicas would destroy a heartbeat that did nothing wrong. So the prune **clamps** anything stamped
+beyond tomorrow back to today, the earliest arrival still defensible, and it expires one ordinary
+window later. Tomorrow itself is left alone — that is a host a few minutes fast, and it costs a day.
+
+This is what makes the rule total: a value that is not a date at all sorts above every real day, so
+the same comparison catches it. Nothing in the store can hold an arrival day the cutoff will not
+reach. (Only `received_day` and `last_seen_day` are ever rewritten; no stored payload is touched,
+here or anywhere in this service.)
 
 **What the clock does not promise to the second.** The prune is daily, so a row can outlive its
 window by up to a day before the next run reaches it, and a collector that is not running cannot
-prune — the start-up prune is what closes that gap, and it runs before the first request is served.
-A prune failure at start-up is fatal on purpose: a collector that cannot delete should not be
-accepting data it has promised to delete.
+prune — the start-up prune closes that gap, and it runs before the first request is served. A prune
+failure at start-up is fatal on purpose: a collector that cannot delete should not be accepting data
+it has promised to delete. A failure *while running* is survivable once — a lock, a transient IO
+error — but it is logged, and if retention has still not succeeded two intervals later the process
+**exits non-zero** rather than quietly becoming a store with no retention. Watch for that line, and
+for `store.last_prune.cutoff_day` on `/metrics` failing to advance.
+
+**Deletion is a `DELETE`, and pages are overwritten — but a backup is not.** The store runs with
+`secure_delete`, so a pruned payload is overwritten rather than left legible in a freed page, and a
+prune that removed anything checkpoints the write-ahead log so the deleted rows do not linger there.
+What that does **not** cover is every copy of the file: a backup or replica taken before a prune
+still holds the rows and has no deletion path of its own. If you operate this service, your backup
+retention is part of your retention promise — the code cannot enforce it for you.
 
 **Behind the clock there is a row cap, and it is not retention.**
 `maxRowsPerInstance` — `retention + 31` by default, derived and not a second literal — bounds what
@@ -511,6 +526,11 @@ Identity rows expire, so `installs_seen` on `/` and `/v1/stats` counts installat
 the retention window**, never since the beginning. The page carries the window in the column heading
 and in prose, and the JSON carries `retention_days`, because an unqualified "seen" reads as all-time
 and would overstate the population.
+
+Note the asymmetry the page also states: the window is on **arrival**, so `days_reported` counts
+records that describe days reaching up to a month further back than the window itself — a record may
+arrive up to 30 days after the day it covers. "Installations seen in the last 90 days" is exact;
+"90 days of activity" would not be.
 
 ## Deleting your data
 

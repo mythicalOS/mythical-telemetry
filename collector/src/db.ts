@@ -106,8 +106,12 @@ export interface TelemetryDbConfig {
 export interface PruneReport {
   /** Oldest `received_day` retained by this prune. */
   cutoff_day: string;
-  /** Newest `received_day` a row may carry and still be believed. */
-  horizon_day: string;
+  /** Newest arrival day still believed; anything above it was corrected to today. */
+  clamp_day: string;
+  /** Heartbeat rows whose impossible (future) arrival day was corrected to today. */
+  clamped_heartbeats: number;
+  /** `instances` rows whose impossible last-seen day was corrected to today. */
+  clamped_instances: number;
   /** Heartbeat rows deleted because they aged out — THE retention control. */
   expired_heartbeats: number;
   /** Heartbeat rows deleted by the per-(instance, product) cap. Not retention. */
@@ -190,8 +194,10 @@ export class TelemetryDb {
   private readonly stmtHeartbeatsRecent: Statement<HeartbeatRow, [string, string, number]>;
   private readonly stmtDeleteHeartbeats: Statement;
   private readonly stmtDeleteInstance: Statement;
+  private readonly stmtClampHeartbeats: Statement;
   private readonly stmtExpireHeartbeats: Statement;
   private readonly stmtCapHeartbeats: Statement;
+  private readonly stmtClampInstances: Statement;
   private readonly stmtExpireInstances: Statement;
   private readonly stmtAggregate: Statement<ProductAggregate, [string]>;
 
@@ -215,6 +221,15 @@ export class TelemetryDb {
     this.db = new Database(config.path, { create: true });
     this.db.exec('PRAGMA journal_mode = WAL;');
     this.db.exec('PRAGMA busy_timeout = 5000;');
+    // Deleted content is OVERWRITTEN, not merely unlinked from the b-tree.
+    // Without this, a pruned payload stays legible in a freed page until
+    // something happens to reuse it — so a store that had "deleted" a year of
+    // heartbeats could still hand them to anyone who read the file. It is not a
+    // full answer (see the README: a backup taken before the prune is the
+    // operator's problem, and so is the WAL until it checkpoints), but the live
+    // volume is the part this process controls, and the cost on a store whose
+    // write path is one row per installation per day is immaterial.
+    this.db.exec('PRAGMA secure_delete = ON;');
 
     // Every statement below is prepared AFTER the migration, because the
     // migration drops and renames the tables they reference.
@@ -265,26 +280,29 @@ export class TelemetryDb {
     this.stmtDeleteInstance = this.db.query('DELETE FROM instances WHERE instance_id = ?1');
 
     // ── THE RETENTION CLOCK ────────────────────────────────────────────────
-    // A heartbeat row survives only while its `received_day` falls inside
-    // [cutoff, horizon]. Both ends carry weight, and between them the rule is
-    // TOTAL: no stored value outlives the window, including one that is not a
-    // date at all.
+    // Two statements, in this order, and the order is the guarantee:
     //
-    //   • The cutoff rises every day and the comparison is BINARY text, so every
-    //     fixed string is eventually below it. A malformed `received_day` that
-    //     happens to sort inside today's window ('2026-07-2X') therefore expires
-    //     too, at worst a day or two after a well-formed neighbour would have.
-    //   • Anything sorting above every real date ('not-a-day', 'zzz') is already
-    //     past the horizon and goes on the first prune.
+    //   1. CLAMP an unbelievable arrival day back to today. A row cannot have
+    //      arrived after today, and believing that it did is how a record
+    //      outlives its window — the cutoff would have to climb past the stamp
+    //      before it even started counting. Deleting such a row instead would
+    //      make one day of skew between two replicas destroy a heartbeat that
+    //      did nothing wrong, so it is corrected rather than punished. Anything
+    //      that is not a date at all ('not-a-day', 'zzz') sorts above every real
+    //      day and is caught by the very same comparison, which is what makes
+    //      the rule TOTAL: after this statement every stored arrival day is one
+    //      the cutoff will reach.
+    //   2. EXPIRE anything that arrived before the cutoff. One indexed range —
+    //      see idx_heartbeats_received_day.
     //
-    // Both clauses are pure range tests deliberately. A shape check (`GLOB
-    // '[0-9][0-9][0-9][0-9]-...'`) would catch the malformed-and-in-range case a
-    // day or two sooner and cost a FULL TABLE SCAN on every prune for ever,
-    // because it defeats the index the two ranges use — measured with EXPLAIN
-    // QUERY PLAN: MULTI-INDEX OR with it removed, SCAN with it present. Nothing
-    // in this service can write such a value in the first place (`received_day`
-    // is always the server's own UTC day), so the scan would buy a couple of days
-    // on a row that cannot exist.
+    // A malformed value that happens to sort INSIDE the window ('2026-07-2X')
+    // is left for the cutoff, which passes it within a day or two of when a
+    // well-formed neighbour would have gone. Catching it sooner would need a
+    // shape test (`GLOB '[0-9][0-9][0-9][0-9]-...'`), and that costs a FULL
+    // TABLE SCAN on every prune for ever because it defeats the index — measured
+    // with EXPLAIN QUERY PLAN. Nothing in this service can write such a value
+    // (`received_day` is always the server's own UTC day), so the scan would buy
+    // two days on a row that cannot exist.
     //
     // WHY `received_day` AND NOT `day`. The promise is about how long WE hold a
     // record, so its clock has to start when the record reaches us. Keying on
@@ -299,11 +317,10 @@ export class TelemetryDb {
     // future `day` outright — so a clock-skewed client cannot park a row beyond
     // the window under either basis. Arrival is the honest basis; `day` would
     // be the flattering one.
-    this.stmtExpireHeartbeats = this.db.query(`
-      DELETE FROM heartbeats
-       WHERE received_day < ?1
-          OR received_day > ?2
-    `);
+    this.stmtClampHeartbeats = this.db.query(
+      'UPDATE heartbeats SET received_day = ?1 WHERE received_day > ?2',
+    );
+    this.stmtExpireHeartbeats = this.db.query('DELETE FROM heartbeats WHERE received_day < ?1');
     // The pathology cap, and NOT the retention control — see `maxRowsFor`. It
     // bounds what one (instance, product) can hold irrespective of dates, which
     // matters for rows the clock cannot reason about: an operator's bulk import,
@@ -326,10 +343,15 @@ export class TelemetryDb {
     // it, so it must outlive every one of them. `last_seen_day` is itself a
     // received day (see `recordHeartbeat`), hence MAX over the rows' own
     // `received_day`, so the guard is belt to the clock's braces rather than a
-    // second, disagreeing rule.
+    // second, disagreeing rule. It is clamped on the same terms, for the same
+    // reason: an identity stamped in the future would otherwise look active for
+    // ever, both to retention and to the aggregate's active window.
+    this.stmtClampInstances = this.db.query(
+      'UPDATE instances SET last_seen_day = ?1 WHERE last_seen_day > ?2',
+    );
     this.stmtExpireInstances = this.db.query(`
       DELETE FROM instances
-       WHERE (last_seen_day < ?1 OR last_seen_day > ?2)
+       WHERE last_seen_day < ?1
          AND NOT EXISTS (
                SELECT 1 FROM heartbeats h
                 WHERE h.instance_id = instances.instance_id
@@ -478,12 +500,20 @@ export class TelemetryDb {
    * Same convention as the aggregate's active window, deliberately — the
    * tighter reading of "90 days" is the one a privacy notice can defend.
    *
-   * THE HORIZON is `today + retentionDays`, not `today + 1`. A row stamped
-   * slightly ahead is real data — two replicas straddling midnight, a host a few
-   * minutes fast — and it expires on its own once the clock passes it, so
-   * deleting it would turn a benign skew into permanent loss. A stamp beyond a
-   * whole window could not expire within any promise this service makes, so it
-   * goes.
+   * A FUTURE ARRIVAL DAY IS CORRECTED, NOT DELETED AND NOT BELIEVED. A stamp
+   * ahead of `today` cannot be true, and believing one is how a record outlives
+   * its window: the cutoff would have to climb past the stamp before the clock
+   * even reached it, so a row stamped a year out would be held for a year plus
+   * the window. Deleting such a row instead is the other error — one day of
+   * clock skew between two replicas would destroy a heartbeat that had done
+   * nothing wrong. So the prune CLAMPS: anything stamped beyond tomorrow is
+   * rewritten to `today`, which is the earliest arrival the store can still
+   * defend, and it then expires one ordinary window later. Tomorrow itself is
+   * left alone — that is a replica a few minutes fast, it costs at most a day,
+   * and rewriting it would be pedantry with a write cost.
+   *
+   * Only `received_day` and `last_seen_day` are ever rewritten. NO STORED
+   * PAYLOAD IS TOUCHED, here or anywhere else in this service.
    *
    * ON BEING CLOCK-DRIVEN AT ALL. A time-based promise cannot be kept without a
    * clock, so the failure modes are worth naming: a clock jumped FORWARD deletes
@@ -508,22 +538,41 @@ export class TelemetryDb {
       throw new Error(`pruneRetention needs a real UTC calendar day as YYYY-MM-DD, got: ${String(today)}`);
     }
     const cutoff = shiftDay(today, -(this.retentionDays - 1));
-    const horizon = shiftDay(today, this.retentionDays);
+    // Beyond tomorrow is not a clock difference, it is a wrong clock.
+    const believable = shiftDay(today, 1);
     const report: PruneReport = {
       cutoff_day: cutoff,
-      horizon_day: horizon,
+      clamp_day: believable,
+      clamped_heartbeats: 0,
+      clamped_instances: 0,
       expired_heartbeats: 0,
       capped_heartbeats: 0,
       expired_instances: 0,
     };
     const tx = this.db.transaction(() => {
-      report.expired_heartbeats = this.stmtExpireHeartbeats.run(cutoff, horizon).changes;
+      // Correct first, expire second — a row clamped to `today` in this same
+      // transaction must be judged on the corrected value, and a value the store
+      // cannot place on the calendar at all ('not-a-day') sorts above every real
+      // date, so it is caught here and given a real clock rather than living for
+      // ever.
+      report.clamped_heartbeats = this.stmtClampHeartbeats.run(today, believable).changes;
+      report.clamped_instances = this.stmtClampInstances.run(today, believable).changes;
+      report.expired_heartbeats = this.stmtExpireHeartbeats.run(cutoff).changes;
       report.capped_heartbeats = this.stmtCapHeartbeats.run(this.maxRowsPerInstance).changes;
       // Last, and inside the same transaction, so NOT EXISTS sees the store as
-      // the two deletes above left it.
-      report.expired_instances = this.stmtExpireInstances.run(cutoff, horizon).changes;
+      // the deletes above left it.
+      report.expired_instances = this.stmtExpireInstances.run(cutoff).changes;
     });
     tx();
+    // Checkpoint after a prune that actually deleted something. The delete lands
+    // in the WAL, and until the WAL is folded back into the database the removed
+    // rows are still sitting in it — `secure_delete` overwrites pages in the main
+    // file, not history in the log. PASSIVE, so a busy reader is never blocked
+    // and a failure to checkpoint is not a failure to delete; the next one
+    // catches up.
+    if (report.expired_heartbeats + report.capped_heartbeats + report.expired_instances > 0) {
+      this.db.exec('PRAGMA wal_checkpoint(PASSIVE);');
+    }
     this.lastPrune = report;
     return report;
   }

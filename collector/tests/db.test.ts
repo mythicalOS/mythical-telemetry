@@ -177,33 +177,63 @@ describe('retention is a CLOCK — rows expire by age, whether or not an install
     db.close();
   });
 
-  test('no stored value outlives the window — not even one that is not a date', () => {
-    // Nothing in this service writes such a value (`received_day` is always the
-    // server's own UTC day), but the survival rule has to be TOTAL: the failure
-    // mode of an unrecognised date is a row no cutoff ever passes, which is the
-    // defect all over again in a different costume.
+  test('an impossible arrival day is CORRECTED, so it cannot buy a second window', () => {
+    // A row cannot arrive after today. Believing one that says it did is how a
+    // record outlives the window twice over: the cutoff has to climb past the
+    // stamp before it even starts counting, so a stamp a year out would be held
+    // for a year AND a window. Deleting it is the other error — a replica one
+    // day fast would lose a heartbeat that did nothing wrong. So it is clamped.
     const db = new TelemetryDb({ path: ':memory:', retentionDays: 90 });
-    db.recordHeartbeat('sorts-high', 'brokkr', '2026-07-20', 2, payload('a'), 'not-a-day');
-    db.recordHeartbeat('empty', 'brokkr', '2026-07-20', 2, payload('c'), '');
-    db.recordHeartbeat('far-future', 'brokkr', '2026-07-20', 2, payload('d'), '2099-01-01');
-    // Malformed but sorting INSIDE today's window, and a stamp only slightly
-    // ahead of today — a replica a few minutes fast, which is real data.
-    db.recordHeartbeat('malformed-in-range', 'brokkr', '2026-07-20', 2, payload('b'), '2026-07-2X');
-    db.recordHeartbeat('bit-fast', 'brokkr', '2026-07-20', 2, payload('e'), '2026-07-29');
+    db.recordHeartbeat('year-ahead', 'brokkr', '2026-07-20', 2, payload('a'), '2027-07-28');
+    // The exact boundary of the old, too-generous horizon: today + retention.
+    db.recordHeartbeat('window-ahead', 'brokkr', '2026-07-20', 2, payload('b'), '2026-10-26');
+    // Not a date at all — it sorts above every real day, so the same comparison
+    // catches it. This is what makes the rule total.
+    db.recordHeartbeat('sorts-high', 'brokkr', '2026-07-20', 2, payload('c'), 'not-a-day');
+    // A replica a few minutes fast. Real data, left alone, costs at most a day.
+    db.recordHeartbeat('bit-fast', 'brokkr', '2026-07-20', 2, payload('d'), '2026-07-29');
 
-    // Anything below the cutoff or above the horizon goes at once.
-    expect(db.pruneRetention('2026-07-28').expired_heartbeats).toBe(3);
-    expect(db.countHeartbeats('malformed-in-range', 'brokkr')).toBe(1);
+    const report = db.pruneRetention('2026-07-28');
+    expect(report.clamped_heartbeats).toBe(3);
+    expect(report.clamped_instances).toBe(3);
+    expect(report.expired_heartbeats).toBe(0); // corrected, never destroyed
+    expect(db.countHeartbeats('year-ahead', 'brokkr')).toBe(1);
+
+    // Each corrected row now expires exactly one window after the prune that
+    // corrected it — not a year later, and not a window after that.
+    expect(db.pruneRetention('2026-10-25').expired_heartbeats).toBe(0);
+    const expiry = db.pruneRetention('2026-10-26');
+    expect(expiry.expired_heartbeats).toBe(3);
+    expect(expiry.expired_instances).toBe(3);
+    // The slightly-fast one keeps its own stamp and goes a single day later.
     expect(db.countHeartbeats('bit-fast', 'brokkr')).toBe(1);
+    expect(db.pruneRetention('2026-10-27').expired_heartbeats).toBe(1);
+    expect(db.countInstances()).toBe(0);
+    db.close();
+  });
 
-    // Both survivors expire on the ordinary clock, because the cutoff rises past
-    // every fixed string: `2026-07-2X` sorts alongside its well-formed
-    // neighbours, so it goes with them rather than living for ever.
-    expect(db.pruneRetention('2026-10-26').expired_heartbeats).toBe(0);
-    expect(db.pruneRetention('2026-10-27').expired_heartbeats).toBe(2);
-    expect(db.countHeartbeats('malformed-in-range', 'brokkr')).toBe(0);
-    expect(db.countHeartbeats('bit-fast', 'brokkr')).toBe(0);
-    expect(db.countInstances()).toBe(0); // and every identity row with them
+  test('a malformed day BELOW the clamp still expires, on the ordinary cutoff', () => {
+    // Nothing in this service writes one — `received_day` is always the server's
+    // own UTC day. A malformed value sorting above tomorrow is caught by the
+    // clamp; one sorting below it is left to the rising cutoff, which reaches it
+    // at the same prune as its well-formed neighbour. Bounded is the
+    // requirement; instant is not.
+    const db = new TelemetryDb({ path: ':memory:', retentionDays: 90 });
+    db.recordHeartbeat('malformed', 'brokkr', '2026-07-20', 2, payload('b'), '2026-07-1X');
+    db.recordHeartbeat('neighbour', 'brokkr', '2026-07-20', 2, payload('c'), '2026-07-19');
+    db.recordHeartbeat('empty', 'brokkr', '2026-07-20', 2, payload('d'), '');
+
+    // The empty string is below every cutoff and goes on the first prune; the
+    // other two are untouched, and NOT clamped — they are not in the future.
+    const first = db.pruneRetention('2026-07-28');
+    expect(first.expired_heartbeats).toBe(1);
+    expect(first.clamped_heartbeats).toBe(0);
+    expect(db.countHeartbeats('malformed', 'brokkr')).toBe(1);
+
+    expect(db.pruneRetention('2026-10-16').expired_heartbeats).toBe(0);
+    // Both go together: the malformed value gets no more life than the real one.
+    expect(db.pruneRetention('2026-10-17').expired_heartbeats).toBe(2);
+    expect(db.countInstances()).toBe(0);
     db.close();
   });
 

@@ -21,6 +21,16 @@ import { loadCanonicalValidator } from '../validator';
 
 const DEFAULT_PORT = 7910;
 const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+/**
+ * How long the service may keep serving after retention last succeeded.
+ *
+ * Two missed daily prunes. A single failure is worth riding out — a lock, a
+ * transient IO error — but a persistent one means the window is no longer being
+ * enforced while data keeps arriving, and a collector that cannot delete must
+ * not go on collecting. At the deadline the process exits non-zero rather than
+ * quietly becoming a store with no retention.
+ */
+const PRUNE_FAILURE_DEADLINE_MS = 2 * PRUNE_INTERVAL_MS;
 
 function envInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -79,14 +89,28 @@ const handler = buildFetchHandler({
 // a cutoff frozen at boot would stop moving and the clock would stall silently,
 // which is the whole failure this prune exists to end.
 db.pruneRetention(todayUtc());
+let lastPruneOkMs = Date.now();
 setInterval(() => {
   try {
     db.pruneRetention(todayUtc());
+    lastPruneOkMs = Date.now();
   } catch (err) {
-    // Never take a running service down over a prune, but never lose the failure
-    // either: an unreported one leaves data past the window with nothing to show
-    // for it. No request data or address is involved in this line.
+    // One failure is survivable — a lock, a transient IO error — but it is never
+    // swallowed: an unreported failure leaves data past the window with nothing
+    // to show for it. No request data or address is involved in this line.
     console.error(`retention prune failed: ${err instanceof Error ? err.message : String(err)}`);
+    if (Date.now() - lastPruneOkMs > PRUNE_FAILURE_DEADLINE_MS) {
+      // Fail closed, exactly as the start-up prune does. Serving on would mean
+      // accepting data under a retention promise nothing is enforcing, and the
+      // longer it ran the more indefensible the promise would get. Exiting is
+      // loud: a supervisor restarts, the start-up prune runs, and either it
+      // works or the service stays down where someone will notice.
+      console.error(
+        'retention has not succeeded within the failure deadline; exiting rather than collecting ' +
+          'data this service can no longer promise to delete',
+      );
+      process.exit(1);
+    }
   }
 }, PRUNE_INTERVAL_MS).unref();
 
