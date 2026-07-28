@@ -275,6 +275,40 @@ describe('retention is a CLOCK — rows expire by age, whether or not an install
     db.close();
   });
 
+  test('the identity row cannot outlive its last heartbeat, even when the CAP took the newest one', () => {
+    // The cap deletes by `day`, so it can remove the row that contributed the
+    // newest ARRIVAL. An instance expiry that also demanded `last_seen_day <
+    // cutoff` would then find a last-seen day pointing at a row that no longer
+    // exists, and keep the identity for up to a whole window after the last
+    // thing it described was deleted — publishing it in the aggregate as an
+    // installation with nothing held for it.
+    const db = new TelemetryDb({ path: ':memory:', retentionDays: 30, maxRowsPerInstance: 1 });
+    // An OLD day that arrived recently — so it carries the identity's newest
+    // arrival, and the cap (which orders by `day`) is the one that takes it.
+    db.recordHeartbeat('capped', 'brokkr', '2026-01-01', 2, payload('late'), '2026-07-20');
+    // A newer day that arrived earlier: the cap keeps this one.
+    db.recordHeartbeat('capped', 'brokkr', '2026-06-30', 2, payload('early'), '2026-06-30');
+    expect(db.getInstance('capped', 'brokkr')!.last_seen_day).toBe('2026-07-20');
+
+    const first = db.pruneRetention('2026-07-28');
+    expect(first.expired_heartbeats).toBe(0); // both arrivals are inside the window
+    expect(first.capped_heartbeats).toBe(1); // ...and the cap takes the late arrival
+    // `last_seen_day` now points at a row that no longer exists.
+    expect(db.getInstance('capped', 'brokkr')!.last_seen_day).toBe('2026-07-20');
+
+    // Three days later the survivor ages out, and with it the whole identity —
+    // under the old condition this row would have been kept until 2026-08-19,
+    // long after the last thing it described was deleted.
+    const second = db.pruneRetention('2026-07-31');
+    expect(second.expired_heartbeats).toBe(1);
+    expect(db.countHeartbeats('capped', 'brokkr')).toBe(0);
+    expect(second.expired_instances).toBe(1);
+    expect(db.getInstance('capped', 'brokkr')).toBeNull();
+    // ...so the public aggregate cannot report an installation with nothing held.
+    expect(db.aggregates('2026-01-01')).toEqual([]);
+    db.close();
+  });
+
   test('a prune folds the write-ahead log back and truncates it, and says whether it did', () => {
     // Deleted rows land in the WAL first, where secure_delete has no reach. This
     // is storage hygiene rather than retention — the rows are deleted either
@@ -290,6 +324,27 @@ describe('retention is a CLOCK — rows expire by age, whether or not an install
       expect(report.expired_heartbeats).toBe(1);
       expect(report.wal_truncated).toBe(true);
       // Truncated means truncated: the log file is empty on disk.
+      expect(statSync(`${path}-wal`).size).toBe(0);
+
+      // ...and a checkpoint the store could NOT complete says so rather than
+      // claiming success. A blocked checkpoint does not throw — it returns
+      // busy — so a receipt written from "no exception" would be a false claim
+      // about where deleted rows are.
+      db.recordHeartbeat('id-2', 'brokkr', '2026-02-01', 2, payload('b'), '2026-02-01');
+      const reader = new Database(path);
+      reader.exec('BEGIN');
+      reader.query('SELECT * FROM heartbeats').all(); // holds a read snapshot
+      const blocked = db.pruneRetention('2026-07-28');
+      expect(blocked.expired_heartbeats).toBe(1); // retention still happened...
+      expect(blocked.wal_truncated).toBe(false); // ...and the log did not clear
+      reader.exec('COMMIT');
+      reader.close();
+
+      // Once the reader is gone the next prune catches up, which is the whole
+      // reason the checkpoint runs on every prune rather than only a deleting one.
+      const after = db.pruneRetention('2026-07-28');
+      expect(after.expired_heartbeats).toBe(0);
+      expect(after.wal_truncated).toBe(true);
       expect(statSync(`${path}-wal`).size).toBe(0);
       db.close();
     } finally {

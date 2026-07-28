@@ -175,11 +175,14 @@ describe('aggregate page', () => {
     const page = await (await h.handler(getReq('/'))).text();
     expect(page).toContain('Installations seen (45d)');
     expect(page).toContain('Nothing here is an all-time total');
-    expect(page).toContain('45 days after it <em>arrives</em>');
+    expect(page).toContain('45 days from the day it <em>arrives</em>');
+    // Day-granular, and pruned daily — so the page must not promise deletion on
+    // the exact day either.
+    expect(page).toContain('deleted by the next');
     // ...and it does NOT claim the figures describe only the last 45 days of
     // activity: a record can arrive up to a month after the day it covers, so
     // the days behind those counts reach further back than the window does.
-    expect(page).toContain('arrive up to a month after');
+    expect(page).toContain('month after the day it covers');
     // The heading must never be unqualified again: bare "Installations seen"
     // reads as all-time, and the store no longer holds all time.
     expect(page).not.toMatch(/Installations seen<\/th>/);

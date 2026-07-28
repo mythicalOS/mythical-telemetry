@@ -439,10 +439,12 @@ rewrites tables in place, and no test is a substitute for a copy of the file.
 
 ## Retention
 
-**Retention is an age, and it has a clock.** A heartbeat row is deleted
-`MYTHICAL_TELEMETRY_RETENTION_DAYS` days after it **arrives**, whether or not that installation is
-still reporting. The prune runs at start-up and every 24 hours. State whatever you configure in
-your privacy notice; it is a published property, not an implementation detail.
+**Retention is an age, and it has a clock.** A heartbeat row is kept for
+`MYTHICAL_TELEMETRY_RETENTION_DAYS` days counted from the day it **arrives**, and is deleted by the
+next prune after that — whether or not that installation is still reporting. The prune runs at
+start-up and every 24 hours, so "deleted by the next daily pass" is the exact claim and "deleted on
+the ninetieth day" is not. State whatever you configure in your privacy notice; it is a published
+property, not an implementation detail.
 
 Two things expire, on the same clock:
 

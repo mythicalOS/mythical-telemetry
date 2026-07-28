@@ -89,6 +89,9 @@ export function maxRowsFor(retentionDays: number): number {
  */
 const WATERMARK_KEY = 'retention_watermark_day';
 
+/** How long a statement waits for a lock held by another process. */
+const BUSY_TIMEOUT_MS = 5000;
+
 export interface TelemetryDbConfig {
   /** SQLite file path, or ':memory:' for tests. */
   path: string;
@@ -246,7 +249,7 @@ export class TelemetryDb {
     this.newInstancesPerDay = config.newInstancesPerDay ?? DEFAULT_NEW_INSTANCES_PER_DAY;
     this.db = new Database(config.path, { create: true });
     this.db.exec('PRAGMA journal_mode = WAL;');
-    this.db.exec('PRAGMA busy_timeout = 5000;');
+    this.db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS};`);
     // Deleted content is OVERWRITTEN, not merely unlinked from the b-tree.
     // Without this, a pruned payload stays legible in a freed page until
     // something happens to reuse it — so a store that had "deleted" a year of
@@ -364,22 +367,29 @@ export class TelemetryDb {
       )
     `);
     // An `instances` row is itself pseudonymous personal data — a stable id with
-    // the days it was active — so it expires too, on the same arrival clock, once
-    // NOTHING of that identity is held any more. The NOT EXISTS guard is what
-    // makes that safe: the row is the only way to read the heartbeats keyed to
-    // it, so it must outlive every one of them. `last_seen_day` is itself a
-    // received day (see `recordHeartbeat`), hence MAX over the rows' own
-    // `received_day`, so the guard is belt to the clock's braces rather than a
-    // second, disagreeing rule. It is clamped on the same terms, for the same
-    // reason: an identity stamped in the future would otherwise look active for
-    // ever, both to retention and to the aggregate's active window.
+    // the days it was active — so it goes when NOTHING of that identity is held
+    // any more. The row exists to serve its heartbeats: it must outlive every one
+    // of them (or the read path could not reach them), and it must not outlive
+    // the last one (or a stable id sits there describing data that no longer
+    // exists). "No heartbeat remains" says both, and says them exactly.
+    //
+    // It is deliberately NOT also conditioned on `last_seen_day` being past the
+    // cutoff. That looked like belt and braces and was a hole: the row cap
+    // deletes by `day`, so it can remove the heartbeat that contributed the
+    // NEWEST arrival, leaving `last_seen_day` pointing at a row that no longer
+    // exists. The identity would then outlive its last heartbeat by up to a
+    // whole window — and appear in the public aggregate as an installation with
+    // nothing held for it.
+    //
+    // `last_seen_day` is still clamped, because it feeds the aggregate's active
+    // window: an identity stamped in the future would otherwise look active for
+    // ever.
     this.stmtClampInstances = this.db.query(
       'UPDATE instances SET last_seen_day = ?1 WHERE last_seen_day > ?2',
     );
     this.stmtExpireInstances = this.db.query(`
       DELETE FROM instances
-       WHERE last_seen_day < ?1
-         AND NOT EXISTS (
+       WHERE NOT EXISTS (
                SELECT 1 FROM heartbeats h
                 WHERE h.instance_id = instances.instance_id
                   AND h.product = instances.product
@@ -625,8 +635,9 @@ export class TelemetryDb {
       report.expired_heartbeats = this.stmtExpireHeartbeats.run(cutoff).changes;
       report.capped_heartbeats = this.stmtCapHeartbeats.run(this.maxRowsPerInstance).changes;
       // Last, and inside the same transaction, so NOT EXISTS sees the store as
-      // the deletes above left it.
-      report.expired_instances = this.stmtExpireInstances.run(cutoff).changes;
+      // BOTH deletes above left it — including rows the cap took, which is the
+      // case that made an earlier version of this leave identities behind.
+      report.expired_instances = this.stmtExpireInstances.run().changes;
       // Writes back the VALIDATED day, so an unusable stored value is replaced
       // rather than left to be re-read every prune.
       this.stmtWriteMeta.run(WATERMARK_KEY, effective);
@@ -653,6 +664,11 @@ export class TelemetryDb {
     // not media-level erasure and is not claimed as such; see the README on
     // backups and replicas.
     //
+    // The RESULT is read, not just the absence of an exception. A checkpoint
+    // blocked by an active reader does not throw — it returns `busy = 1` and
+    // leaves the log exactly where it was — so running this through `exec` and
+    // declaring success would have put a false claim on /metrics.
+    //
     // A checkpoint that fails outright is RECORDED, not thrown. Throwing here
     // would report a prune that has already committed as a failed one, and the
     // caller counts failures towards taking the service down — so a storage
@@ -660,8 +676,23 @@ export class TelemetryDb {
     // The flag rides the receipt onto /metrics instead, where it is a fact an
     // operator can see rather than an exception that misrepresents the prune.
     try {
-      this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
-      report.wal_truncated = true;
+      // ...and it does not WAIT for one either. The connection's busy timeout
+      // would otherwise make a truncating checkpoint sit for seconds behind an
+      // open reader, blocking writers to reclaim log space that tomorrow's prune
+      // can reclaim for free. Nothing else can run on this connection meanwhile
+      // — the prune is synchronous — so dropping the timeout for the duration
+      // affects this statement and nothing else.
+      this.db.exec('PRAGMA busy_timeout = 0;');
+      try {
+        const checkpoint = this.db
+          .query<{ busy: number }, []>('PRAGMA wal_checkpoint(TRUNCATE)')
+          .get();
+        // busy = 0 means nothing is holding pruned frames in the log — which is
+        // trivially true of a store that has no log at all, e.g. ':memory:'.
+        report.wal_truncated = checkpoint !== null && checkpoint.busy === 0;
+      } finally {
+        this.db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS};`);
+      }
     } catch {
       report.wal_truncated = false;
     }

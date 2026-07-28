@@ -134,12 +134,12 @@ export function renderAggregatePage(view: AggregateView): string {
 <p class="sub">Aggregate figures only, as of ${esc(view.generated_day)} (UTC).</p>
 ${table}
 <h2>How to read this</h2>
-<p class="note"><strong>Nothing here is an all-time total.</strong> A record is deleted
-${esc(view.retention_days)} days after it <em>arrives</em>, and an installation's identity row goes
-with the last record of it &mdash; so an installation that stopped reporting more than
-${esc(view.retention_days)} days ago is not counted at all. Days reported counts the records still
-held, which describe days slightly older than that, since a record can arrive up to a month after
-the day it covers.</p>
+<p class="note"><strong>Nothing here is an all-time total.</strong> A record is kept for
+${esc(view.retention_days)} days from the day it <em>arrives</em> and is then deleted by the next
+daily pass, and an installation's identity record goes with the last record of it &mdash; so an
+installation that stopped reporting that long ago is not counted at all. Days reported counts the
+records still held, which describe days slightly older than that, since a record can arrive up to a
+month after the day it covers.</p>
 <p class="note"><strong>There is no family total, by design.</strong> Each product derives its own
 installation identity, and nothing joins them. Adding these columns would count anyone running two
 products twice, so no such figure is published.</p>
