@@ -11,6 +11,8 @@ import {
   TransportConfigError,
   describeSendReport,
   TRANSPORT_REASONS,
+  type DeliveryRecord,
+  type DestinationKind,
   type TransportOptions,
 } from "./transport.ts";
 import { userConsent, type ConsentState } from "./optout.ts";
@@ -69,6 +71,29 @@ function harness(
 
 const OK: PostResult = { status: 202, ok: true };
 const FAIL: PostResult = { status: 503, ok: false };
+
+/** The whole delivery document, as it actually is on disk. */
+function readStateFile(root: string): { records: Record<string, DeliveryRecord>; breakers: Record<string, unknown> } {
+  return JSON.parse(fs.readFileSync(deliveryStateFilePath(root), "utf8")) as {
+    records: Record<string, DeliveryRecord>;
+    breakers: Record<string, unknown>;
+  };
+}
+
+/**
+ * Put a record into a state the test needs, ON DISK.
+ *
+ * `record()` hands back a detached snapshot, so mutating it changes nothing — deliberately. The
+ * transport re-reads the document immediately before every write and keeps no in-memory copy, which
+ * is the whole fix for two writers erasing each other, and it leaves a test no object to reach into.
+ */
+function patchRecordOnDisk(root: string, day: string, kind: DestinationKind, destination: string, patch: Partial<DeliveryRecord>): void {
+  const state = readStateFile(root);
+  const rec = state.records[`${day}|${kind}|${destination}`];
+  if (rec === undefined) throw new Error(`no ${kind} record for ${day} at ${destination}`);
+  Object.assign(rec, patch);
+  fs.writeFileSync(deliveryStateFilePath(root), JSON.stringify(state, null, 2));
+}
 
 function sendInput(consent: ConsentState = userConsent(true, Date.parse("2026-01-01T00:00:00.000Z")), withCopy = true) {
   return {
@@ -218,6 +243,162 @@ describe("per-destination durable delivery state", () => {
     fs.writeFileSync(deliveryStateFilePath(root), "{{{");
     const { transport } = harness(() => OK, { stateRoot: root });
     expect((await transport.send(sendInput())).central.status).toBe("delivered");
+  });
+});
+
+describe("two writers on one state directory", () => {
+  // Each Transport is an independent writer of the same document — which is what a second process
+  // is, from the file's point of view. The defect these pin was a remembered copy of the whole
+  // document: a writer that had read it once wrote that remembered version back on every save, so
+  // whatever anyone else had recorded since was not merely stale, it was ERASED. Delivery records
+  // are the only thing that stops a day being sent twice and the only proof an opt-out purged a
+  // pending payload, so losing them wholesale is worse than losing a field.
+  //
+  // WHAT THESE DO NOT TEST, so nobody reads more into them than is there: they cannot interleave
+  // two writers INSIDE one read-modify-write. Nothing in one process can — that is precisely why
+  // the read-modify-write is synchronous. The residual window it leaves is stated in the README,
+  // not tested away here.
+
+  test("a writer that read the document earlier does not erase what was written since", async () => {
+    const root = tmpRoot();
+    const a = harness(() => OK, { stateRoot: root });
+    const b = harness(() => OK, { stateRoot: root });
+
+    // B looks at the state before anything exists. This is the read that used to be remembered for
+    // the rest of B's life.
+    expect(b.transport.status({ day: DAY, central: { url: CENTRAL_URL } }).central.attempts).toBe(0);
+
+    await a.transport.send({ ...sendInput(), day: "2026-07-20", copy: undefined });
+    await b.transport.send({ ...sendInput(), day: "2026-07-21", copy: undefined });
+
+    expect(Object.keys(readStateFile(root).records).sort()).toEqual([
+      `2026-07-20|central|${CENTRAL_URL}`,
+      `2026-07-21|central|${CENTRAL_URL}`,
+    ]);
+    expect(a.transport.record("2026-07-20", "central", CENTRAL_URL)?.status).toBe("delivered");
+    expect(a.transport.record("2026-07-21", "central", CENTRAL_URL)?.status).toBe("delivered");
+  });
+
+  test("a delivery landing does not erase a record written while its request was in flight", async () => {
+    const root = tmpRoot();
+    let other: Promise<unknown> | undefined;
+    const a = harness(async () => {
+      // The other writer records a whole delivery DURING this request — the window a read-modify-
+      // write that spans an HTTP round trip leaves open, and the one that used to swallow the lot.
+      other ??= b.transport.send({ ...sendInput(), day: "2026-07-21", copy: undefined });
+      await other;
+      return OK;
+    }, { stateRoot: root });
+    const b = harness(() => OK, { stateRoot: root });
+
+    await a.transport.send({ ...sendInput(), day: "2026-07-20", copy: undefined });
+
+    const records = readStateFile(root).records;
+    expect(Object.keys(records).sort()).toEqual([`2026-07-20|central|${CENTRAL_URL}`, `2026-07-21|central|${CENTRAL_URL}`]);
+    expect(records[`2026-07-20|central|${CENTRAL_URL}`]!.status).toBe("delivered");
+    expect(records[`2026-07-21|central|${CENTRAL_URL}`]!.status).toBe("delivered");
+  });
+
+  test("a fence by the other writer is not undone by a reply that arrives after it", async () => {
+    const root = tmpRoot();
+    let fenced = false;
+    const a = harness(() => {
+      if (!fenced) {
+        fenced = true;
+        b.transport.fenceAll("the other writer's user opted out");
+      }
+      return OK;
+    }, { stateRoot: root });
+    const b = harness(() => OK, { stateRoot: root });
+
+    const report = await a.transport.send({ ...sendInput(), copy: undefined });
+
+    // The record was purged mid-flight. A late success must not resurrect it, and above all must
+    // not put the payload the opt-out purged back on disk.
+    expect(fenced).toBe(true);
+    expect(a.transport.record(DAY, "central", CENTRAL_URL)).toBeUndefined();
+    expect(fs.readFileSync(deliveryStateFilePath(root), "utf8")).not.toContain("central\\\":true");
+    expect(report.central.status).toBe("pending");
+  });
+
+  test("a late reply does not land on the DIFFERENT delivery that replaced it at the same key", async () => {
+    // A fence purges a pending delivery and a new one is started for the same day and destination
+    // under a new credential — same key, new generation. Matching the late reply on the key alone
+    // would mark that new delivery delivered on the strength of a request made under the OLD
+    // configuration, drop the payload it is still holding, and the send that was actually
+    // authorised would never happen. Worse than doing nothing, so it is not done.
+    const root = tmpRoot();
+    let rotated = false;
+    const a = harness(async () => {
+      if (!rotated) {
+        rotated = true;
+        await b.transport.send({
+          ...sendInput(),
+          central: { url: CENTRAL_URL, identity: identity("z"), body: '{"rotated":true}' },
+          copy: undefined,
+        });
+      }
+      return OK;
+    }, { stateRoot: root });
+    const b = harness(() => FAIL, { stateRoot: root });
+
+    await a.transport.send({ ...sendInput(), copy: undefined });
+
+    expect(rotated).toBe(true);
+    const rec = readStateFile(root).records[`${DAY}|central|${CENTRAL_URL}`]!;
+    expect(rec.status).toBe("pending");
+    expect(rec.body).toBe('{"rotated":true}');
+    expect(rec.last_http_status).toBe(503); // the rotated delivery's own result, not the old one's
+  });
+
+  test("a late failure does not annotate a delivery another writer already completed", async () => {
+    // Both writers attempt the same day and destination; one succeeds, the other's request fails
+    // afterwards. Delivered is terminal and is a fact — writing the failure onto it would report an
+    // error against a delivery that happened, and would count toward a circuit breaker against a
+    // destination that has just accepted one, suppressing later days over an outage that is not
+    // happening.
+    const root = tmpRoot();
+    let release: (() => void) | undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const slow = harness(
+      async () => {
+        await held;
+        return FAIL;
+      },
+      { stateRoot: root, baseBackoffMs: 0, breakerThreshold: 1, breakerCooldownMs: 7 * 24 * 3_600_000 },
+    );
+    const quick = harness(() => OK, { stateRoot: root, baseBackoffMs: 0 });
+
+    const slowSend = slow.transport.send({ ...sendInput(), copy: undefined });
+    await Bun.sleep(10); // the slow writer has claimed its attempt and is inside its request
+    await quick.transport.send({ ...sendInput(), copy: undefined });
+    expect(quick.transport.record(DAY, "central", CENTRAL_URL)?.status).toBe("delivered");
+    release!();
+    await slowSend;
+
+    const rec = readStateFile(root).records[`${DAY}|central|${CENTRAL_URL}`]!;
+    expect(rec.status).toBe("delivered");
+    expect(rec.last_error).toBeNull();
+    expect(rec.last_http_status).toBe(202);
+    for (const breaker of Object.values(readStateFile(root).breakers) as Array<{ consecutive_failures: number; open_until: string | null }>) {
+      expect(breaker.consecutive_failures).toBe(0);
+      expect(breaker.open_until).toBeNull();
+    }
+  });
+
+  test("record() hands back a snapshot, not a handle into live state", async () => {
+    const root = tmpRoot();
+    const { transport } = harness(() => FAIL, { stateRoot: root });
+    await transport.send({ ...sendInput(), copy: undefined });
+
+    const snapshot = transport.record(DAY, "central", CENTRAL_URL)!;
+    snapshot.attempts = 999;
+    snapshot.status = "delivered";
+
+    expect(transport.record(DAY, "central", CENTRAL_URL)!.attempts).toBe(1);
+    expect(readStateFile(root).records[`${DAY}|central|${CENTRAL_URL}`]!.status).toBe("pending");
   });
 });
 
@@ -674,8 +855,7 @@ describe("drain fences for itself — it does not assume a preceding send() did"
     // Only the three OLDEST are still inside their backoff window; the newest is eligible.
     const oldest = ["2026-07-20", "2026-07-21", "2026-07-22"];
     for (const day of oldest) {
-      const rec = transport.record(day, "central", CENTRAL_URL)!;
-      rec.next_attempt_at = new Date(now.value + 10 * 24 * 3_600_000).toISOString();
+      patchRecordOnDisk(root, day, "central", CENTRAL_URL, { next_attempt_at: new Date(now.value + 10 * 24 * 3_600_000).toISOString() });
     }
     now.value += 3_600_000;
 
@@ -702,11 +882,7 @@ describe("the drain cap counts ATTEMPTS, not selections", () => {
     const seed = harness(() => FAIL, { stateRoot: root, maxAttempts: 99, breakerThreshold: 99 });
     const days = ["2026-07-20", "2026-07-21", "2026-07-22", "2026-07-23"];
     for (const day of days) await seed.transport.send({ ...sendInput(CONSENT), day, copy: undefined });
-    for (const day of days) {
-      const rec = seed.transport.record(day, "central", CENTRAL_URL)!;
-      rec.attempts = 0;
-      rec.next_attempt_at = null;
-    }
+    for (const day of days) patchRecordOnDisk(root, day, "central", CENTRAL_URL, { attempts: 0, next_attempt_at: null });
     seed.transport.fenceDestination("central", CENTRAL_URL, seed.transport.record(days[0]!, "central", CENTRAL_URL)!.generation);
 
     // The FIRST attempt opens a long-cooldown breaker. Every later day in the same loop is
@@ -739,10 +915,7 @@ describe("the drain cap counts ATTEMPTS, not selections", () => {
     const seed = harness(() => FAIL, { stateRoot: root, maxAttempts: 99, breakerThreshold: 99 });
     const days = ["2026-07-20", "2026-07-21", "2026-07-22", "2026-07-23", "2026-07-24"];
     for (const day of days) await seed.transport.send({ ...sendInput(CONSENT), day, copy: undefined });
-    for (const day of days) {
-      const rec = seed.transport.record(day, "central", CENTRAL_URL)!;
-      rec.next_attempt_at = null;
-    }
+    for (const day of days) patchRecordOnDisk(root, day, "central", CENTRAL_URL, { next_attempt_at: null });
     seed.transport.fenceDestination("central", CENTRAL_URL, seed.transport.record(days[0]!, "central", CENTRAL_URL)!.generation);
 
     let calls = 0;

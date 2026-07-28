@@ -95,6 +95,70 @@ Partial state is exposed, not hidden — "central delivered, copy unresolved" is
 are validated and fenced independently: a typo in the operator URL retires the copy and is
 reported on the emit result, while central's unresolved deliveries are untouched.
 
+## On-disk state, and what happens with two writers
+
+Three documents under `<stateRoot>/telemetry/`: `instance.json` (the central identity),
+`copy-identities.json` (the destination-scoped copy identity), `delivery.json` (per-destination
+delivery records). Every write that **replaces** an existing document — delivery state, a rotation,
+the self-heal of an unreadable file — goes temp-then-`rename`, so a reader sees the old bytes or the
+new ones and never a torn mix. A **first mint** is not a replacement and does not use `rename`; see
+below.
+
+**A first mint is a claim, not a write.** `createFileExclusiveSync` writes the content into a
+private same-directory temp and then `link(2)`s it into place, so the destination goes from absent
+to complete in one step; `EEXIST` means another writer got there first, and the loser **adopts that
+identity** instead of returning its own. This matters more than it looks: an id that exists only in
+one process's memory is data the installation can neither read nor delete, because the id is the
+capability a user exercises to ask for their data back. So a **first mint** resolves — claimed, or
+adopted — before `centralIdentity()` / `copyIdentityFor()` return anything. **One exception, and it
+is deliberate:** if the claim cannot be attempted at all (a full disk, a read-only mount, an I/O
+error), the store logs and returns a process-stable in-memory identity rather than throwing, and
+retries the write on the next call — telemetry never takes down the product it reports on, and the
+retry resolves rather than overwriting whatever landed meanwhile. **A document that cannot be read
+is still replaced** — nothing will ever release that name, and without the replace the install
+would never get a durable identity — but the replace is tied to the inode that was read, so a real
+document that turned up while the corrupt one was being judged is adopted instead of overwritten.
+Where the filesystem
+cannot hard-link, the claim degrades to an exclusive `O_EXCL` create — still exclusive, and
+inode-guarded so that losing the name mid-write reports the loss rather than a false success — and
+warns. The guard is a check and not a hold: it removes the window in which the destination is an
+empty file, not the instant between its last check and its return, which no filesystem primitive
+can remove.
+
+**Delivery state is never cached.** It is re-read immediately before every mutation and the change
+is applied to what is actually on disk, so a second writer's records are not erased *by a stale
+in-memory copy of the document* — including across the HTTP round trip, which is a window no write
+may span. A reply that arrives after its delivery was fenced, or after a different delivery took
+the same key under a new generation, is discarded rather than applied.
+
+**The honest limits**, because the shorter version would be a lie:
+
+- The read-modify-write is a single synchronous read → mutate → atomic write, and **no more than
+  that**. The filesystem offers no compare-and-exchange, so two writers landing inside *that*
+  window can still resolve to one, and two first sends of the same day can still both go out.
+- **Rotation is a replace, not a claim**, because superseding the stored identity is the whole
+  point of `rotateCentral()`. Two processes rotating central at the same instant can still each
+  mint, and the loser's secret will not be the one on disk. (Changing the *copy destination* is
+  also a replacement, but it goes through the inode-tied path and keeps anything already holding
+  that destination, so two processes moving to the same new endpoint converge on one secret.)
+- **After a failed write, `centralIdentity()` can return a different identity later in the same
+  process.** An identity that never reached disk has no claim on the name, so the retry claims and
+  — if another writer got there first — adopts what is actually stored rather than renaming over
+  it. Read the identity per use rather than caching it across a process's lifetime, which the
+  emitter already does.
+- **The opt-out fence is process-local.** It cancels in-flight requests and purges pending state in
+  the process that observes it; it cannot reach into another process's open socket. Each process
+  reads consent live and stops on its own next tick.
+
+**One writer per state directory remains the supported topology.** What changed is that no path
+which merely *reads* now destroys an identity: it claims, adopts, or leaves it alone. Every write
+that replaces one is either a **deliberate** act — `rotateCentral()`, a copy destination change,
+`clearCopyIdentity()` retiring a removed endpoint — or the **self-heal of a document that cannot be
+read**, which is inode-tied so that anything real appearing meanwhile is adopted instead. What is
+left is the irreducible check-then-act instants above.
+
+`transport.record()` returns a **detached snapshot** — mutating it changes nothing.
+
 ## Operator-endpoint isolation
 
 The copy destination is attacker-controlled input, fetched from inside the deployment. `src/ssrf.ts`

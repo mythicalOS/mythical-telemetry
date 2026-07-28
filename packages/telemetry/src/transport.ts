@@ -228,7 +228,6 @@ export class Transport {
     postImpl: NonNullable<TransportOptions["postImpl"]>;
     log: (line: string) => void;
   };
-  private state: DeliveryStateFile | undefined;
   private readonly inflight = new Map<string, Promise<DestinationOutcome>>();
   /** Aborters for in-flight attempts, so a fence can cancel them mid-request. */
   private readonly aborters = new Map<string, AbortController>();
@@ -264,15 +263,27 @@ export class Transport {
   }
 
   // ── durable state ────────────────────────────────────────────────────────────────────────
+  //
+  // THIS DOCUMENT IS NEVER CACHED, AND THAT IS THE POINT. An earlier shape read the file once and
+  // kept it in memory for the life of the object; every write then sent that whole remembered
+  // document back. Two processes each holding a full stale copy do not lose a field, they erase
+  // each other's delivery RECORDS — and those records are the only thing standing between a retry
+  // and a duplicate send, or between an opt-out and a payload that is still on disk. So the file
+  // is re-read immediately before every mutation and the mutation is applied to what is actually
+  // there, in `transact` below.
+  //
+  // WHAT THIS DOES AND DOES NOT GUARANTEE, stated plainly because the stronger claim would be
+  // false. `transact` narrows the read-modify-write to a single synchronous read → mutate → atomic
+  // write with no `await` inside it, so nothing another writer did before it began is discarded,
+  // and in particular the long window that used to span an entire HTTP round trip is gone. It is
+  // not a compare-and-exchange: the filesystem offers none, so two writers landing inside that
+  // microsecond window can still resolve to one. One writer per state directory remains the
+  // supported topology; this makes the unsupported one degrade instead of corrupt.
 
-  private load(): DeliveryStateFile {
-    if (this.state !== undefined) return this.state;
+  private readState(): DeliveryStateFile {
     const raw = readJsonSync(deliveryStateFilePath(this.opts.stateRoot));
     const empty: DeliveryStateFile = { version: 1, records: {}, breakers: {} };
-    if (raw === null || typeof raw !== "object") {
-      this.state = empty;
-      return empty;
-    }
+    if (raw === null || typeof raw !== "object") return empty;
     const doc = raw as Record<string, unknown>;
     const records: Record<string, DeliveryRecord> = {};
     if (doc.records !== null && typeof doc.records === "object") {
@@ -292,12 +303,10 @@ export class Transport {
         };
       }
     }
-    this.state = { version: 1, records, breakers };
-    return this.state;
+    return { version: 1, records, breakers };
   }
 
-  private persist(): void {
-    const state = this.load();
+  private writeState(state: DeliveryStateFile): void {
     this.prune(state);
     try {
       atomicWriteFileSync(deliveryStateFilePath(this.opts.stateRoot), JSON.stringify(state, null, 2));
@@ -308,6 +317,18 @@ export class Transport {
     }
   }
 
+  /**
+   * One read-modify-write against the CURRENT on-disk document. `fn` runs synchronously — putting
+   * an `await` inside it would re-open the window this exists to close — and says whether it
+   * changed anything, so a read-only pass does not rewrite the file (and does not create it).
+   */
+  private transact<T>(fn: (state: DeliveryStateFile) => { value: T; changed: boolean }): T {
+    const state = this.readState();
+    const { value, changed } = fn(state);
+    if (changed) this.writeState(state);
+    return value;
+  }
+
   private prune(state: DeliveryStateFile): void {
     const cutoff = new Date(this.opts.nowMs() - this.opts.retentionDays * 86_400_000).toISOString().slice(0, 10);
     for (const [key, rec] of Object.entries(state.records)) {
@@ -315,10 +336,17 @@ export class Transport {
     }
   }
 
-  /** The durable record for one (day, destination), or undefined. */
+  /**
+   * The durable record for one (day, destination), or undefined.
+   *
+   * A DETACHED SNAPSHOT, read from disk on each call. It used to be a live reference into the
+   * cached document, so mutating the returned object silently changed what the next write
+   * persisted; there is no cache now and no such back door. To change delivery state, call the
+   * transport.
+   */
   record(day: string, kind: DestinationKind, destinationUrl: string): DeliveryRecord | undefined {
     const destination = normalizeDestinationUrl(destinationUrl);
-    return this.load().records[recordKey(day, kind, destination)];
+    return this.readState().records[recordKey(day, kind, destination)];
   }
 
   // ── fences ───────────────────────────────────────────────────────────────────────────────
@@ -333,13 +361,16 @@ export class Transport {
       controller.abort();
       this.aborters.delete(key);
     }
-    const state = this.load();
-    for (const [key, rec] of Object.entries(state.records)) {
-      if (rec.status !== "delivered") delete state.records[key];
-    }
-    state.breakers = {};
     this.opts.log(`telemetry delivery fenced (${reason}): queued retries cancelled, pending payloads purged`);
-    this.persist();
+    this.transact((state) => {
+      for (const [key, rec] of Object.entries(state.records)) {
+        if (rec.status !== "delivered") delete state.records[key];
+      }
+      state.breakers = {};
+      // Always written, even when nothing matched: an opt-out that reports "purged" must leave a
+      // document that says so rather than one that merely happens to look right.
+      return { value: undefined, changed: true };
+    });
   }
 
   /**
@@ -349,29 +380,30 @@ export class Transport {
    * longer matches (endpoint or credential changed under them).
    */
   fenceDestination(kind: DestinationKind, destination: string | undefined, generation: string | undefined): void {
-    const state = this.load();
-    let changed = false;
-    for (const [key, rec] of Object.entries(state.records)) {
-      if (rec.kind !== kind) continue;
-      const retired = destination === undefined || rec.destination !== destination;
-      const stale = !retired && generation !== undefined && rec.generation !== generation && rec.status !== "delivered";
-      if (retired || stale) {
-        const controller = this.aborters.get(key);
-        if (controller !== undefined) {
-          controller.abort();
-          this.aborters.delete(key);
+    this.transact((state) => {
+      let changed = false;
+      for (const [key, rec] of Object.entries(state.records)) {
+        if (rec.kind !== kind) continue;
+        const retired = destination === undefined || rec.destination !== destination;
+        const stale = !retired && generation !== undefined && rec.generation !== generation && rec.status !== "delivered";
+        if (retired || stale) {
+          const controller = this.aborters.get(key);
+          if (controller !== undefined) {
+            controller.abort();
+            this.aborters.delete(key);
+          }
+          delete state.records[key];
+          changed = true;
         }
-        delete state.records[key];
-        changed = true;
       }
-    }
-    for (const key of Object.keys(state.breakers)) {
-      if (key.startsWith(`${kind}|`) && (destination === undefined || key !== breakerKey(kind, destination))) {
-        delete state.breakers[key];
-        changed = true;
+      for (const key of Object.keys(state.breakers)) {
+        if (key.startsWith(`${kind}|`) && (destination === undefined || key !== breakerKey(kind, destination))) {
+          delete state.breakers[key];
+          changed = true;
+        }
       }
-    }
-    if (changed) this.persist();
+      return { value: undefined, changed };
+    });
   }
 
   // ── sending ──────────────────────────────────────────────────────────────────────────────
@@ -379,8 +411,9 @@ export class Transport {
   /** Read-only view of a day's per-destination state. Never sends. */
   status(input: { day: string; central: { url: string }; copy?: { url: string } | undefined }): SendReport {
     assertDestinations(input);
-    const central = this.outcomeFor(input.day, "central", normalizeDestinationUrl(input.central.url), null);
-    const copy = input.copy === undefined ? null : this.outcomeFor(input.day, "copy", normalizeDestinationUrl(input.copy.url), null);
+    const state = this.readState();
+    const central = this.outcomeFor(state, input.day, "central", normalizeDestinationUrl(input.central.url), null);
+    const copy = input.copy === undefined ? null : this.outcomeFor(state, input.day, "copy", normalizeDestinationUrl(input.copy.url), null);
     return { day: input.day, central, copy, partial: isPartial(central, copy) };
   }
 
@@ -498,7 +531,7 @@ export class Transport {
     const wanted = new Map<DestinationKind, string>([["central", normalizeDestinationUrl(input.central.url)]]);
     if (input.copy !== undefined) wanted.set("copy", normalizeDestinationUrl(input.copy.url));
 
-    const state = this.load();
+    const state = this.readState();
     const now = this.opts.nowMs();
     const days = new Set<string>();
     for (const rec of Object.values(state.records)) {
@@ -607,18 +640,20 @@ export class Transport {
 
   /** Total attempts recorded for a day across its configured destinations. */
   private attemptsForDay(day: string, centralUrl: string, copyUrl: string | undefined): number {
-    const central = this.record(day, "central", centralUrl)?.attempts ?? 0;
-    const copy = copyUrl === undefined ? 0 : (this.record(day, "copy", copyUrl)?.attempts ?? 0);
+    const state = this.readState();
+    const central = state.records[recordKey(day, "central", normalizeDestinationUrl(centralUrl))]?.attempts ?? 0;
+    const copy = copyUrl === undefined ? 0 : (state.records[recordKey(day, "copy", normalizeDestinationUrl(copyUrl))]?.attempts ?? 0);
     return central + copy;
   }
 
   private outcomeFor(
+    state: DeliveryStateFile,
     day: string,
     kind: DestinationKind,
     destination: string,
     skipped: DestinationOutcome["skipped_because"],
   ): DestinationOutcome {
-    const rec = this.load().records[recordKey(day, kind, destination)];
+    const rec = state.records[recordKey(day, kind, destination)];
     if (rec === undefined) {
       return {
         kind,
@@ -684,66 +719,87 @@ export class Transport {
     },
     key: string,
   ): Promise<DestinationOutcome> {
-    const state = this.load();
     const now = this.opts.nowMs();
     const nowIso = new Date(now).toISOString();
-
-    let rec = state.records[key];
-    // A drain re-sends what already exists; it must never CREATE a delivery. Otherwise draining
-    // one destination's backlog would mint a body-less record for a destination that simply had
-    // nothing for that day, and that record would immediately retire itself as unsendable.
-    if (rec === undefined && args.onlyExisting) return this.outcomeFor(args.day, args.kind, args.destination, null);
-    if (rec === undefined) {
-      rec = {
-        day: args.day,
-        kind: args.kind,
-        destination: args.destination,
-        generation: args.generation,
-        idempotency_key: sha256Hex(`${args.input.identity.instance_id}|${args.product}|${args.day}|${args.generation}`),
-        attempts: 0,
-        first_attempt_at: null,
-        last_attempt_at: null,
-        next_attempt_at: null,
-        status: "pending",
-        last_error: null,
-        last_http_status: null,
-      };
-      state.records[key] = rec;
-    }
-
-    if (rec.status === "delivered") return this.outcomeFor(args.day, args.kind, args.destination, null);
-    if (rec.status === "exhausted") return this.outcomeFor(args.day, args.kind, args.destination, null);
-
-    if (rec.next_attempt_at !== null && Date.parse(rec.next_attempt_at) > now) {
-      return this.outcomeFor(args.day, args.kind, args.destination, "backoff");
-    }
-
     const bKey = breakerKey(args.kind, args.destination);
-    const breaker = state.breakers[bKey];
-    if (breaker?.open_until != null && Date.parse(breaker.open_until) > now) {
-      return this.outcomeFor(args.day, args.kind, args.destination, "circuit_open");
-    }
 
-    if (args.budget.aborted) return this.outcomeFor(args.day, args.kind, args.destination, "budget_exhausted");
+    // ── phase one: claim the attempt, in ONE read-modify-write against the live document ──
+    //
+    // Everything that decides whether to send, and the attempt bookkeeping that must be durable
+    // before the request leaves, happens here with no `await` in between. What crosses into the
+    // request below is a value, not a live handle into a remembered document.
+    type Claim =
+      | { send: false; outcome: DestinationOutcome }
+      // `generation` is the record's own, not `args.generation`: a drain re-sends a record created
+      // under an earlier one, and phase two has to recognise the record it actually claimed.
+      | { send: true; body: string; idempotencyKey: string; generation: string };
 
-    // An empty body means the payload was never stored or has already been released. Posting empty
-    // bytes would be a guaranteed rejection that still burns an attempt and looks like an outage.
-    if ((rec.body ?? args.input.body) === "") {
-      rec.status = "exhausted";
-      rec.next_attempt_at = null;
-      rec.last_error = "payload not retained — this day can no longer be re-sent";
-      this.persist();
-      return this.outcomeFor(args.day, args.kind, args.destination, null);
-    }
+    const claim = this.transact<Claim>((state) => {
+      const stop = (why: DestinationOutcome["skipped_because"], changed = false): { value: Claim; changed: boolean } => ({
+        value: { send: false, outcome: this.outcomeFor(state, args.day, args.kind, args.destination, why) },
+        changed,
+      });
 
-    // Record the attempt BEFORE the request, and persist it. A crash mid-request must not look
-    // like an attempt that never happened, or a restart loop retries without bound.
-    rec.attempts += 1;
-    rec.last_attempt_at = nowIso;
-    if (rec.first_attempt_at === null) rec.first_attempt_at = nowIso;
-    rec.next_attempt_at = new Date(now + this.backoffFor(rec.attempts)).toISOString();
-    if (rec.body === undefined) rec.body = args.input.body;
-    this.persist();
+      let rec = state.records[key];
+      // A drain re-sends what already exists; it must never CREATE a delivery. Otherwise draining
+      // one destination's backlog would mint a body-less record for a destination that simply had
+      // nothing for that day, and that record would immediately retire itself as unsendable.
+      if (rec === undefined && args.onlyExisting) return stop(null);
+      if (rec === undefined) {
+        rec = {
+          day: args.day,
+          kind: args.kind,
+          destination: args.destination,
+          generation: args.generation,
+          idempotency_key: sha256Hex(`${args.input.identity.instance_id}|${args.product}|${args.day}|${args.generation}`),
+          attempts: 0,
+          first_attempt_at: null,
+          last_attempt_at: null,
+          next_attempt_at: null,
+          status: "pending",
+          last_error: null,
+          last_http_status: null,
+        };
+        state.records[key] = rec;
+      }
+
+      if (rec.status === "delivered") return stop(null);
+      if (rec.status === "exhausted") return stop(null);
+
+      if (rec.next_attempt_at !== null && Date.parse(rec.next_attempt_at) > now) return stop("backoff");
+
+      const breaker = state.breakers[bKey];
+      if (breaker?.open_until != null && Date.parse(breaker.open_until) > now) return stop("circuit_open");
+
+      if (args.budget.aborted) return stop("budget_exhausted");
+
+      // An empty body means the payload was never stored or has already been released. Posting
+      // empty bytes would be a guaranteed rejection that still burns an attempt and looks like an
+      // outage.
+      if ((rec.body ?? args.input.body) === "") {
+        rec.status = "exhausted";
+        rec.next_attempt_at = null;
+        rec.last_error = "payload not retained — this day can no longer be re-sent";
+        return stop(null, true);
+      }
+
+      // Record the attempt BEFORE the request, and persist it. A crash mid-request must not look
+      // like an attempt that never happened, or a restart loop retries without bound.
+      rec.attempts += 1;
+      rec.last_attempt_at = nowIso;
+      if (rec.first_attempt_at === null) rec.first_attempt_at = nowIso;
+      rec.next_attempt_at = new Date(now + this.backoffFor(rec.attempts)).toISOString();
+      // Re-send the bytes the record was created with. The idempotency key is derived from the same
+      // (identity, product, day, generation) tuple, so a retry must carry the same document, or a
+      // deduping collector would silently keep the first version of a day it later re-received.
+      if (rec.body === undefined) rec.body = args.input.body;
+      return {
+        value: { send: true, body: rec.body, idempotencyKey: rec.idempotency_key, generation: rec.generation },
+        changed: true,
+      };
+    });
+
+    if (!claim.send) return claim.outcome;
 
     // The aborter is registered BEFORE resolution, not after it. Registering it only around the
     // POST left a window in which a fence (opt-out, endpoint change) or the overall budget had
@@ -754,11 +810,6 @@ export class Transport {
     const onBudget = (): void => attemptAborter.abort();
     args.budget.addEventListener("abort", onBudget, { once: true });
 
-    // Re-send the bytes the record was created with. The idempotency key is derived from the same
-    // (identity, product, day, generation) tuple, so a retry must carry the same document, or a
-    // deduping collector would silently keep the first version of a day it later re-received.
-    const body = rec.body ?? args.input.body;
-
     try {
       const endpoint = await this.opts.resolveImpl(ingestUrlFor(args.destination), {
         ...this.opts.policy,
@@ -768,64 +819,100 @@ export class Transport {
       if (attemptAborter.signal.aborted) throw new EndpointRejected("aborted", "attempt aborted during resolution");
       const result = await this.opts.postImpl({
         endpoint,
-        body,
+        body: claim.body,
         headers: {
           "content-type": "application/json",
           // Write auth rides the header, never the payload.
           "X-Mythical-Write-Key": args.input.identity.instance_secret,
           // Lets an operator collector dedupe a retry it already accepted.
-          "Idempotency-Key": rec.idempotency_key,
+          "Idempotency-Key": claim.idempotencyKey,
         },
         timeoutMs: this.opts.perAttemptTimeoutMs,
         signal: attemptAborter.signal,
       });
 
+      // ── phase two: fold the outcome into whatever the document says NOW ──
       if (result.ok) {
-        rec.status = "delivered";
-        rec.next_attempt_at = null;
-        rec.last_error = null;
-        rec.last_http_status = result.status;
-        delete rec.body; // terminal — the retained payload has no further purpose
-        state.breakers[bKey] = { consecutive_failures: 0, open_until: null };
-        this.persist();
-        return this.outcomeFor(args.day, args.kind, args.destination, null);
+        return this.transact((state) => {
+          const rec = state.records[key];
+          // Fenced while the request was in flight — an opt-out, or a configuration change. The
+          // record is gone on purpose and must not be resurrected by its own late reply, and the
+          // breaker the same fence cleared must not be re-seeded either.
+          //
+          // A DIFFERENT GENERATION AT THE SAME KEY IS NOT OUR RECORD EITHER, and matching on the key
+          // alone would be worse than doing nothing: the fence purged our delivery and a NEW one was
+          // started for the same day and destination under a new credential or endpoint, so marking
+          // it delivered on the strength of our reply would drop the payload it is still holding and
+          // the send that was actually authorised would never happen.
+          if (rec === undefined || rec.generation !== claim.generation) {
+            return { value: this.outcomeFor(state, args.day, args.kind, args.destination, null), changed: false };
+          }
+          rec.status = "delivered";
+          rec.next_attempt_at = null;
+          rec.last_error = null;
+          rec.last_http_status = result.status;
+          delete rec.body; // terminal — the retained payload has no further purpose
+          state.breakers[bKey] = { consecutive_failures: 0, open_until: null };
+          return { value: this.outcomeFor(state, args.day, args.kind, args.destination, null), changed: true };
+        });
       }
 
       // The status and nothing else. The response BODY is never read into local state: the
       // endpoint is attacker-controlled and already holds the write key, so any excerpt of what it
       // says is bytes of its choosing landing in a file and on a status surface. See ssrf.ts.
-      this.recordFailure(rec, state, bKey, `HTTP ${result.status}`, result.status);
-      return this.outcomeFor(args.day, args.kind, args.destination, null);
+      return this.recordFailure(args, key, bKey, claim.generation, `HTTP ${result.status}`, result.status);
     } catch (err) {
       // ONLY the closed reason is persisted — never the exception message. A message can carry
       // text that originated at the endpoint (a TLS error naming the certificate it presented, a
       // parser quoting what it received), and that is exactly the attacker-chosen-bytes-at-rest
       // problem the response-body removal exists to close. An unrecognised failure collapses to a
       // single fixed value rather than leaking its own description.
-      this.recordFailure(rec, state, bKey, transportReason(err), null);
-      return this.outcomeFor(args.day, args.kind, args.destination, null);
+      return this.recordFailure(args, key, bKey, claim.generation, transportReason(err), null);
     } finally {
       args.budget.removeEventListener("abort", onBudget);
       this.aborters.delete(key);
     }
   }
 
-  private recordFailure(rec: DeliveryRecord, state: DeliveryStateFile, bKey: string, error: string, httpStatus: number | null): void {
-    rec.last_error = error;
-    rec.last_http_status = httpStatus;
-    if (rec.attempts >= this.opts.maxAttempts) {
-      rec.status = "exhausted";
-      rec.next_attempt_at = null;
-      delete rec.body; // terminal — do not retain a payload that will never be sent
-    }
-    const breaker = state.breakers[bKey] ?? { consecutive_failures: 0, open_until: null };
-    breaker.consecutive_failures += 1;
-    if (breaker.consecutive_failures >= this.opts.breakerThreshold) {
-      breaker.open_until = new Date(this.opts.nowMs() + this.opts.breakerCooldownMs).toISOString();
-      breaker.consecutive_failures = 0;
-    }
-    state.breakers[bKey] = breaker;
-    this.persist();
+  private recordFailure(
+    args: { day: string; kind: DestinationKind; destination: string },
+    key: string,
+    bKey: string,
+    generation: string,
+    error: string,
+    httpStatus: number | null,
+  ): DestinationOutcome {
+    return this.transact((state) => {
+      const rec = state.records[key];
+      // Fenced mid-flight, or replaced by a delivery under a different generation: same reasoning
+      // as the success path — a purged delivery stays purged, and a failure that belongs to a
+      // configuration nobody is using any more does not get to burn a live delivery's attempts or
+      // open a circuit breaker against it.
+      //
+      // DELIVERED IS TERMINAL AND IS A FACT. If another writer's attempt for this same day and
+      // destination succeeded while ours was in flight, the day IS delivered, and writing our
+      // failure onto it would report an error against a delivery that happened and — worse — count
+      // toward a circuit breaker against a destination that just accepted one, suppressing later
+      // days over an outage that is not happening.
+      if (rec === undefined || rec.generation !== generation || rec.status === "delivered") {
+        return { value: this.outcomeFor(state, args.day, args.kind, args.destination, null), changed: false };
+      }
+      rec.last_error = error;
+      rec.last_http_status = httpStatus;
+      if (rec.attempts >= this.opts.maxAttempts) {
+        rec.status = "exhausted";
+        rec.next_attempt_at = null;
+        delete rec.body; // terminal — do not retain a payload that will never be sent
+      }
+      const breaker = state.breakers[bKey] ?? { consecutive_failures: 0, open_until: null };
+      breaker.consecutive_failures += 1;
+      if (breaker.consecutive_failures >= this.opts.breakerThreshold) {
+        breaker.open_until = new Date(this.opts.nowMs() + this.opts.breakerCooldownMs).toISOString();
+        breaker.consecutive_failures = 0;
+      }
+      state.breakers[bKey] = breaker;
+      return { value: this.outcomeFor(state, args.day, args.kind, args.destination, null), changed: true };
+    });
   }
 
   /**
