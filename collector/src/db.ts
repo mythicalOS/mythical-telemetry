@@ -584,11 +584,23 @@ export class TelemetryDb {
       capped_heartbeats: 0,
       expired_instances: 0,
     };
-    const tx = this.db.transaction(() => {
-      // The watermark is read and written INSIDE the transaction, so two
-      // replicas pruning the same file cannot each read the old value and race
-      // the cutoff backwards.
-      const watermark = this.stmtReadMeta.get(WATERMARK_KEY)?.value ?? null;
+    // IMMEDIATE, like `recordHeartbeat` and the migration, and for the same
+    // reason: the watermark is read and then written, so under a DEFERRED
+    // transaction two replicas pruning one file could each read the old value
+    // before either wrote. Taking the write lock up front makes the second one
+    // wait (busy_timeout) and re-read the winner's watermark, which is what the
+    // one-way cutoff needs to actually be one-way.
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const stored = this.stmtReadMeta.get(WATERMARK_KEY)?.value ?? null;
+      // A watermark that is not a calendar day is REFUSED, not compared. Text
+      // comparison would happily rank 'zzz' above every real date, `shiftDay`
+      // returns unparseable input unchanged, and the cutoff would then be 'zzz'
+      // — which every ISO date sorts below. That is not a late prune, it is the
+      // whole store deleted from one bad value, and then written back durably so
+      // it happens again. Nothing here writes such a value; the point is that if
+      // one ever appears, it must not be load-bearing.
+      const watermark = stored !== null && dayToEpochUtc(stored) !== null ? stored : null;
       const effective = watermark !== null && watermark > today ? watermark : today;
       const cutoff = shiftDay(effective, -(this.retentionDays - 1));
       // Beyond tomorrow is not a clock difference, it is a wrong clock.
@@ -606,19 +618,29 @@ export class TelemetryDb {
       // Last, and inside the same transaction, so NOT EXISTS sees the store as
       // the deletes above left it.
       report.expired_instances = this.stmtExpireInstances.run(cutoff).changes;
+      // Writes back the VALIDATED day, so an unusable stored value is replaced
+      // rather than left to be re-read every prune.
       this.stmtWriteMeta.run(WATERMARK_KEY, effective);
-    });
-    tx();
-    // Fold the WAL back into the database after a prune that deleted something,
-    // and TRUNCATE it, so the removed rows are not left sitting in the log: this
-    // is what `secure_delete` alone does not cover, since that overwrites freed
-    // pages in the main file and knows nothing about log frames. Best effort by
-    // design — a checkpoint blocked by an active reader reports busy rather than
-    // throwing, and the next prune catches up. It is not media-level erasure and
-    // is not claimed as such; see the README on backups and replicas.
-    if (report.expired_heartbeats + report.capped_heartbeats + report.expired_instances > 0) {
-      this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+      this.db.exec('COMMIT');
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // Already resolved; the original error is what matters.
+      }
+      throw err;
     }
+    // Fold the WAL back into the database and TRUNCATE it, so rows this prune
+    // deleted are not left sitting in the log: that is what `secure_delete`
+    // alone does not cover, since it overwrites freed pages in the main file and
+    // knows nothing about log frames. Run on EVERY prune, not only one that
+    // deleted something — a checkpoint blocked by a reader reports busy rather
+    // than throwing, and if it only ran after a deleting prune, one busy moment
+    // could leave those frames in the log until the next deletion, which may be
+    // months away. Unconditional makes "the next prune catches up" true. It is
+    // not media-level erasure and is not claimed as such; see the README on
+    // backups and replicas.
+    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
     this.lastPrune = report;
     return report;
   }

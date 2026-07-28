@@ -306,6 +306,70 @@ describe('retention is a CLOCK — rows expire by age, whether or not an install
     }
   });
 
+  test('a watermark that is not a calendar day is refused, not compared', () => {
+    // Text comparison ranks 'zzz' above every real date, and `shiftDay` returns
+    // what it cannot parse — so a cutoff of 'zzz' would delete every ISO date in
+    // the store and then be written back to do it again tomorrow. One bad value
+    // in a key/value table must not be able to empty the database.
+    const dir = mkdtempSync(join(tmpdir(), 'collector-db-'));
+    try {
+      const path = join(dir, 'telemetry.db');
+      const seed = new TelemetryDb({ path, retentionDays: 30 });
+      seed.recordHeartbeat('id-1', 'brokkr', '2026-07-20', 2, payload('a'), '2026-07-20');
+      seed.close();
+
+      const raw = new Database(path);
+      raw.query("INSERT INTO meta (key, value) VALUES ('retention_watermark_day', 'zzz')").run();
+      raw.close();
+
+      const db = new TelemetryDb({ path, retentionDays: 30 });
+      const report = db.pruneRetention('2026-07-28');
+      expect(report.effective_day).toBe('2026-07-28'); // today, not the garbage
+      expect(report.cutoff_day).toBe('2026-06-29');
+      expect(report.expired_heartbeats).toBe(0);
+      expect(db.countHeartbeats('id-1', 'brokkr')).toBe(1);
+      db.close();
+
+      // ...and the unusable value is replaced rather than re-read every prune.
+      const check = new Database(path, { readonly: true });
+      const value = check
+        .query<{ value: string }, []>("SELECT value FROM meta WHERE key = 'retention_watermark_day'")
+        .get()?.value;
+      check.close();
+      expect(value).toBe('2026-07-28');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('under a regressed clock the CLAMP moves with the watermark, not with the wrong clock', () => {
+    // Both halves have to use the same day. If the clamp kept using the host's
+    // (wrong, earlier) today while the cutoff used the watermark, a row stamped
+    // between the two would be clamped DOWN below the cutoff and deleted on the
+    // spot — the regression turned into immediate data loss.
+    const dir = mkdtempSync(join(tmpdir(), 'collector-db-'));
+    try {
+      const path = join(dir, 'telemetry.db');
+      const first = new TelemetryDb({ path, retentionDays: 30 });
+      first.recordHeartbeat('id-1', 'brokkr', '2026-07-20', 2, payload('a'), '2026-07-20');
+      first.pruneRetention('2026-07-28'); // watermark := 2026-07-28
+      first.close();
+
+      const second = new TelemetryDb({ path, retentionDays: 30 });
+      // A row stamped ahead of the regressed clock but behind the watermark.
+      second.recordHeartbeat('later', 'brokkr', '2026-07-25', 2, payload('b'), '2026-07-26');
+      const report = second.pruneRetention('2026-07-01'); // clock a month behind
+      expect(report.effective_day).toBe('2026-07-28');
+      expect(report.clamp_day).toBe('2026-07-29'); // from the watermark, not from 2026-07-01
+      expect(report.clamped_heartbeats).toBe(0); // so nothing was "corrected"...
+      expect(report.expired_heartbeats).toBe(0); // ...and nothing was destroyed
+      expect(second.getHeartbeats('later', 'brokkr')[0]!.received_day).toBe('2026-07-26');
+      second.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('pruneRetention REFUSES a day it cannot parse rather than computing a garbage cutoff', () => {
     // An unparseable day would flow into a text comparison and delete everything
     // or nothing. Both are silent; neither is acceptable in a delete path.

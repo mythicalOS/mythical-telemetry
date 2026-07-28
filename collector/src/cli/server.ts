@@ -96,12 +96,16 @@ const bootPrune = db.pruneRetention(todayUtc());
 let consecutivePruneFailures = 0;
 setInterval(() => {
   try {
-    const report = db.pruneRetention(todayUtc());
+    // Read ONCE. Called twice, a tick that straddles midnight would compare the
+    // day the prune used against a different day and report a clock regression
+    // that never happened.
+    const today = todayUtc();
+    const report = db.pruneRetention(today);
     consecutivePruneFailures = 0;
     // The store refused to work from the day it was given, which means this
     // host's clock has moved backwards. Retention still happened — the durable
     // watermark saw to that — but an operator should know the clock is wrong.
-    if (report.effective_day !== todayUtc()) {
+    if (report.effective_day !== today) {
       console.error(
         `retention: system clock is behind the recorded watermark; pruned as of ${report.effective_day}`,
       );
