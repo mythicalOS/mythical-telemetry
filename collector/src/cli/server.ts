@@ -22,15 +22,19 @@ import { loadCanonicalValidator } from '../validator';
 const DEFAULT_PORT = 7910;
 const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 /**
- * How long the service may keep serving after retention last succeeded.
+ * How many prunes in a row may fail before the service stops serving.
  *
- * Two missed daily prunes. A single failure is worth riding out — a lock, a
- * transient IO error — but a persistent one means the window is no longer being
- * enforced while data keeps arriving, and a collector that cannot delete must
- * not go on collecting. At the deadline the process exits non-zero rather than
- * quietly becoming a store with no retention.
+ * A single failure is worth riding out — a lock, a transient IO error — but a
+ * persistent one means the window is no longer being enforced while data keeps
+ * arriving, and a collector that cannot delete must not go on collecting.
+ *
+ * Counted, not timed. A deadline in wall-clock milliseconds would be measured by
+ * the same clock whose unreliability the retention code already has to allow
+ * for: set it back and the deadline never arrives, set it forward and the
+ * service exits over one bad tick. Two consecutive failures are two consecutive
+ * failures whatever the clock says.
  */
-const PRUNE_FAILURE_DEADLINE_MS = 2 * PRUNE_INTERVAL_MS;
+const MAX_CONSECUTIVE_PRUNE_FAILURES = 2;
 
 function envInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -88,26 +92,35 @@ const handler = buildFetchHandler({
 // data it has promised to delete. `todayUtc()` is read per tick, never captured —
 // a cutoff frozen at boot would stop moving and the clock would stall silently,
 // which is the whole failure this prune exists to end.
-db.pruneRetention(todayUtc());
-let lastPruneOkMs = Date.now();
+const bootPrune = db.pruneRetention(todayUtc());
+let consecutivePruneFailures = 0;
 setInterval(() => {
   try {
-    db.pruneRetention(todayUtc());
-    lastPruneOkMs = Date.now();
+    const report = db.pruneRetention(todayUtc());
+    consecutivePruneFailures = 0;
+    // The store refused to work from the day it was given, which means this
+    // host's clock has moved backwards. Retention still happened — the durable
+    // watermark saw to that — but an operator should know the clock is wrong.
+    if (report.effective_day !== todayUtc()) {
+      console.error(
+        `retention: system clock is behind the recorded watermark; pruned as of ${report.effective_day}`,
+      );
+    }
   } catch (err) {
-    // One failure is survivable — a lock, a transient IO error — but it is never
-    // swallowed: an unreported failure leaves data past the window with nothing
-    // to show for it. No request data or address is involved in this line.
+    // One failure is survivable, but it is never swallowed: an unreported
+    // failure leaves data past the window with nothing to show for it. No
+    // request data or address is involved in this line.
+    consecutivePruneFailures += 1;
     console.error(`retention prune failed: ${err instanceof Error ? err.message : String(err)}`);
-    if (Date.now() - lastPruneOkMs > PRUNE_FAILURE_DEADLINE_MS) {
+    if (consecutivePruneFailures >= MAX_CONSECUTIVE_PRUNE_FAILURES) {
       // Fail closed, exactly as the start-up prune does. Serving on would mean
       // accepting data under a retention promise nothing is enforcing, and the
-      // longer it ran the more indefensible the promise would get. Exiting is
+      // longer it ran the more indefensible that promise would get. Exiting is
       // loud: a supervisor restarts, the start-up prune runs, and either it
       // works or the service stays down where someone will notice.
       console.error(
-        'retention has not succeeded within the failure deadline; exiting rather than collecting ' +
-          'data this service can no longer promise to delete',
+        `retention has failed ${consecutivePruneFailures} times in a row; exiting rather than ` +
+          'collecting data this service can no longer promise to delete',
       );
       process.exit(1);
     }
@@ -125,3 +138,7 @@ console.log(`collector listening on 0.0.0.0:${port} (db: ${dbPath})`);
 console.log(
   `migration: ${JSON.stringify(db.migration)} · trusted proxy hops: ${envInt('MYTHICAL_TELEMETRY_TRUSTED_PROXY_HOPS', 0)}`,
 );
+// The start-up prune's receipt, at start-up. On a volume that predates the
+// retention clock this is where an operator sees the backlog go, and on every
+// other boot it is how they know the clock ran at all.
+console.log(`retention: ${JSON.stringify(bootPrune)}`);

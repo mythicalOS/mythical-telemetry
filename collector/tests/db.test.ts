@@ -7,7 +7,7 @@ import { Database } from 'bun:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { INGEST_DAY_WINDOW_DAYS } from '../src/day';
+import { INGEST_DAY_WINDOW_DAYS, shiftDay } from '../src/day';
 import { maxRowsFor, TelemetryDb } from '../src/db';
 
 const payload = (day: string) => JSON.stringify({ day, schema_version: 1, metrics: {} });
@@ -198,6 +198,13 @@ describe('retention is a CLOCK — rows expire by age, whether or not an install
     expect(report.clamped_instances).toBe(3);
     expect(report.expired_heartbeats).toBe(0); // corrected, never destroyed
     expect(db.countHeartbeats('year-ahead', 'brokkr')).toBe(1);
+    // The correction is in the STORE, not merely in the report's arithmetic.
+    for (const id of ['year-ahead', 'window-ahead', 'sorts-high']) {
+      expect(db.getHeartbeats(id, 'brokkr')[0]!.received_day).toBe('2026-07-28');
+      expect(db.getInstance(id, 'brokkr')!.last_seen_day).toBe('2026-07-28');
+    }
+    // ...and a believable stamp is left exactly as it was.
+    expect(db.getHeartbeats('bit-fast', 'brokkr')[0]!.received_day).toBe('2026-07-29');
 
     // Each corrected row now expires exactly one window after the prune that
     // corrected it — not a year later, and not a window after that.
@@ -268,6 +275,37 @@ describe('retention is a CLOCK — rows expire by age, whether or not an install
     db.close();
   });
 
+  test('a clock moved BACK cannot suspend retention — the cutoff is one-way', () => {
+    // The one direction that would silently stop the promise: the cutoff
+    // retreats, rows past the window are kept, and nothing anywhere says so.
+    // The watermark is durable, so this survives a restart too.
+    const dir = mkdtempSync(join(tmpdir(), 'collector-db-'));
+    try {
+      const path = join(dir, 'telemetry.db');
+      const first = new TelemetryDb({ path, retentionDays: 30 });
+      first.recordHeartbeat('id-1', 'brokkr', '2026-07-20', 2, payload('a'), '2026-07-20');
+      expect(first.pruneRetention('2026-07-28').cutoff_day).toBe('2026-06-29');
+      first.close();
+
+      // The host comes back with its clock a year in the past.
+      const second = new TelemetryDb({ path, retentionDays: 30 });
+      const report = second.pruneRetention('2025-07-28');
+      expect(report.effective_day).toBe('2026-07-28'); // the watermark won
+      expect(report.cutoff_day).toBe('2026-06-29'); // ...so the cutoff did not retreat
+      // ...and the row still expires on the real schedule rather than being
+      // held indefinitely by a wrong clock.
+      expect(second.pruneRetention('2025-01-01').expired_heartbeats).toBe(0);
+      second.close();
+
+      const third = new TelemetryDb({ path, retentionDays: 30 });
+      expect(third.pruneRetention('2026-08-19').expired_heartbeats).toBe(1);
+      expect(third.countInstances()).toBe(0);
+      third.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('pruneRetention REFUSES a day it cannot parse rather than computing a garbage cutoff', () => {
     // An unparseable day would flow into a text comparison and delete everything
     // or nothing. Both are silent; neither is acceptable in a delete path.
@@ -313,16 +351,29 @@ describe('the row cap behind the clock (a pathology bound, NOT retention)', () =
     expect(maxRowsFor(90)).toBe(90 + INGEST_DAY_WINDOW_DAYS + 1);
     expect(new TelemetryDb({ path: ':memory:', retentionDays: 90 }).maxRowsPerInstance).toBe(maxRowsFor(90));
 
-    const db = new TelemetryDb({ path: ':memory:', retentionDays: 5 });
-    // Six distinct days, every one arriving today: more than the retention
-    // window's worth of rows, all of them inside the window by arrival.
-    for (const day of ['2026-07-23', '2026-07-24', '2026-07-25', '2026-07-26', '2026-07-27', '2026-07-28']) {
+    const retentionDays = 5;
+    const db = new TelemetryDb({ path: ':memory:', retentionDays });
+    // A WHOLE window's worth of days plus a whole ingest window of backfill,
+    // every row arriving on the same day — the widest legitimate holding this
+    // store allows. A cap that merely matched the retention window, or any
+    // number below `maxRowsFor`, would trim the oldest of these.
+    const rows = maxRowsFor(retentionDays); // 5 + 30 + 1
+    for (let i = 0; i < rows; i++) {
+      const day = shiftDay('2026-07-28', -i);
       db.recordHeartbeat('backfiller', 'brokkr', day, 2, payload(day), '2026-07-28');
     }
+    expect(db.countHeartbeats('backfiller', 'brokkr')).toBe(rows);
+
     const report = db.pruneRetention('2026-07-28');
     expect(report.capped_heartbeats).toBe(0);
     expect(report.expired_heartbeats).toBe(0);
-    expect(db.countHeartbeats('backfiller', 'brokkr')).toBe(6);
+    expect(db.countHeartbeats('backfiller', 'brokkr')).toBe(rows);
+
+    // One row beyond it IS the pathology the cap is for, and only then.
+    const extra = shiftDay('2026-07-28', -rows);
+    db.recordHeartbeat('backfiller', 'brokkr', extra, 2, payload(extra), '2026-07-28');
+    expect(db.pruneRetention('2026-07-28').capped_heartbeats).toBe(1);
+    expect(db.getHeartbeats('backfiller', 'brokkr').map((r) => r.day)).not.toContain(extra);
     db.close();
   });
 

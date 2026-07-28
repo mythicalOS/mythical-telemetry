@@ -473,26 +473,45 @@ replicas would destroy a heartbeat that did nothing wrong. So the prune **clamps
 beyond tomorrow back to today, the earliest arrival still defensible, and it expires one ordinary
 window later. Tomorrow itself is left alone — that is a host a few minutes fast, and it costs a day.
 
-This is what makes the rule total: a value that is not a date at all sorts above every real day, so
-the same comparison catches it. Nothing in the store can hold an arrival day the cutoff will not
-reach. (Only `received_day` and `last_seen_day` are ever rewritten; no stored payload is touched,
-here or anywhere in this service.)
+Clamp and cutoff together are **total over stored values**, including ones that are not dates at
+all. Text comparison sorts every value somewhere, and each place is covered: above tomorrow
+(`not-a-day`) the clamp corrects it; below the cutoff (an empty string) it is deleted at once;
+between the two (`2026-07-1X`) the rising cutoff reaches it at the same prune as its well-formed
+neighbours. No stored arrival day escapes the clock. (Only `received_day` and `last_seen_day` are
+ever rewritten; no stored payload is touched, here or anywhere in this service.)
+
+**The cutoff never goes backwards.** The highest day any prune has acted on is recorded durably, and
+a system clock reading *below* it is not believed — otherwise a clock set back would silently
+suspend the promise, leaving rows past the window kept with nothing to show that anything was wrong.
+The trade is deliberate and it is not free: a clock jumped *forward* deletes early, and the
+watermark makes that damage persist until the real date catches up. Telling "the clock jumped a
+year" from "the service was down for a year" needs a trusted time source this process does not have,
+so between quietly keeping data too long and visibly deleting it too early, this service takes the
+second. Run a clock you trust, and watch `store.last_prune` on `/metrics`: `effective_day` differing
+from today is the collector saying its clock went backwards.
 
 **What the clock does not promise to the second.** The prune is daily, so a row can outlive its
 window by up to a day before the next run reaches it, and a collector that is not running cannot
 prune — the start-up prune closes that gap, and it runs before the first request is served. A prune
 failure at start-up is fatal on purpose: a collector that cannot delete should not be accepting data
 it has promised to delete. A failure *while running* is survivable once — a lock, a transient IO
-error — but it is logged, and if retention has still not succeeded two intervals later the process
-**exits non-zero** rather than quietly becoming a store with no retention. Watch for that line, and
-for `store.last_prune.cutoff_day` on `/metrics` failing to advance.
+error — but it is logged, and after **two consecutive failures** the process **exits non-zero**
+rather than quietly becoming a store with no retention. Failures are counted rather than timed on
+purpose: a deadline in wall-clock milliseconds would be measured by the same clock the retention
+code already cannot fully trust. Watch for that line, and for `store.last_prune.cutoff_day` on
+`/metrics` failing to advance.
 
-**Deletion is a `DELETE`, and pages are overwritten — but a backup is not.** The store runs with
-`secure_delete`, so a pruned payload is overwritten rather than left legible in a freed page, and a
-prune that removed anything checkpoints the write-ahead log so the deleted rows do not linger there.
-What that does **not** cover is every copy of the file: a backup or replica taken before a prune
-still holds the rows and has no deletion path of its own. If you operate this service, your backup
-retention is part of your retention promise — the code cannot enforce it for you.
+**What deletion does and does not physically do.** The store runs with `secure_delete`, so a pruned
+payload is overwritten in the database's freed pages rather than left legible there, and a prune that
+removed anything checkpoints and **truncates** the write-ahead log, which is where those changes
+land first and where `secure_delete` has no reach. Both are best effort: a checkpoint blocked by an
+active reader reports busy and the next prune catches up.
+
+Neither is **media-level erasure**, and this is not claimed as such. Truncating a file does not
+scrub the blocks it occupied, a copy-on-write filesystem or SSD may retain them, and — the part that
+matters most in practice — **a backup or replica taken before a prune still holds the rows and has
+no deletion path of its own**. If you operate this service, your backup retention is part of your
+retention promise. The code cannot reach it for you.
 
 **Behind the clock there is a row cap, and it is not retention.**
 `maxRowsPerInstance` — `retention + 31` by default, derived and not a second literal — bounds what

@@ -484,9 +484,16 @@ describe('the operator metrics surface', () => {
     expect(before.store.last_prune).toBeNull(); // nothing has run yet in this process
 
     h.db.recordHeartbeat('long-gone', 'brokkr', '2026-01-01', 1, '{}', '2026-01-01');
+    expect(h.db.countHeartbeats('long-gone', 'brokkr')).toBe(1);
     h.db.pruneRetention('2026-07-09');
+    // The receipt is checked against the STORE, not just against itself — a
+    // report saying rows went while the rows stayed would be the worst of both.
+    expect(h.db.countHeartbeats('long-gone', 'brokkr')).toBe(0);
+    expect(h.db.getInstance('long-gone', 'brokkr')).toBeNull();
+
     const after = await (await h.handler(getReq('/metrics', { 'x-mythical-ops-key': 'ops-secret' }))).json() as any;
     expect(after.store.last_prune).toEqual({
+      effective_day: '2026-07-09',
       cutoff_day: '2026-06-10',
       clamp_day: '2026-07-10',
       clamped_heartbeats: 0,
@@ -495,6 +502,8 @@ describe('the operator metrics surface', () => {
       capped_heartbeats: 0,
       expired_instances: 1,
     });
+    // The identity that is still reporting is untouched by the same prune.
+    expect(after.store.instances_total).toBe(1);
     // Still counts only — no identity travels in the receipt.
     expect(JSON.stringify(after)).not.toContain('long-gone');
   });

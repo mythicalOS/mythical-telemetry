@@ -79,6 +79,16 @@ export function maxRowsFor(retentionDays: number): number {
   return retentionDays + INGEST_DAY_WINDOW_DAYS + 1;
 }
 
+/**
+ * `meta` key holding the highest day any prune has acted on.
+ *
+ * Durable because the failure it guards is durable: a host whose clock is set
+ * back would otherwise let the cutoff retreat, and every row past the window
+ * would go on being kept with nothing to show for it. Remembering the high-water
+ * mark makes the retention clock one-way.
+ */
+const WATERMARK_KEY = 'retention_watermark_day';
+
 export interface TelemetryDbConfig {
   /** SQLite file path, or ':memory:' for tests. */
   path: string;
@@ -104,6 +114,12 @@ export interface TelemetryDbConfig {
  * passed for a retention clock for as long as it did.
  */
 export interface PruneReport {
+  /**
+   * The day this prune actually worked from. Equal to the `today` it was given,
+   * unless that was behind the durable watermark — a clock moved back — in which
+   * case the watermark won and this says so.
+   */
+  effective_day: string;
   /** Oldest `received_day` retained by this prune. */
   cutoff_day: string;
   /** Newest arrival day still believed; anything above it was corrected to today. */
@@ -199,6 +215,8 @@ export class TelemetryDb {
   private readonly stmtCapHeartbeats: Statement;
   private readonly stmtClampInstances: Statement;
   private readonly stmtExpireInstances: Statement;
+  private readonly stmtReadMeta: Statement<{ value: string }, [string]>;
+  private readonly stmtWriteMeta: Statement;
   private readonly stmtAggregate: Statement<ProductAggregate, [string]>;
 
   constructor(config: TelemetryDbConfig) {
@@ -287,22 +305,23 @@ export class TelemetryDb {
     //      outlives its window — the cutoff would have to climb past the stamp
     //      before it even started counting. Deleting such a row instead would
     //      make one day of skew between two replicas destroy a heartbeat that
-    //      did nothing wrong, so it is corrected rather than punished. Anything
-    //      that is not a date at all ('not-a-day', 'zzz') sorts above every real
-    //      day and is caught by the very same comparison, which is what makes
-    //      the rule TOTAL: after this statement every stored arrival day is one
-    //      the cutoff will reach.
+    //      did nothing wrong, so it is corrected rather than punished.
     //   2. EXPIRE anything that arrived before the cutoff. One indexed range —
     //      see idx_heartbeats_received_day.
     //
-    // A malformed value that happens to sort INSIDE the window ('2026-07-2X')
-    // is left for the cutoff, which passes it within a day or two of when a
-    // well-formed neighbour would have gone. Catching it sooner would need a
-    // shape test (`GLOB '[0-9][0-9][0-9][0-9]-...'`), and that costs a FULL
-    // TABLE SCAN on every prune for ever because it defeats the index — measured
-    // with EXPLAIN QUERY PLAN. Nothing in this service can write such a value
+    // Together they are TOTAL over stored values, including ones that are not
+    // dates. Text comparison sorts every such value somewhere, and each place is
+    // covered: above tomorrow ('not-a-day', 'zzz') the clamp corrects it; below
+    // the cutoff ('') it is deleted at once; and between the two ('2026-07-1X')
+    // the rising cutoff reaches it at the same prune as its well-formed
+    // neighbours. No stored arrival day escapes the clock.
+    //
+    // Catching an in-window malformed value on shape rather than on order would
+    // need a `GLOB '[0-9][0-9][0-9][0-9]-...'` test, and that costs a FULL TABLE
+    // SCAN on every prune for ever because it defeats the index — measured with
+    // EXPLAIN QUERY PLAN. Nothing in this service can write such a value
     // (`received_day` is always the server's own UTC day), so the scan would buy
-    // two days on a row that cannot exist.
+    // nothing on a row that cannot exist.
     //
     // WHY `received_day` AND NOT `day`. The promise is about how long WE hold a
     // record, so its clock has to start when the record reaches us. Keying on
@@ -358,6 +377,10 @@ export class TelemetryDb {
                   AND h.product = instances.product
              )
     `);
+    this.stmtReadMeta = this.db.query('SELECT value FROM meta WHERE key = ?1');
+    this.stmtWriteMeta = this.db.query(
+      'INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+    );
     this.stmtAggregate = this.db.query(`
       SELECT i.product                                                AS product,
              COUNT(*)                                                 AS installs_seen,
@@ -515,11 +538,25 @@ export class TelemetryDb {
    * Only `received_day` and `last_seen_day` are ever rewritten. NO STORED
    * PAYLOAD IS TOUCHED, here or anywhere else in this service.
    *
-   * ON BEING CLOCK-DRIVEN AT ALL. A time-based promise cannot be kept without a
-   * clock, so the failure modes are worth naming: a clock jumped FORWARD deletes
-   * early (loss for us, never a privacy failure), and a clock moved BACK deletes
-   * late — which is no worse than the unconditional behaviour this replaced.
-   * Neither hands anything back to an attacker, which is exactly why the
+   * THE CUTOFF NEVER GOES BACKWARDS. A time-based promise cannot be kept
+   * without a clock, and a clock can be wrong — but a clock moved BACK is the
+   * one direction that would silently SUSPEND the promise: the cutoff would
+   * retreat, and rows past the window would sit there being kept, with nothing
+   * to show that anything was wrong. So the highest day any prune has acted on
+   * is recorded durably (`meta.retention_watermark_day`) and a `today` below it
+   * is not believed; the prune uses the watermark instead and reports which day
+   * it used, so the caller can say so out loud.
+   *
+   * That choice is not free and the trade is deliberate. A clock moved FORWARD
+   * deletes early, and the watermark makes that damage PERSIST — a host that
+   * spends one prune convinced it is 2099 leaves a store that will expire
+   * everything until the real date catches up. Distinguishing "the clock jumped
+   * a year" from "the service was down for a year" needs a trusted time source
+   * this process does not have, so between a store that quietly keeps data past
+   * its window and one that visibly deletes too early, this service takes the
+   * second. Run a clock you trust, and watch `cutoff_day` on /metrics.
+   *
+   * Neither direction hands anything back to an attacker, which is why the
    * ADMISSION LEDGER IS STILL DELIBERATELY NOT PRUNED: it holds one small row
    * per UTC day the service has ever seen — a few tens of kilobytes per decade,
    * nothing beside the heartbeat rows — and deleting from it is the only
@@ -537,12 +574,10 @@ export class TelemetryDb {
     if (dayToEpochUtc(today) === null) {
       throw new Error(`pruneRetention needs a real UTC calendar day as YYYY-MM-DD, got: ${String(today)}`);
     }
-    const cutoff = shiftDay(today, -(this.retentionDays - 1));
-    // Beyond tomorrow is not a clock difference, it is a wrong clock.
-    const believable = shiftDay(today, 1);
     const report: PruneReport = {
-      cutoff_day: cutoff,
-      clamp_day: believable,
+      effective_day: today,
+      cutoff_day: today,
+      clamp_day: today,
       clamped_heartbeats: 0,
       clamped_instances: 0,
       expired_heartbeats: 0,
@@ -550,28 +585,39 @@ export class TelemetryDb {
       expired_instances: 0,
     };
     const tx = this.db.transaction(() => {
-      // Correct first, expire second — a row clamped to `today` in this same
-      // transaction must be judged on the corrected value, and a value the store
-      // cannot place on the calendar at all ('not-a-day') sorts above every real
-      // date, so it is caught here and given a real clock rather than living for
-      // ever.
-      report.clamped_heartbeats = this.stmtClampHeartbeats.run(today, believable).changes;
-      report.clamped_instances = this.stmtClampInstances.run(today, believable).changes;
+      // The watermark is read and written INSIDE the transaction, so two
+      // replicas pruning the same file cannot each read the old value and race
+      // the cutoff backwards.
+      const watermark = this.stmtReadMeta.get(WATERMARK_KEY)?.value ?? null;
+      const effective = watermark !== null && watermark > today ? watermark : today;
+      const cutoff = shiftDay(effective, -(this.retentionDays - 1));
+      // Beyond tomorrow is not a clock difference, it is a wrong clock.
+      const believable = shiftDay(effective, 1);
+      report.effective_day = effective;
+      report.cutoff_day = cutoff;
+      report.clamp_day = believable;
+
+      // Correct first, expire second — a row clamped in this same transaction
+      // must then be judged on the corrected value.
+      report.clamped_heartbeats = this.stmtClampHeartbeats.run(effective, believable).changes;
+      report.clamped_instances = this.stmtClampInstances.run(effective, believable).changes;
       report.expired_heartbeats = this.stmtExpireHeartbeats.run(cutoff).changes;
       report.capped_heartbeats = this.stmtCapHeartbeats.run(this.maxRowsPerInstance).changes;
       // Last, and inside the same transaction, so NOT EXISTS sees the store as
       // the deletes above left it.
       report.expired_instances = this.stmtExpireInstances.run(cutoff).changes;
+      this.stmtWriteMeta.run(WATERMARK_KEY, effective);
     });
     tx();
-    // Checkpoint after a prune that actually deleted something. The delete lands
-    // in the WAL, and until the WAL is folded back into the database the removed
-    // rows are still sitting in it — `secure_delete` overwrites pages in the main
-    // file, not history in the log. PASSIVE, so a busy reader is never blocked
-    // and a failure to checkpoint is not a failure to delete; the next one
-    // catches up.
+    // Fold the WAL back into the database after a prune that deleted something,
+    // and TRUNCATE it, so the removed rows are not left sitting in the log: this
+    // is what `secure_delete` alone does not cover, since that overwrites freed
+    // pages in the main file and knows nothing about log frames. Best effort by
+    // design — a checkpoint blocked by an active reader reports busy rather than
+    // throwing, and the next prune catches up. It is not media-level erasure and
+    // is not claimed as such; see the README on backups and replicas.
     if (report.expired_heartbeats + report.capped_heartbeats + report.expired_instances > 0) {
-      this.db.exec('PRAGMA wal_checkpoint(PASSIVE);');
+      this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
     }
     this.lastPrune = report;
     return report;
