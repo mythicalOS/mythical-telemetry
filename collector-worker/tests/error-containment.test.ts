@@ -114,47 +114,22 @@ describe('a failing store is contained: coarse 500, counted, nothing internal on
 });
 
 describe('KNOWN DEFECT — routes whose failures escape the catch (see this file’s header)', () => {
-  test.skip('POST /v1/ingest — FAILS TODAY: `return handleIngest(...)` is not awaited, so the rejection escapes', async () => {
+  test('POST /v1/ingest — a store throw is contained as 500 internal, not a bare rejection', async () => {
     const h = makeHarness();
     breakStore(h, 'recordHeartbeat');
     await expectContained(h, await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A)));
   });
 
-  test.skip('GET /v1/instances/:uuid/stats — FAILS TODAY: `return handleStats(...)` is not awaited (REGRESSION: caught in the reference)', async () => {
+  test('GET /v1/instances/:uuid/stats — a store throw is contained as 500 internal', async () => {
     const h = makeHarness();
     breakStore(h, 'getInstance');
     await expectContained(h, await h.handler(statsReq(INSTANCE_A, 'brokkr', { secret: SECRET_A })));
   });
 
-  test.skip('DELETE /v1/instances/:uuid — FAILS TODAY: `return handleDelete(...)` is not awaited (REGRESSION: caught in the reference)', async () => {
+  test('DELETE /v1/instances/:uuid — a store throw is contained as 500 internal', async () => {
     const h = makeHarness();
     breakStore(h, 'deleteInstance');
     await expectContained(h, await h.handler(deleteReq(INSTANCE_A, SECRET_A)));
   });
 
-  // The defect is asserted POSITIVELY here, so this file proves the claim it
-  // makes rather than only describing it. If someone lands the three `await`s,
-  // this test starts failing and the three above start passing — which is the
-  // signal to delete this one and un-skip those.
-  test('the three routes above currently REJECT instead of answering 500 — this is the defect, pinned', async () => {
-    const cases: Array<[string, string, () => Request]> = [
-      ['ingest', 'recordHeartbeat', () => ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A)],
-      ['stats', 'getInstance', () => statsReq(INSTANCE_A, 'brokkr', { secret: SECRET_A })],
-      ['delete', 'deleteInstance', () => deleteReq(INSTANCE_A, SECRET_A)],
-    ];
-    for (const [label, method, mk] of cases) {
-      const h = makeHarness();
-      breakStore(h, method);
-      let rejected = false;
-      try {
-        await h.handler(mk());
-      } catch (err) {
-        rejected = true;
-        // ...and the message that escapes is the internal one.
-        expect(err instanceof Error ? err.message : String(err), label).toContain('BOOM');
-      }
-      expect(rejected, `${label} should currently reject (it does not, so the defect is fixed)`).toBe(true);
-      expect(h.counters.get('internal_error'), label).toBe(0);
-    }
-  });
 });

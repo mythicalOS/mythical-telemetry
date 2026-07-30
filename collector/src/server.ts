@@ -664,13 +664,13 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
         const res = handleMetrics(req, server);
         if (res) return res;
       }
-      if (path === '/v1/ingest' && req.method === 'POST') return handleIngest(req, server);
+      if (path === '/v1/ingest' && req.method === 'POST') return await handleIngest(req, server);
 
       const statsMatch = /^\/v1\/instances\/([^/]+)\/stats$/.exec(path);
-      if (statsMatch && req.method === 'GET') return handleStats(statsMatch[1] ?? '', url, req, server);
+      if (statsMatch && req.method === 'GET') return await handleStats(statsMatch[1] ?? '', url, req, server);
 
       const instanceMatch = /^\/v1\/instances\/([^/]+)$/.exec(path);
-      if (instanceMatch && req.method === 'DELETE') return handleDelete(instanceMatch[1] ?? '', req, server);
+      if (instanceMatch && req.method === 'DELETE') return await handleDelete(instanceMatch[1] ?? '', req, server);
 
       return json(404, { ok: false, error: 'not_found' });
     } catch {
