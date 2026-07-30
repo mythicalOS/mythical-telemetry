@@ -234,6 +234,22 @@ possession of that installation's own derived secret. Do not add a shared creden
 
 ### 5. Deploy
 
+Build it first, without deploying anything. This resolves and bundles every import — including the
+`node:crypto` calls that need `nodejs_compat` and the sources this package reaches into outside its
+own directory — and contacts no account:
+
+```sh
+npx wrangler deploy --dry-run --outdir /tmp/collector-worker-build
+```
+```
+Total Upload: 68.31 KiB / gzip: 20.08 KiB
+Your Worker has access to the following bindings:
+env.DB (mythicalos-telemetry)      D1 Database
+--dry-run: exiting now.
+```
+
+Then, for real:
+
 ```sh
 npx wrangler deploy
 ```
