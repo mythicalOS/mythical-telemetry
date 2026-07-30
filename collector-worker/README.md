@@ -589,11 +589,11 @@ bun test tests      # from this directory
 bun test            # from the repository root — includes these
 ```
 
-Current: **31 pass, 2 skip, 0 fail.** They run in CI, because the root `bun test` picks them up.
+Current: **178 pass, 7 skip, 0 fail.** They run in CI, because the root `bun test` picks them up.
 
 ### What is covered
 
-`tests/db.test.ts` is `collector/tests/db.test.ts` ported to the D1 store. The transform was
+**The store.** `tests/db.test.ts` is `collector/tests/db.test.ts` ported to the D1 store. The transform was
 mechanical — `async`/`await` throughout, and the store constructed over a shim instead of a file
 path. **No assertion was relaxed and no expected value was changed.** It covers the whole store: the
 upsert and its `first_seen_day`/`last_seen_day` behaviour, per-product partitioning, the retention
@@ -611,27 +611,71 @@ Two of those tests matter more here than they did in the original, because they 
   caught a real bug in the rewrite here: a budget of `0` means "disabled", and the first SQL guard
   refused everything instead.
 
+**The routes.** `tests/{ingest,read-auth,hardening,stats,aggregate}.test.ts` are the corresponding
+suites from `collector/tests/`, ported against **this package's own `src/server.ts`** over the same
+shim, through `tests/helpers.ts`. Same rule as the store port: mechanical `async`/`await`, no
+assertion relaxed. Between them they cover the authentication and authorization model (derived
+identity on write, read and delete; the historical header name; the operator key granting neither
+read nor write), the coarse-answer discipline (a missing and a wrong credential are byte-identical;
+`/metrics` unconfigured answers like any unknown route), the pinned check ORDER — including that
+authentication precedes body parsing, so an unauthenticated malformed body is 403 and not 400 — the
+body cap and the day window, the retired `/i/<uuid>` route staying 404 under every method and with
+the owning secret, the small-cell aggregate floor at its exact boundary, delete's idempotency and
+its effect on both the per-install read and the public aggregate, the per-source throttles and the
+new-identity budgets, and the operator metrics surface.
+
+**The deployed wiring.** `tests/worker-entry.test.ts` drives `src/worker.ts` itself — the real
+`fetch` and `scheduled` exports over the shim. It is the only place the **canonical validator**, the
+`envInt` binding reader, the `CF-Connecting-IP` source derivation and the per-isolate memoisation
+are exercised; everything else injects a stub validator and a config object.
+
+**Error containment.** `tests/error-containment.test.ts` asks whether a store failure stays inside
+the service on each route. It has no counterpart in `collector/tests/`, and writing it found a
+defect — see the last bullet below.
+
 ### What is NOT covered, and why
 
-- **`bun test` cannot drive D1.** There is no D1 outside workerd. The store tests run against
-  `tests/d1-over-sqlite.ts`, a shim presenting D1's API over `bun:sqlite`. Read that file's header:
-  it does **not** prove D1's `batch()` atomicity (the shim uses a real SQLite transaction, which is
-  stronger than D1 documents), does not reproduce `SQLITE_AUTH`, and does not reproduce network
-  latency or D1's per-query and row-size limits.
-- **`src/server.ts` has no unit tests here at all.** The original's route-level suites — ingest,
-  read auth, hardening, IP/trusted-proxy, stats, aggregate, seam, packaging — were not ported. The
-  route layer's only coverage is the end-to-end verification above. That is the largest gap in this
-  package, and it is a gap, not a decision that route behaviour does not matter.
-- **`src/worker.ts` has no tests.** Its `scheduled` path is exercised only by firing the cron by
-  hand under `wrangler dev --local`.
-- **The two unportable tests** are declared in `tests/db.test.ts` as skipped tests carrying their
-  reason, so `bun test` reports `2 skip` on every run rather than silently forgetting them:
-  - `file-backed database runs in WAL mode` — D1 refuses `PRAGMA journal_mode`.
-  - `a prune folds the write-ahead log back and truncates it, and says whether it did` — D1 exposes
-    no write-ahead log, and the prune receipt has no `wal_truncated` field.
+- **`bun test` cannot drive D1.** There is no D1 outside workerd. Every suite here — store and
+  routes alike — runs against `tests/d1-over-sqlite.ts`, a shim presenting D1's API over
+  `bun:sqlite`. Read that file's header: it does **not** prove D1's `batch()` atomicity (the shim
+  uses a real SQLite transaction, which is stronger than D1 documents), does not reproduce
+  `SQLITE_AUTH`, and does not reproduce network latency or D1's per-query and row-size limits. A
+  green route test means the routing, the authentication and the hardening are right. It does not
+  mean D1 behaves. The end-to-end proof stays the `wrangler dev --local` verification above.
+- **The throttles and counters are per-PROCESS in tests and per-ISOLATE in production.** Every bound
+  `tests/hardening.test.ts` asserts holds for one handler with one set of token buckets, which is
+  what `collector/`'s single Bun process gives you. A deployed Worker has many isolates, so those
+  same bounds apply per isolate and a distributed flood is barely bounded at all — §4 of "What this
+  deployment does not have". The route logic is tested; the operational guarantee it implies is
+  weaker than the test suggests.
+- **Two bodies of the original stay in `collector/tests/`, deliberately.** The `resolveSourceKey` /
+  `addressKey` matrix (all of `tests/ip.test.ts` and most of `the trusted-proxy model`), the
+  `TokenBucketLimiter` memory-bound tests, and the direct `foldTotals` / `foldRates` /
+  `renderAggregatePage` / `escapeHtml` unit tests exercise modules this package imports **by
+  reference**, not by copy. Re-running them here would assert the same function objects twice. Every
+  path that reaches those modules THROUGH a route is ported. `seam.test.ts`, `packaging.test.ts` and
+  `migrate.test.ts` do not apply: the first two describe the reference package, and the Worker does
+  not migrate at all.
+- **The seven skipped tests** are declared in place, named, carrying their reason, so `bun test`
+  reports `7 skip` on every run rather than silently forgetting them:
+  - `tests/db.test.ts` — `file-backed database runs in WAL mode` (D1 refuses `PRAGMA journal_mode`)
+    and `a prune folds the write-ahead log back and truncates it` (D1 exposes no write-ahead log, and
+    the prune receipt has no `wal_truncated` field). These are §1, expressed as tests.
+  - `tests/hardening.test.ts` — `the migration receipt is served on /metrics` (the Worker does not
+    migrate; `migration` is `null` rather than a fabricated object) and `last_prune is observable in
+    production` (it lives in one isolate and the prune runs in another). The second is §4.
+  - `tests/error-containment.test.ts` — **three tests that fail today, and should not.** The router
+    returns `handleIngest`, `handleStats` and `handleDelete` without `await`, so a rejection from any
+    of them completes the `try` block and never reaches the catch-all that turns an internal failure
+    into `500 {"ok":false,"error":"internal"}` plus an `internal_error` counter. In the reference
+    collector `handleStats` and `handleDelete` are synchronous and ARE caught — this port made them
+    `async`, and that colour change moved them out of the catch's reach. Read that file's header for
+    the full account and what it costs. The fix is `return await` in three places; it is not applied
+    on this branch, because a route-layer change belongs in its own commit against **both**
+    collectors (see [`../docs/TWO-COLLECTORS.md`](../docs/TWO-COLLECTORS.md)).
 
-  They are §1 of "What this deployment does not have", expressed as tests. Do not delete them to
-  make the suite tidy; a skipped test is reported every run, a deleted one is reported never.
+  Do not delete any of them to make the suite tidy; a skipped test is reported every run, a deleted
+  one is reported never.
 
 ---
 
