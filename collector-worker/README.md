@@ -5,9 +5,10 @@ with [D1](https://developers.cloudflare.com/d1/) instead of Bun with `bun:sqlite
 published** — a private workspace package; the repository's release workflow publishes only the
 client package.
 
-> **This is one of two collectors in this repository and they are near-copies of each other.**
-> Read [`../docs/TWO-COLLECTORS.md`](../docs/TWO-COLLECTORS.md) before changing anything in
-> `src/`. It says which one is production, which is reference, and what must be changed in both.
+> **This is the centrally deployed collector**, on Cloudflare Workers and D1. If you want to run a
+> collector of your own, start from [`../collector`](../collector) instead — it is the same service
+> with no platform dependencies. The two share their payload validation, their identity scheme and
+> their admission rules; a change to either one's behaviour belongs in both.
 
 Everything the service *does* — the routes, the identity scheme, the admission budgets, the
 first-report exclusion, the small-cell floor, the wire answers — is described in
@@ -656,23 +657,20 @@ defect — see the last bullet below.
   path that reaches those modules THROUGH a route is ported. `seam.test.ts`, `packaging.test.ts` and
   `migrate.test.ts` do not apply: the first two describe the reference package, and the Worker does
   not migrate at all.
-- **The seven skipped tests** are declared in place, named, carrying their reason, so `bun test`
-  reports `7 skip` on every run rather than silently forgetting them:
+- **The four skipped tests** are declared in place, named, carrying their reason, so `bun test`
+  reports `4 skip` on every run rather than silently forgetting them:
   - `tests/db.test.ts` — `file-backed database runs in WAL mode` (D1 refuses `PRAGMA journal_mode`)
     and `a prune folds the write-ahead log back and truncates it` (D1 exposes no write-ahead log, and
     the prune receipt has no `wal_truncated` field). These are §1, expressed as tests.
   - `tests/hardening.test.ts` — `the migration receipt is served on /metrics` (the Worker does not
     migrate; `migration` is `null` rather than a fabricated object) and `last_prune is observable in
     production` (it lives in one isolate and the prune runs in another). The second is §4.
-  - `tests/error-containment.test.ts` — **three tests that fail today, and should not.** The router
-    returns `handleIngest`, `handleStats` and `handleDelete` without `await`, so a rejection from any
-    of them completes the `try` block and never reaches the catch-all that turns an internal failure
-    into `500 {"ok":false,"error":"internal"}` plus an `internal_error` counter. In the reference
-    collector `handleStats` and `handleDelete` are synchronous and ARE caught — this port made them
-    `async`, and that colour change moved them out of the catch's reach. Read that file's header for
-    the full account and what it costs. The fix is `return await` in three places; it is not applied
-    on this branch, because a route-layer change belongs in its own commit against **both**
-    collectors (see [`../docs/TWO-COLLECTORS.md`](../docs/TWO-COLLECTORS.md)).
+
+  `tests/error-containment.test.ts` used to hold three more. They covered a real defect: the router
+  returned `handleIngest`, `handleStats` and `handleDelete` without `await`, so a rejection from any
+  of them completed the `try` block and never reached the catch-all that turns an internal failure
+  into `500 {"ok":false,"error":"internal"}` plus an `internal_error` counter. Writing the route
+  tests is what exposed it. It is fixed — those three now assert containment and pass.
 
   Do not delete any of them to make the suite tidy; a skipped test is reported every run, a deleted
   one is reported never.

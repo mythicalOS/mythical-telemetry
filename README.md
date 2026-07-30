@@ -14,9 +14,11 @@ them must not drift. Keeping them together lets a single lockstep test span all 
 defect once slipped through precisely because a rename touched two of them and not the third,
 and no test could see across the gap.
 
-**The two collectors are near-copies of each other and nothing tests them against each other.** A
-change to `db.ts` or `server.ts` must land in both, in the same commit. Read
-[`docs/TWO-COLLECTORS.md`](docs/TWO-COLLECTORS.md) before touching either.
+**There are two collectors.** [`collector/`](collector) is the one you can run yourself — Bun and a
+single SQLite file, no platform dependencies. [`collector-worker/`](collector-worker) is the same
+service on Cloudflare Workers and D1, and is the one deployed centrally. They share their payload
+validation, identity scheme and admission rules, so a change to what either accepts or stores
+belongs in both.
 
 ## What is collected
 

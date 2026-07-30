@@ -5,12 +5,11 @@ workspace package, and the repository's release workflow publishes only the clie
 
 Run your own or don't. Nothing in any product requires this service to exist.
 
-> **There is a second collector in this repository, and it is the deployed one.**
-> [`../collector-worker`](../collector-worker) is this service ported to Cloudflare Workers on D1.
-> It duplicates `src/db.ts` and `src/server.ts` almost line for line, so **a change to either of
-> those files has to land in both, in the same commit** — nothing tests the two against each other.
-> Read [`../docs/TWO-COLLECTORS.md`](../docs/TWO-COLLECTORS.md) first: which is production, which is
-> reference, which differences are deliberate, and what convergence would take.
+> **This is the collector you run yourself.** It is a self-contained service: Bun, one SQLite file,
+> no platform dependencies. Run it to receive your own installations' heartbeats instead of sending
+> them anywhere. [`../collector-worker`](../collector-worker) is the same service on Cloudflare
+> Workers and D1 — that is the one deployed centrally, and it is not the one to start from if you
+> want to host this.
 >
 > The Worker deployment does **not** have four of the guarantees described below — `secure_delete`
 > and the WAL truncation, the fail-closed retention posture, globally-enforced per-source limiters,
