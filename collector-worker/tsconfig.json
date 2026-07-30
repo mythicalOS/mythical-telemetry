@@ -1,0 +1,10 @@
+{
+  "extends": "../tsconfig.base.json",
+  // `src` and `tests` only. The two files this package reaches OUTSIDE its own
+  // directory — `../collector/src/*` and `../packages/telemetry/src/envelope` —
+  // are pulled in by import and typechecked as part of their own packages; they
+  // are deliberately not listed here, so a change to them is reported against
+  // the package that owns them rather than twice.
+  "include": ["src/**/*.ts", "tests/**/*.ts"],
+  "exclude": ["node_modules", ".wrangler"]
+}

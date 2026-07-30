@@ -1,4 +1,8 @@
-// SPIKE — the D1 port of `collector/src/db.ts`.
+// The D1 store — the deployed counterpart of `collector/src/db.ts`.
+//
+// THESE TWO FILES ARE A KNOWN DUPLICATE PAIR AND MUST BE CHANGED TOGETHER.
+// Read `../../docs/TWO-COLLECTORS.md` before editing either of them: which one
+// is production, which is reference, and what has already drifted.
 //
 // The SQL is, statement for statement, the SQL of the original: every query
 // shape was probed against local D1 (`wrangler d1 execute --local`) and every
@@ -8,7 +12,7 @@
 //
 //   1. EVERY METHOD IS ASYNC. D1 has no synchronous read, so the colour change
 //      starts here and propagates all the way to the route handlers — see
-//      `server-d1.ts`.
+//      `server.ts`.
 //
 //   2. THERE IS NO INTERACTIVE TRANSACTION. `BEGIN IMMEDIATE` is refused
 //      outright by D1 (measured: "To execute a transaction, please use the
@@ -27,11 +31,16 @@
 //      load-bearing and are addressed where they used to be set.
 //      (`PRAGMA table_info` is the one exception — it IS permitted.)
 
-import { dayToEpochUtc, INGEST_DAY_WINDOW_DAYS, shiftDay } from '../../../collector/src/day';
+import { dayToEpochUtc, INGEST_DAY_WINDOW_DAYS, shiftDay } from '../../collector/src/day';
 
 // ── Minimal structural D1 types ────────────────────────────────────────────
-// Declared here rather than pulled from `@cloudflare/workers-types` so the
-// spike adds no dependency. Only the surface actually used is described.
+// Declared here rather than pulled from `@cloudflare/workers-types`, which
+// would have to be added to `types` in this package's tsconfig and would then
+// collide with `bun-types` over the shared globals (`Request`, `Response`,
+// `fetch`) — the store's tests run under bun, so both type sets are in scope at
+// once. Only the D1 surface this store actually uses is described, which is
+// also what lets the bun-side harness implement it exactly and completely
+// (see `tests/d1-over-sqlite.ts`).
 
 export interface D1Meta {
   changes?: number;

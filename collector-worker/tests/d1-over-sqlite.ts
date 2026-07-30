@@ -1,12 +1,17 @@
-// SPIKE TEST HARNESS — a `D1Database` implemented over `bun:sqlite`.
+// TEST HARNESS — a `D1Database` implemented over `bun:sqlite`.
 //
-// WHY THIS EXISTS. The collector's 263 tests run in `bun test` against an
-// in-memory `bun:sqlite`. They cannot run against D1 as written, and the
-// question the spike has to answer is HOW MUCH of that is the store being
-// remote and how much is merely the store being async. This shim isolates the
-// second half: it presents D1's exact API surface over `bun:sqlite`, so the
-// ported test file differs from the original ONLY by `async`/`await` and by the
-// assertions that name things D1 does not have.
+// TEST-ONLY, AND IT LIVES HERE RATHER THAN IN `src/` FOR THAT REASON: it
+// imports `bun:sqlite`, which does not exist on workerd. Anything under `src/`
+// can end up in the deployed bundle; nothing under `tests/` can. Do not move it
+// back, and do not import it from `src/`.
+//
+// WHY IT EXISTS. `bun test` cannot drive D1 — there is no D1 outside workerd,
+// and wrangler's local D1 lives inside miniflare. Without a shim the store's
+// entire test suite would have had to be thrown away and replaced with
+// end-to-end curl checks, which prove far less. This presents D1's exact API
+// surface over `bun:sqlite`, so the store tests differ from the originals in
+// `collector/tests/db.test.ts` ONLY by `async`/`await` and by the assertions
+// that name things D1 does not have.
 //
 // WHAT IT DOES NOT PROVE, stated plainly so no one reads more into a green run
 // than is there:
@@ -14,17 +19,17 @@
 //   • It does not prove D1's `batch()` atomicity. Here `batch` is a real
 //     SQLite transaction, which is STRONGER than what D1 documents.
 //   • It does not reproduce SQLITE_AUTH. Every PRAGMA works here and none work
-//     on D1 — the PRAGMA findings in this spike come from `wrangler d1 execute
-//     --local`, not from this file.
+//     on D1 — the PRAGMA findings came from `wrangler d1 execute --local`, not
+//     from this file.
 //   • It does not reproduce network latency, D1's per-query limits, or its
 //     row/size caps.
 //
-// It is a harness for the PORTED LOGIC, not a substitute for running on D1.
-// The end-to-end proof that the port works on real (local) D1 is the
-// `wrangler dev --local` run recorded in the spike notes.
+// It is a harness for the STORE LOGIC, not a substitute for running on D1. The
+// end-to-end proof that the port works on real (local) D1 is the
+// `wrangler dev --local` verification recorded in ../README.md.
 
 import { Database } from 'bun:sqlite';
-import type { D1Database, D1PreparedStatement, D1Result } from './db-d1';
+import type { D1Database, D1PreparedStatement, D1Result } from '../src/db';
 
 class ShimStatement implements D1PreparedStatement {
   constructor(

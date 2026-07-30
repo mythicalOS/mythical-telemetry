@@ -1,7 +1,0 @@
-{
-  // SPIKE ONLY — local emulation.
-  "name": "timing-probe",
-  "main": "timing.ts",
-  "compatibility_date": "2026-07-01",
-  "compatibility_flags": ["nodejs_compat"]
-}

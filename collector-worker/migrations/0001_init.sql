@@ -1,4 +1,7 @@
--- SPIKE — the collector's CURRENT table shape, expressed as a D1 migration.
+-- The collector's CURRENT table shape, expressed as a D1 migration.
+--
+-- Applied out of band by `wrangler d1 migrations apply` — see ../README.md.
+-- The Worker itself never migrates: there is no boot hook to run one from.
 --
 -- This is deliberately NOT a port of `collector/src/migrate.ts`. That module is
 -- a transactional REBUILD: it detects a pre-product table by its primary key
@@ -10,7 +13,7 @@
 -- The consequence is recorded rather than hidden: an existing SQLite volume
 -- cannot be brought to D1 by running this. It would have to be exported and
 -- reloaded, and the rebuild logic (and its row-conservation guard) has no home
--- in the D1 world. See the spike report.
+-- in the D1 world. See ../README.md → "What this deployment does not have".
 --
 -- `PRAGMA user_version` is not set: D1 tracks applied migrations in its own
 -- `d1_migrations` table, which is the mechanism that replaces the user_version

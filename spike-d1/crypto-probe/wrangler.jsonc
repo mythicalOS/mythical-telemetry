@@ -1,8 +1,0 @@
-{
-  // SPIKE ONLY — local emulation. No account id, no routes, nothing deployable.
-  "name": "crypto-probe",
-  "main": "worker.ts",
-  // The flag under test. Without it `node:crypto` does not resolve at all.
-  "compatibility_date": "2026-07-01",
-  "compatibility_flags": ["nodejs_compat"]
-}

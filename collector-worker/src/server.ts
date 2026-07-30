@@ -1,4 +1,8 @@
-// SPIKE — the D1 port of `collector/src/server.ts`.
+// The Worker's route surface — the deployed counterpart of
+// `collector/src/server.ts`.
+//
+// THESE TWO FILES ARE A KNOWN DUPLICATE PAIR AND MUST BE CHANGED TOGETHER.
+// Read `../../docs/TWO-COLLECTORS.md` before editing either of them.
 //
 // The ROUTING, the check ORDER, the coarse wire answers and every privacy
 // invariant are untouched. What changed is colour: D1 has no synchronous read,
@@ -44,17 +48,17 @@
 // and never-existed instances are indistinguishable.
 
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { dayToEpochUtc, INGEST_DAY_WINDOW_DAYS, MS_PER_DAY, shiftDay } from '../../../collector/src/day';
-import type { TelemetryD1 } from './db-d1';
-import { authorizesInstance, UUID_V4_RE } from '../../../collector/src/identity';
-import { Counters, type CounterName } from '../../../collector/src/counters';
-import { parseTrustedProxies } from '../../../collector/src/ip';
-import { renderAggregatePage, type AggregateProductView, type AggregateView } from '../../../collector/src/page';
-import { resolveSourceKey, TokenBucketLimiter, type ServerLike } from '../../../collector/src/throttle';
-import { decorateDay, foldRates, foldTotals, type TotalsValue } from '../../../collector/src/totals';
-import { HEARTBEAT_SCHEMA_VERSION, safeValidate, type HeartbeatValidator } from '../../../collector/src/validator';
+import { dayToEpochUtc, INGEST_DAY_WINDOW_DAYS, MS_PER_DAY, shiftDay } from '../../collector/src/day';
+import type { TelemetryD1 } from './db';
+import { authorizesInstance, UUID_V4_RE } from '../../collector/src/identity';
+import { Counters, type CounterName } from '../../collector/src/counters';
+import { parseTrustedProxies } from '../../collector/src/ip';
+import { renderAggregatePage, type AggregateProductView, type AggregateView } from '../../collector/src/page';
+import { resolveSourceKey, TokenBucketLimiter, type ServerLike } from '../../collector/src/throttle';
+import { decorateDay, foldRates, foldTotals, type TotalsValue } from '../../collector/src/totals';
+import { HEARTBEAT_SCHEMA_VERSION, safeValidate, type HeartbeatValidator } from '../../collector/src/validator';
 
-export type { ServerLike } from '../../../collector/src/throttle';
+export type { ServerLike } from '../../collector/src/throttle';
 
 export const DEFAULT_MAX_BODY_BYTES = 32_768;
 export const DEFAULT_RATE_LIMIT_PER_MIN = 60;

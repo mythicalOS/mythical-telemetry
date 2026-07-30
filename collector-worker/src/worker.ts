@@ -1,4 +1,5 @@
-// SPIKE — the Worker entrypoint. Replaces `collector/src/cli/server.ts`.
+// The Worker entrypoint. The deployed counterpart of
+// `collector/src/cli/server.ts` — see `../../docs/TWO-COLLECTORS.md`.
 //
 // Three things in that file have no Worker equivalent and are dealt with here:
 //
@@ -15,11 +16,11 @@
 // counters, the aggregate cache — is per-isolate as a result. See the note on
 // `getHandler`.
 
-import { todayUtc } from '../../../collector/src/day';
-import type { ServerLike } from '../../../collector/src/throttle';
-import type { HeartbeatValidator, ValidationResult, Heartbeat } from '../../../collector/src/validator';
-import { TelemetryD1, type D1Database } from './db-d1';
-import { buildFetchHandler, type FetchHandler } from './server-d1';
+import { todayUtc } from '../../collector/src/day';
+import type { ServerLike } from '../../collector/src/throttle';
+import type { HeartbeatValidator, ValidationResult, Heartbeat } from '../../collector/src/validator';
+import { TelemetryD1, type D1Database } from './db';
+import { buildFetchHandler, type FetchHandler } from './server';
 
 // THE VALIDATOR SEAM, AND WHY THIS IMPORT LOOKS LIKE THIS.
 //
@@ -36,11 +37,22 @@ import { buildFetchHandler, type FetchHandler } from './server-d1';
 // pulls in regardless. So the import has to reach `envelope.ts` directly, which
 // is the only module the validator actually needs and which imports nothing.
 //
-// Consequence for the package, and it is a real one: its `exports` map today
-// publishes only `"."` and the two schema JSON files. A deep import of
-// `envelope.ts` is reachable from this repo's source tree but NOT from the
-// published package. Shipping this would require adding a subpath export.
-import { validateHeartbeat } from '../../../packages/telemetry/src/envelope';
+// So this is a deep RELATIVE import into the sibling package's source tree,
+// not a package-name import. That is deliberate and it is bounded: this Worker
+// is bundled from inside this repository, where the source is present, so it
+// never resolves `@mythicalos/telemetry` through node_modules and never needs
+// the package's `exports` map to publish a subpath. The dependency is still
+// declared in `package.json` because it is a real coupling — if the package
+// moved or its envelope module were renamed, this import would break and the
+// declaration is what says whose fault that is.
+//
+// The consequence to know: ANYONE OUTSIDE THIS REPOSITORY cannot reproduce
+// this wiring against the published package, because `exports` publishes only
+// `"."` and the two schema JSON files. Adding a `./envelope` subpath export
+// would fix that — it is not done here, because it would make an internal
+// module a supported public entry point, and nothing in this deployment needs
+// it.
+import { validateHeartbeat } from '../../packages/telemetry/src/envelope';
 
 export interface Env {
   DB: D1Database;

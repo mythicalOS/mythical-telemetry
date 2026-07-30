@@ -1,0 +1,84 @@
+{
+  // The heartbeat collector, as a Cloudflare Worker on D1.
+  //
+  // Deploy runbook, verification, rollback and — read this before deploying —
+  // the list of guarantees this deployment does NOT have: ./README.md
+  //
+  // House style follows the family's other workers (`mythicalos-get`,
+  // `mythicalos-waitlist`): the same `compatibility_date`, the same
+  // "create the D1 first, then paste the id in here" convention.
+  "name": "mythicalos-telemetry",
+  "main": "src/worker.ts",
+
+  // Pinned to the same date as the family's other workers, so all of them see
+  // one set of runtime behaviour flags. Moving it is a deliberate act: read
+  // Cloudflare's compatibility-date changelog, then redeploy and re-run the
+  // verification in README.md.
+  "compatibility_date": "2026-07-01",
+
+  // REQUIRED, not a convenience. Identity derivation and the constant-time
+  // comparison are `node:crypto` (`createHash`, `timingSafeEqual`, `Buffer`)
+  // and the derivation is byte-frozen — every stored instance id depends on it,
+  // so it may not be re-implemented against WebCrypto "to drop the flag".
+  // Measured on workerd under this flag: `createHash().digest()` returns a
+  // Buffer synchronously (not a thenable) and matches the known SHA-256 vector,
+  // and `timingSafeEqual` is present and discriminating. Without the flag the
+  // Worker does not build.
+  "compatibility_flags": ["nodejs_compat"],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mythicalos-telemetry",
+
+      // ══════════════════════════════════════════════════════════════════════
+      //  PLACEHOLDER — NOT A REAL DATABASE ID. REPLACE BEFORE THE FIRST DEPLOY.
+      //
+      //  No database has been created; that is the operator's step, on the
+      //  operator's account. Run it, then paste the id it prints here:
+      //
+      //      wrangler d1 create mythicalos-telemetry --location weur
+      //
+      //  `--location weur` matches the waitlist database (EU residency). Choose
+      //  it deliberately or keep it — a D1 database's location cannot be
+      //  changed afterwards.
+      //
+      //  Local emulation never resolves this value, so every `--local` step in
+      //  README.md works while it is still a placeholder. `wrangler deploy`
+      //  DOES resolve it, and fails rather than deploying a Worker whose
+      //  binding points at nothing.
+      // ══════════════════════════════════════════════════════════════════════
+      "database_id": "PLACEHOLDER_RUN_WRANGLER_D1_CREATE_AND_PASTE_THE_ID",
+
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  "triggers": {
+    // The retention prune. This replaces BOTH the boot prune and the
+    // `setInterval(prune, 24h)` in `collector/src/cli/server.ts` — and only the
+    // interval half of that actually survives. See README.md → "Retention is no
+    // longer fail-closed", which is the most consequential difference between
+    // this deployment and the Bun service.
+    //
+    // 03:17 UTC: deliberately off the hour, so it does not queue behind every
+    // other cron on the platform that fires at :00.
+    "crons": ["17 3 * * *"]
+  },
+
+  // A failed prune throws out of the `scheduled` handler and logs its reason.
+  // There is no boot hook and no process to exit, so THIS IS THE ONLY PLACE A
+  // FAILED PRUNE BECOMES VISIBLE — the service keeps serving either way.
+  // Turning observability off makes the retention clock unobservable, which is
+  // exactly how the previous collector went years without deleting anything.
+  "observability": { "enabled": true }
+
+  // NO HOSTNAME IS CONFIGURED, deliberately. As it stands the Worker answers on
+  // `mythicalos-telemetry.<subdomain>.workers.dev`, which is fine for a
+  // post-deploy smoke test and wrong for an ingest endpoint that shipped
+  // clients hard-code. When the hostname is decided, add it here and redeploy —
+  // it must be a hostname on this Cloudflare zone, and `custom_domain` then
+  // provisions the certificate (the same arrangement as `get.` and `app.`):
+  //
+  //   "routes": [{ "pattern": "telemetry.mythicalos.ai", "custom_domain": true }]
+}

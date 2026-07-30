@@ -1,4 +1,4 @@
-// SPIKE — `collector/tests/db.test.ts` ported to the D1 store.
+// `collector/tests/db.test.ts`, ported to the D1 store.
 //
 // The transform is MECHANICAL: every `test(...)` callback became `async`, every
 // store call gained `await`, and the store is constructed over the
@@ -11,25 +11,22 @@
 // is what "durable, not in-memory" means when the store is D1: a different
 // isolate talking to the same database.
 //
-// TWO TESTS FROM THE ORIGINAL ARE ABSENT, and they are absent because D1 cannot
-// satisfy them, not because they were inconvenient:
+// TWO TESTS FROM THE ORIGINAL CANNOT PORT. They are declared at the bottom of
+// this file as skipped tests carrying their reason, so the runner names them on
+// every run — deleting them would have made a lost guarantee look like a
+// guarantee nobody ever wanted. Both losses are privacy-adjacent, not cosmetic;
+// `../README.md` → "What this deployment does not have" is the full account.
 //
-//   1. 'file-backed database runs in WAL mode' — D1 refuses `PRAGMA
-//      journal_mode` (`not authorized: SQLITE_AUTH`, measured). There is no
-//      journal mode to assert.
-//   2. 'a prune folds the write-ahead log back and truncates it, and says
-//      whether it did' — D1 exposes no write-ahead log, refuses `PRAGMA
-//      wal_checkpoint`, and there is no `-wal` file to `statSync`. The
-//      behaviour this test guards does not exist on D1; `PruneReportD1` drops
-//      the `wal_truncated` field for the same reason.
-//
-// Both losses are privacy-adjacent, not cosmetic — see the spike report.
+// WHAT THIS FILE DOES NOT COVER, and what does cover it, is set out in
+// `../README.md` → "Tests". In short: this is the store, driven through a shim.
+// The route layer and the Worker entrypoint have no bun-drivable tests here at
+// all; they are exercised by the `wrangler dev --local` checks in the README.
 
 import { describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { INGEST_DAY_WINDOW_DAYS, shiftDay } from '../../../collector/src/day';
-import { maxRowsFor, TelemetryD1, type TelemetryD1Config } from '../src/db-d1';
-import { D1OverSqlite } from '../src/d1-over-sqlite';
+import { INGEST_DAY_WINDOW_DAYS, shiftDay } from '../../collector/src/day';
+import { maxRowsFor, TelemetryD1, type TelemetryD1Config } from '../src/db';
+import { D1OverSqlite } from './d1-over-sqlite';
 
 const payload = (day: string) => JSON.stringify({ day, schema_version: 1, metrics: {} });
 
@@ -674,4 +671,42 @@ describe('aggregates', () => {
       { product: 'saga', installs_seen: 1, installs_active: 1, days_reported: 1 },
     ]);
   });
+});
+
+// ── Unportable to D1 ───────────────────────────────────────────────────────
+//
+// These two tests exist in `collector/tests/db.test.ts` and PASS there. They
+// are carried here named and skipped rather than deleted, because deleting them
+// would erase the only visible trace of two guarantees this deployment does not
+// have: a skipped test is reported on every run, a deleted one is reported
+// never. They are not slow, flaky or awkward — the behaviour they assert has no
+// D1 equivalent at all — so neither is a candidate for "fix it later".
+describe('UNPORTABLE to D1 — guarantees the original store has and this one does not', () => {
+  test.skip('file-backed database runs in WAL mode — UNPORTABLE: D1 refuses PRAGMA journal_mode', () => {
+    // `PRAGMA journal_mode` returns `not authorized: SQLITE_AUTH` on D1
+    // (measured via `wrangler d1 execute --local`). There is no journal mode to
+    // read, and the store no longer sets one. Nothing to assert, and nothing
+    // that could be asserted in its place.
+  });
+
+  test.skip(
+    'a prune folds the write-ahead log back and truncates it, and says whether it did — ' +
+      'UNPORTABLE: D1 exposes no write-ahead log',
+    () => {
+      // The original asserts THREE things this store cannot offer: that a prune
+      // checkpoints and truncates the `-wal` file (there is no such file, and
+      // `PRAGMA wal_checkpoint` is refused), that the prune receipt reports the
+      // outcome (`PruneReportD1` has no `wal_truncated` field, deliberately — a
+      // permanently-`false` key would be a standing false negative on
+      // /metrics), and that a checkpoint blocked by a live reader is reported
+      // rather than swallowed.
+      //
+      // WHY IT MATTERS, since "log truncation" reads like housekeeping: the WAL
+      // is where deleted rows land first, and it is the one place
+      // `secure_delete` has no reach. Truncating it is half of the original's
+      // "a pruned payload is overwritten rather than left legible" claim — the
+      // other half being `PRAGMA secure_delete`, which D1 also refuses. On D1
+      // neither half can be set OR verified from this code.
+    },
+  );
 });
