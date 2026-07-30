@@ -1,0 +1,5 @@
+{
+  "extends": "../tsconfig.base.json",
+  "include": ["collector-d1/src/**/*.ts", "collector-d1/tests-ported/**/*.ts", "crypto-probe/**/*.ts"],
+  "exclude": ["node_modules", "**/.wrangler/**"]
+}
