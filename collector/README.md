@@ -5,6 +5,20 @@ workspace package, and the repository's release workflow publishes only the clie
 
 Run your own or don't. Nothing in any product requires this service to exist.
 
+> **There is a second collector in this repository, and it is the deployed one.**
+> [`../collector-worker`](../collector-worker) is this service ported to Cloudflare Workers on D1.
+> It duplicates `src/db.ts` and `src/server.ts` almost line for line, so **a change to either of
+> those files has to land in both, in the same commit** — nothing tests the two against each other.
+> Read [`../docs/TWO-COLLECTORS.md`](../docs/TWO-COLLECTORS.md) first: which is production, which is
+> reference, which differences are deliberate, and what convergence would take.
+>
+> The Worker deployment does **not** have four of the guarantees described below — `secure_delete`
+> and the WAL truncation, the fail-closed retention posture, globally-enforced per-source limiters,
+> and an observable prune receipt — and it adds a 30-day restorable copy of the whole database that
+> the prune cannot reach. They are listed in
+> [`../collector-worker/README.md`](../collector-worker/README.md). **If you are writing a privacy
+> notice for the deployed service, that list is the one that governs, not this file.**
+
 ## What it stores, and what it cannot
 
 One JSON document per installation, per product, per UTC day. The document is whatever the

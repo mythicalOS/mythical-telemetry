@@ -6,12 +6,17 @@ contract:
 | Path | What it is | Published? |
 |---|---|---|
 | `packages/telemetry/` | **`@mythicalos/telemetry`** — the heartbeat client every product consumes: the frozen envelope, the per-product bodies, identity derivation, opt-out, and the dual-send transport. | ✅ npm |
-| `collector/` | The ingest service that receives heartbeats. Operator-deployable; run your own or don't. | ❌ never published |
+| `collector/` | The ingest service that receives heartbeats — the **reference** implementation (Bun + SQLite). Operator-deployable; run your own or don't. | ❌ never published |
+| `collector-worker/` | The same service on Cloudflare Workers + D1 — the **deployed** one. Fewer guarantees; read its README before trusting it. | ❌ never published |
 
 **Why one repo:** the schema, the emitter that produces payloads and the validator that accepts
 them must not drift. Keeping them together lets a single lockstep test span all three — a real
 defect once slipped through precisely because a rename touched two of them and not the third,
 and no test could see across the gap.
+
+**The two collectors are near-copies of each other and nothing tests them against each other.** A
+change to `db.ts` or `server.ts` must land in both, in the same commit. Read
+[`docs/TWO-COLLECTORS.md`](docs/TWO-COLLECTORS.md) before touching either.
 
 ## What is collected
 

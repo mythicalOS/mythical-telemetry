@@ -54,6 +54,7 @@ import { authorizesInstance, UUID_V4_RE } from '../../collector/src/identity';
 import { Counters, type CounterName } from '../../collector/src/counters';
 import { parseTrustedProxies } from '../../collector/src/ip';
 import { renderAggregatePage, type AggregateProductView, type AggregateView } from '../../collector/src/page';
+import { STORABLE_PRODUCTS } from '../../collector/src/products';
 import { resolveSourceKey, TokenBucketLimiter, type ServerLike } from '../../collector/src/throttle';
 import { decorateDay, foldRates, foldTotals, type TotalsValue } from '../../collector/src/totals';
 import { HEARTBEAT_SCHEMA_VERSION, safeValidate, type HeartbeatValidator } from '../../collector/src/validator';
@@ -94,13 +95,13 @@ const OPS_KEY_HEADER = 'x-mythical-ops-key';
 /**
  * The closed set of products that may create a storage partition.
  *
- * This is NOT payload validation — the canonical validator has already
- * accepted the document. It is an authorization check on the partition key: a
- * validator that one day widens its product enum must not be able to silently
- * create new partitions in a deployed collector, because `product` is half of
- * the primary key and of every aggregate. Widening is a deliberate act here.
+ * SHARED WITH `collector/`, not copied. Of everything these two route layers
+ * duplicate, this is the one constant whose drift would change what a
+ * deployment ACCEPTS: a product added on one side only means heartbeats that
+ * one collector stores and the other refuses as `unknown_product`. Re-exported
+ * so this module's surface matches the original's exactly.
  */
-export const STORABLE_PRODUCTS: ReadonlySet<string> = new Set(['brokkr', 'saga', 'skuld']);
+export { STORABLE_PRODUCTS };
 
 export type FetchHandler = (req: Request, server?: ServerLike) => Promise<Response> | Response;
 

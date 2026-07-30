@@ -41,6 +41,7 @@ import { authorizesInstance, UUID_V4_RE } from './identity';
 import { Counters, type CounterName } from './counters';
 import { parseTrustedProxies } from './ip';
 import { renderAggregatePage, type AggregateProductView, type AggregateView } from './page';
+import { STORABLE_PRODUCTS } from './products';
 import { resolveSourceKey, TokenBucketLimiter, type ServerLike } from './throttle';
 import { decorateDay, foldRates, foldTotals, type TotalsValue } from './totals';
 import { HEARTBEAT_SCHEMA_VERSION, safeValidate, type HeartbeatValidator } from './validator';
@@ -81,13 +82,13 @@ const OPS_KEY_HEADER = 'x-mythical-ops-key';
 /**
  * The closed set of products that may create a storage partition.
  *
- * This is NOT payload validation — the canonical validator has already
- * accepted the document. It is an authorization check on the partition key: a
- * validator that one day widens its product enum must not be able to silently
- * create new partitions in a deployed collector, because `product` is half of
- * the primary key and of every aggregate. Widening is a deliberate act here.
+ * Declared in `products.ts` and re-exported here, so this module's surface is
+ * unchanged. It has its own file because the Worker collector's route layer
+ * imports the same constant — of everything the two collectors duplicate, this
+ * is the one whose drift would change what a deployment ACCEPTS rather than
+ * how it performs. See `../../docs/TWO-COLLECTORS.md`.
  */
-export const STORABLE_PRODUCTS: ReadonlySet<string> = new Set(['brokkr', 'saga', 'skuld']);
+export { STORABLE_PRODUCTS };
 
 export type FetchHandler = (req: Request, server?: ServerLike) => Promise<Response> | Response;
 
