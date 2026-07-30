@@ -32,7 +32,9 @@
       "database_name": "mythicalos-telemetry",
 
       // ══════════════════════════════════════════════════════════════════════
-      //  PLACEHOLDER — NOT A REAL DATABASE ID. REPLACE BEFORE THE FIRST DEPLOY.
+      //  Created 2026-07-30 with `wrangler d1 create mythicalos-telemetry --location weur`.
+      //  WEUR is a deliberate placement, not a default: it is the one property of this database
+      //  that cannot be changed later without recreating it and moving the data.
       //
       //  No database has been created; that is the operator's step, on the
       //  operator's account. Run it, then paste the id it prints here:
@@ -48,7 +50,7 @@
       //  DOES resolve it, and fails rather than deploying a Worker whose
       //  binding points at nothing.
       // ══════════════════════════════════════════════════════════════════════
-      "database_id": "PLACEHOLDER_RUN_WRANGLER_D1_CREATE_AND_PASTE_THE_ID",
+      "database_id": "0b8cecbe-0178-430a-8be7-238c3eb1209f",
 
       "migrations_dir": "migrations"
     }
