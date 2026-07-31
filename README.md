@@ -85,9 +85,10 @@ intended to receive central heartbeats** — there is no separate, closed ingest
 publishing it is that you can read exactly what receives your data, and run your own instead if
 you would rather.
 
-*(As of this writing no central collector is deployed, so nothing is being received anywhere yet.
-This section will say so plainly whenever that stops being true — a claim about where your data
-goes is not one to leave stale.)*
+*(As of this writing the central collector **is deployed**, at `telemetry.mythicalos.ai` — it is
+the [`collector-worker/`](collector-worker) deployment described above. No released product sends
+to it yet, so it has received nothing so far. This paragraph keeps tracking that — a claim about
+where your data goes is not one to leave stale.)*
 
 mythicalOS does sell a hosted, multi-user tier. That is separate, private software, and it
 consumes these packages on exactly the terms you do.
