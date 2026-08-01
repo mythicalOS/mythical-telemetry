@@ -66,7 +66,11 @@ reference them, and nothing here should.
 3. Any secrets, internal hostnames or IDs, personal names or email addresses, machine-local paths?
 4. Any internal planning, review, or decision content — or a pointer to maintainer-internal tooling?
 5. Does your **commit message** pass checks 3 and 4 as well? Messages are as public as files.
-6. Sign off your commit (`git commit -s`) and stage explicit paths rather than everything.
+6. Stage explicit paths rather than everything. For commit sign-off and any other commit
+   requirements, follow **this repository's `CONTRIBUTING.md`** — it is the authority on what a
+   commit here must carry, and it is where a contributor will look. Do not assume a flag: the
+   right invocation depends on the repository's configured identity, which differs across these
+   repositories and is still settling ahead of the public flip.
 
 ---
 
