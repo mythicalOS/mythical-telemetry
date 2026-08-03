@@ -1,0 +1,46 @@
+{
+  "note": "Generated from the router registry (ROUTES) by collector/tests/openapi.test.ts (API-M4 criterion 0). NEVER hand-edit; a completeness gate compares a spec against this. Regenerate with `UPDATE_INVENTORY=1 bun test tests/openapi.test.ts`.",
+  "product": "telemetry",
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ingest"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/instances/{id}"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/instances/{id}/stats"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/schema"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/stats"
+    },
+    {
+      "method": "GET",
+      "path": "/health"
+    },
+    {
+      "method": "HEAD",
+      "path": "/health"
+    },
+    {
+      "method": "GET",
+      "path": "/metrics"
+    },
+    {
+      "method": "GET",
+      "path": "/openapi.json"
+    }
+  ]
+}

@@ -13,12 +13,13 @@
 //             asserted through the production handler, not a spec-side fixture.
 // The Worker twin shares THIS document; the route-parity test (parity.test.ts) binds them.
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ROUTES } from "../src/server";
 import { makeHarness } from "./helpers";
 
 const SPEC_PATH = join(import.meta.dir, "../../api/openapi.json");
+const INVENTORY_PATH = join(import.meta.dir, "../../api/inventory.json");
 const COLLECTOR_SRC = join(import.meta.dir, "../src/server.ts");
 const spec = JSON.parse(readFileSync(SPEC_PATH, "utf8")) as {
   openapi: string;
@@ -199,5 +200,48 @@ describe("GET /openapi.json serves the committed document byte-for-byte (clause 
     expect((JSON.parse(served) as { "x-mythical": { product: string } })["x-mythical"].product).toBe(
       "telemetry",
     );
+  });
+});
+
+// ── API-M4 criterion 0: the committed route inventory is GENERATED from the router ──────────────
+//
+// mythical-docs' completeness gate (check-api.mjs) compares telemetry's vendored spec against a
+// vendored route INVENTORY. The load-bearing rule (design §7 API-M4 criterion 0) is that the
+// inventory is GENERATED from the router — never hand-written — so a route added to the router but
+// not re-generated makes THIS suite fail. Here the enumeration is the router's OWN dispatch table
+// (ROUTES, the same registry clause 2 checks the document against), so the inventory is the router's
+// route set directly, not a spec-side transcription. `api/inventory.json` is this suite's committed
+// output; sync-api.mjs vendors it verbatim into mythical-docs/inventory/telemetry.json. Its shape is
+// the docs pipeline's (inventory.mjs): a sorted, de-duplicated list of { method, path }.
+describe("the committed route inventory is generated from the router registry (API-M4 criterion 0)", () => {
+  const INVENTORY_NOTE =
+    "Generated from the router registry (ROUTES) by collector/tests/openapi.test.ts (API-M4 criterion 0). NEVER hand-edit; a completeness gate compares a spec against this. Regenerate with `UPDATE_INVENTORY=1 bun test tests/openapi.test.ts`.";
+
+  /** ROUTES normalised into the docs inventory's sorted, de-duplicated { method, path } list. */
+  function inventoryRoutes(): { method: string; path: string }[] {
+    const seen = new Set<string>();
+    const out: { method: string; path: string }[] = [];
+    for (const r of ROUTES) {
+      const method = r.method.toUpperCase();
+      const key = `${method} ${r.path}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ method, path: r.path });
+    }
+    out.sort((a, b) => (a.path === b.path ? a.method.localeCompare(b.method) : a.path.localeCompare(b.path)));
+    return out;
+  }
+
+  test("api/inventory.json equals the router's ROUTES registry", () => {
+    const routes = inventoryRoutes();
+    expect(routes.length, "ROUTES is empty — cannot regenerate the inventory").toBeGreaterThan(0);
+    const fresh = `${JSON.stringify({ note: INVENTORY_NOTE, product: "telemetry", routes }, null, 2)}\n`;
+    // Regenerate the committed artifact on demand: `UPDATE_INVENTORY=1 bun test tests/openapi.test.ts`.
+    if (process.env.UPDATE_INVENTORY) writeFileSync(INVENTORY_PATH, fresh);
+    const committed = readFileSync(INVENTORY_PATH, "utf8");
+    expect(
+      committed,
+      "api/inventory.json is STALE — a route was added to or removed from ROUTES but the inventory was not regenerated; run `UPDATE_INVENTORY=1 bun test tests/openapi.test.ts`",
+    ).toBe(fresh);
   });
 });
