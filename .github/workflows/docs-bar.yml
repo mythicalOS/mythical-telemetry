@@ -42,7 +42,7 @@ jobs:
           fi
 
           # Self-test: probe assembled at runtime, so no literal banned term lives in this file.
-          p1=BO; p2=SS
+          p1=de-; p2=net
           if ! printf '%s\n' "$p1$p2" | grep -aiqE -e "$DENY"; then
             echo "::error::self-test failed — pattern did not match its probe; the gate is not firing"
             exit 1
