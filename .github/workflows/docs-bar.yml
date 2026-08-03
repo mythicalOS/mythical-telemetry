@@ -52,9 +52,9 @@ jobs:
           grep -rainE -e "$DENY" . --exclude-dir=.git --exclude-dir=.github --exclude=.git > /tmp/raw.txt && rc=0 || rc=$?
           [ "$rc" -le 1 ] || { echo "::error::tree scan failed (grep rc=$rc)"; exit 1; }
           # Re-test every hit with real data-URI payloads stripped: a long base64 blob is not prose
-          # and matches by chance. Requires a data: URI and >=40 payload chars, so no banned term
-          # (all far shorter) can be removed from ordinary text.
-          sed -E 's#data:[a-z0-9./+-]*(;[a-z0-9._+-]+=[a-z0-9._+-]+)*;base64,[A-Za-z0-9+/=]{40,}#data:[payload]#g' /tmp/raw.txt > /tmp/stripped.txt
+          # and matches by chance. Only the payload is replaced — the data: prefix and any
+          # parameters are preserved, so nothing but >=40 chars of base64 leaves the scan.
+          sed -E 's#(data:[a-z0-9./+-]*(;[a-z0-9._+-]+=[a-z0-9._+-]+)*;base64,)[A-Za-z0-9+/=]{40,}#\1[payload]#g' /tmp/raw.txt > /tmp/stripped.txt
           grep -aiE -e "$DENY" /tmp/stripped.txt > /tmp/hits.txt && rc=0 || rc=$?
           [ "$rc" -le 1 ] || { echo "::error::tree re-scan failed (grep rc=$rc)"; exit 1; }
           if [ -s /tmp/hits.txt ]; then
