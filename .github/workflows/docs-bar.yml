@@ -51,9 +51,10 @@ jobs:
           # Tree scan. -a is mandatory: one NUL byte hides a whole file from bare grep.
           grep -rainE -e "$DENY" . --exclude-dir=.git --exclude-dir=.github --exclude=.git > /tmp/raw.txt && rc=0 || rc=$?
           [ "$rc" -le 1 ] || { echo "::error::tree scan failed (grep rc=$rc)"; exit 1; }
-          # Re-test each hit with inline data-URI payloads stripped — base64 blobs are not prose
-          # and match by chance. Only the payload is removed, never the surrounding line.
-          sed -E 's#;base64,[A-Za-z0-9+/=]+#;base64,[payload]#g' /tmp/raw.txt > /tmp/stripped.txt
+          # Re-test every hit with real data-URI payloads stripped: a long base64 blob is not prose
+          # and matches by chance. Requires a data: URI and >=40 payload chars, so no banned term
+          # (all far shorter) can be removed from ordinary text.
+          sed -E 's#data:[a-z0-9./+-]*;base64,[A-Za-z0-9+/=]{40,}#data:[payload]#g' /tmp/raw.txt > /tmp/stripped.txt
           grep -aiE -e "$DENY" /tmp/stripped.txt > /tmp/hits.txt && rc=0 || rc=$?
           [ "$rc" -le 1 ] || { echo "::error::tree re-scan failed (grep rc=$rc)"; exit 1; }
           if [ -s /tmp/hits.txt ]; then
@@ -63,16 +64,20 @@ jobs:
           fi
 
           # Message scan — new commit bodies only, never author/committer fields.
+          INCOMPLETE=0
           if [ "$EVENT" = push ]; then
             if [ -n "$BEFORE" ] && git rev-parse -q --verify "$BEFORE^{commit}" >/dev/null 2>&1; then
               git log --format=%B "$BEFORE..$AFTER" > /tmp/msg.txt
             else
-              # New branch or force-push: no usable range. Bounded scan, announced as such.
-              echo "::warning::before-sha unusable — message scan limited to the last 20 commits"
+              # New branch or force-push: the range cannot be established, so the scan below is
+              # best-effort only and the job fails closed rather than reporting an unproven pass.
+              echo "::error::before-sha unusable — message range unknown; bounded scan is incomplete"
               git log --format=%B -n 20 "$AFTER" > /tmp/msg.txt
+              INCOMPLETE=1
             fi
           else
-            git fetch -q --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" || true
+            git fetch -q --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" ||
+              { echo "::error::could not refresh origin/$BASE_REF — message range unreliable"; exit 1; }
             git log --format=%B "origin/$BASE_REF..HEAD" > /tmp/msg.txt
           fi
           if grep -aiqE -e "$DENY" /tmp/msg.txt; then rc=0; else rc=$?; fi
@@ -84,5 +89,6 @@ jobs:
               awk '{n = length($0); printf "  match=%s… (len %d)\n", substr($0, 1, (n > 6 ? 3 : 1)), n}'
             exit 1
           fi
+          [ "$INCOMPLETE" -eq 0 ] || exit 1
 
           echo "docs-bar: clean"
