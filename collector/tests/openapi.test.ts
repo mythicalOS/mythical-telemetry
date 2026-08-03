@@ -100,6 +100,10 @@ describe("every documented path resolves on the booted collector (clause 1)", ()
 
 describe("error codes are documented in both directions (clause 4)", () => {
   const source = readFileSync(COLLECTOR_SRC, "utf8");
+  // Strip block and line comments first, so a token that appears only in PROSE (a `// error: 'x'`
+  // note or a JSDoc block) is not mistaken for an emitted wire token — the emitted set must be
+  // tokens the CODE actually returns.
+  const codeOnly = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
   const specJson = JSON.stringify(spec);
   const documented = new Set<string>();
   for (const m of specJson.matchAll(/"x-error-codes":\[([^\]]*)\]/g)) {
@@ -113,16 +117,19 @@ describe("error codes are documented in both directions (clause 4)", () => {
   // ingest path. Both must be scanned — a scan that saw only the first missed write_key_mismatch,
   // payload_too_large and invalid_payload, and would have let them go undocumented.
   const emitted = new Set<string>();
-  for (const m of source.matchAll(/error:\s*'([a-z][a-z0-9_]+)'/g)) emitted.add(m[1]!);
-  for (const m of source.matchAll(/rejectIngest\(\s*\d+,\s*'([a-z][a-z0-9_]+)'/g)) emitted.add(m[1]!);
+  for (const m of codeOnly.matchAll(/error:\s*'([a-z][a-z0-9_]+)'/g)) emitted.add(m[1]!);
+  for (const m of codeOnly.matchAll(/rejectIngest\(\s*\d+,\s*'([a-z][a-z0-9_]+)'/g)) emitted.add(m[1]!);
 
   test("the scan found a non-trivial set of codes (guard against an empty match)", () => {
     expect(documented.size).toBeGreaterThanOrEqual(8);
     expect(emitted.size).toBeGreaterThanOrEqual(8);
   });
-  test("every documented error code is emitted by the collector source", () => {
+  test("every documented error code is a wire token the collector actually emits", () => {
+    // Against the EMITTED set (the scanned wire tokens), not a bare substring search of the
+    // source — a token that appears only in a comment or an unrelated string must not satisfy
+    // this, or a documented code no route can return would slip through.
     for (const code of documented) {
-      expect(source.includes(`'${code}'`), `documented '${code}' appears in no source line`).toBe(true);
+      expect(emitted.has(code), `documented '${code}' is not a wire token any route emits`).toBe(true);
     }
   });
   test("every error code the collector emits is documented", () => {
