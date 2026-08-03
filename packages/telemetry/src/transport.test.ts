@@ -131,9 +131,9 @@ describe("configuration rules", () => {
   });
 
   test("ingestUrlFor appends the route and preserves a query string", () => {
-    expect(ingestUrlFor("https://telemetry.example.com")).toBe("https://telemetry.example.com/v1/ingest");
-    expect(ingestUrlFor("https://ops.example.net/collect")).toBe("https://ops.example.net/collect/v1/ingest");
-    expect(ingestUrlFor("https://ops.example.net/collect?tenant=7")).toBe("https://ops.example.net/collect/v1/ingest?tenant=7");
+    expect(ingestUrlFor("https://telemetry.example.com")).toBe("https://telemetry.example.com/api/v1/ingest");
+    expect(ingestUrlFor("https://ops.example.net/collect")).toBe("https://ops.example.net/collect/api/v1/ingest");
+    expect(ingestUrlFor("https://ops.example.net/collect?tenant=7")).toBe("https://ops.example.net/collect/api/v1/ingest?tenant=7");
   });
 });
 

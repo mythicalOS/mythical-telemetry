@@ -15,17 +15,21 @@
 // trivial. Tests drive every route with a plain Request: no port bind, no
 // real network.
 //
-//   POST   /v1/ingest                  secret + derived-identity (constant-time)
-//   GET    /v1/instances/:uuid/stats   secret + derived-identity  ← G6: reads are authenticated
-//   DELETE /v1/instances/:uuid         secret + derived-identity; purges EVERY product
+//   POST   /api/v1/ingest                  secret + derived-identity (constant-time)
+//   GET    /api/v1/instances/:uuid/stats   secret + derived-identity  ← G6: reads are authenticated
+//   DELETE /api/v1/instances/:uuid         secret + derived-identity; purges EVERY product
 //
 // Every one of those three is per-source throttled, because anyone can mint a
 // valid (secret, id) pair — an authenticated request is not a scarce one here.
-//   GET    /v1/stats                   public, AGGREGATE ONLY
-//   GET    /                           public, aggregate give-back page
-//   GET    /v1/schema                  the published JSON Schema, when the operator wired one
-//   GET    /metrics                    operator-gated counters (absent unless configured)
-//   GET    /healthz                    200 {ok:true}
+//   GET    /api/v1/stats                   public, AGGREGATE ONLY
+//   GET    /                               public, aggregate give-back page (HTML)
+//   GET    /api/v1/schema                  the published JSON Schema, when the operator wired one
+//   GET    /metrics                        operator-gated counters (absent unless configured)
+//   GET    /health, HEAD /health           200 {ok, version, uptime_s} — C5 liveness (was /healthz)
+//   GET    /openapi.json                   the committed OpenAPI document, served verbatim (C9)
+//
+// API-M3: the versioned surface moved /v1/* -> /api/v1/* and /healthz -> /health as a HARD CUT
+// (no aliases — the old paths 404). This Worker shares ONE document with the collector twin.
 //
 // GONE: `GET /i/<uuid>`. See page.ts for why it was deleted rather than
 // authenticated.
@@ -58,6 +62,10 @@ import { STORABLE_PRODUCTS } from '../../collector/src/products';
 import { resolveSourceKey, TokenBucketLimiter, type ServerLike } from '../../collector/src/throttle';
 import { decorateDay, foldRates, foldTotals, type TotalsValue } from '../../collector/src/totals';
 import { HEARTBEAT_SCHEMA_VERSION, safeValidate, type HeartbeatValidator } from '../../collector/src/validator';
+// The committed OpenAPI document, served verbatim at GET /openapi.json (C9/C13 clause 6). The
+// collector imports the SAME file, so both twins serve identical bytes — the route-parity test
+// and the byte-equality test bind that. esbuild inlines this JSON into the Worker bundle.
+import openapiDocument from '../../api/openapi.json' with { type: 'json' };
 
 export type { ServerLike } from '../../collector/src/throttle';
 
@@ -112,7 +120,9 @@ export interface TelemetryServerConfig {
    * knowledge — see validator.ts.
    */
   validator: HeartbeatValidator;
-  /** Served verbatim on GET /v1/schema. Omit and the route does not exist. */
+  /** Reported by GET /health (C5 liveness triple). Defaults to '0.0.0'. */
+  version?: string;
+  /** Served verbatim on GET /api/v1/schema. Omit and the route does not exist. */
   schemaJson?: string | null;
   maxBodyBytes?: number;
   rateLimitPerMin?: number;
@@ -204,14 +214,16 @@ export interface RouteSignature {
  * path parameter (an instance UUID).
  */
 export const ROUTES: readonly RouteSignature[] = [
-  { method: 'GET', path: '/healthz' },
+  { method: 'GET', path: '/health' },
+  { method: 'HEAD', path: '/health' },
+  { method: 'GET', path: '/openapi.json' },
   { method: 'GET', path: '/' },
-  { method: 'GET', path: '/v1/stats' },
-  { method: 'GET', path: '/v1/schema' },
+  { method: 'GET', path: '/api/v1/stats' },
+  { method: 'GET', path: '/api/v1/schema' },
   { method: 'GET', path: '/metrics' },
-  { method: 'POST', path: '/v1/ingest' },
-  { method: 'GET', path: '/v1/instances/{id}/stats' },
-  { method: 'DELETE', path: '/v1/instances/{id}' },
+  { method: 'POST', path: '/api/v1/ingest' },
+  { method: 'GET', path: '/api/v1/instances/{id}/stats' },
+  { method: 'DELETE', path: '/api/v1/instances/{id}' },
 ];
 
 /** A route handler; resolving to `null` means "not active in this configuration" → falls to 404. */
@@ -251,6 +263,11 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
   const nowUtcDay = config.nowUtcDay ?? (() => new Date().toISOString().slice(0, 10));
   const nowMs = config.nowMs ?? Date.now;
   const counters = config.counters ?? new Counters();
+  const version = config.version ?? '0.0.0';
+  // Liveness uptime is measured from handler construction, on the injected clock so tests can
+  // advance it. Serialized once, since both twins serve identical bytes at /openapi.json.
+  const startedAtMs = nowMs();
+  const openapiText = JSON.stringify(openapiDocument);
 
   const rateLimitPerMin = config.rateLimitPerMin ?? DEFAULT_RATE_LIMIT_PER_MIN;
   const aggregateCacheMs = config.aggregateCacheMs ?? DEFAULT_AGGREGATE_CACHE_MS;
@@ -717,7 +734,14 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
   // the route is not active in this configuration (no ops key, no wired schema) and the dispatch
   // falls through to 404 — the same behaviour the previous if-chain had for /metrics and /v1/schema.
   const routeHandlers: Record<string, RouteHandler> = {
-    'GET /healthz': () => json(200, { ok: true }),
+    // C5 liveness triple. Nothing here needs protecting, so it stays unauthenticated.
+    'GET /health': () =>
+      json(200, { ok: true, version, uptime_s: Math.floor((nowMs() - startedAtMs) / 1000) }),
+    // HEAD answers with the same status and headers and an empty body (C5).
+    'HEAD /health': () => new Response(null, { status: 200, headers: { 'content-type': 'application/json' } }),
+    // C9/C13 clause 6 — the served document IS the committed one (imported above).
+    'GET /openapi.json': () =>
+      new Response(openapiText, { status: 200, headers: { 'content-type': 'application/json' } }),
     'GET /': async () => {
       // The counter is incremented only AFTER the snapshot is in hand: a failed cache build must
       // not be recorded as a served aggregate.
@@ -725,19 +749,19 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
       counters.inc('read_aggregate_ok');
       return html(200, page);
     },
-    'GET /v1/stats': async () => {
+    'GET /api/v1/stats': async () => {
       const body = (await aggregateSnapshot()).json;
       counters.inc('read_aggregate_ok');
       return new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
     },
-    'GET /v1/schema': () =>
+    'GET /api/v1/schema': () =>
       schemaJson === null
         ? null
         : new Response(schemaJson, { status: 200, headers: { 'content-type': 'application/json' } }),
     'GET /metrics': (_m, req, _url, server) => handleMetrics(req, server),
-    'POST /v1/ingest': (_m, req, _url, server) => handleIngest(req, server),
-    'GET /v1/instances/{id}/stats': (m, req, url, server) => handleStats(m[1] ?? '', url, req, server),
-    'DELETE /v1/instances/{id}': (m, req, _url, server) => handleDelete(m[1] ?? '', req, server),
+    'POST /api/v1/ingest': (_m, req, _url, server) => handleIngest(req, server),
+    'GET /api/v1/instances/{id}/stats': (m, req, url, server) => handleStats(m[1] ?? '', url, req, server),
+    'DELETE /api/v1/instances/{id}': (m, req, _url, server) => handleDelete(m[1] ?? '', req, server),
   };
   // The dispatcher and the inventory cannot drift: every ROUTES entry must have exactly one
   // handler and vice versa, or construction throws (caught by every test that builds a handler).

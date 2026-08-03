@@ -86,7 +86,7 @@ function fetchAs(clientIp: string | null, req: Request): Promise<Response> {
 function ingest(payload: unknown, secret?: string): Request {
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (secret !== undefined) headers['x-mythical-instance-secret'] = secret;
-  return new Request('https://telemetry.mythicalos.ai/v1/ingest', {
+  return new Request('https://telemetry.mythicalos.ai/api/v1/ingest', {
     method: 'POST',
     headers,
     body: typeof payload === 'string' ? payload : JSON.stringify(payload),
@@ -166,7 +166,7 @@ describe('CF-Connecting-IP is the source key', () => {
     // matters is the negative one: an absent address must not let a caller
     // choose a bucket by sending X-Forwarded-For, which on this deployment is
     // an ordinary client-settable header.
-    const spoofed = new Request('https://telemetry.mythicalos.ai/v1/ingest', {
+    const spoofed = new Request('https://telemetry.mythicalos.ai/api/v1/ingest', {
       method: 'POST',
       headers: { 'x-mythical-instance-secret': SECRET_A, 'x-forwarded-for': '203.0.113.4' },
       body: '{{{',
@@ -208,10 +208,14 @@ describe('the retired per-install page is gone from the deployment too', () => {
     expect(await r.json()).toEqual({ ok: false, error: 'not_found' });
   });
 
-  test('GET /healthz is 200 and needs nothing', async () => {
-    const r = await fetchAs('203.0.113.7', new Request('https://telemetry.mythicalos.ai/healthz'));
+  test('GET /health is 200 and needs nothing (C5 triple)', async () => {
+    const r = await fetchAs('203.0.113.7', new Request('https://telemetry.mythicalos.ai/health'));
     expect(r.status).toBe(200);
-    expect(await r.json()).toEqual({ ok: true });
+    const body = (await r.json()) as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    expect(typeof body.version).toBe('string');
+    expect(typeof body.uptime_s).toBe('number');
+    expect(Object.keys(body).sort()).toEqual(['ok', 'uptime_s', 'version']);
   });
 });
 

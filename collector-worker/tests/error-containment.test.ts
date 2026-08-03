@@ -22,7 +22,7 @@
 //
 //  The router returns the per-route handlers WITHOUT awaiting them:
 //
-//      if (path === '/v1/ingest' && req.method === 'POST') return handleIngest(req, server);
+//      if (path === '/api/v1/ingest' && req.method === 'POST') return handleIngest(req, server);
 //      if (statsMatch    && req.method === 'GET')    return handleStats(...);
 //      if (instanceMatch && req.method === 'DELETE') return handleDelete(...);
 //
@@ -36,7 +36,7 @@
 //  try and ARE caught — measured. This port made both of them `async` (D1 has
 //  no synchronous read), and that colour change silently moved them out of
 //  the catch's reach. It is a port-introduced regression on those two routes.
-//  `/v1/ingest` has the same gap in BOTH collectors and is therefore not a
+//  `/api/v1/ingest` has the same gap in BOTH collectors and is therefore not a
 //  regression — but it is the route most likely to trip it here, because
 //  `TelemetryD1.recordHeartbeat` deliberately THROWS on two conditions it
 //  treats as impossible, and both of them are "`meta.changes` was not what I
@@ -85,10 +85,10 @@ async function expectContained(h: ReturnType<typeof makeHarness>, res: Response)
 }
 
 describe('a failing store is contained: coarse 500, counted, nothing internal on the wire', () => {
-  test('the public aggregate — GET /v1/stats', async () => {
+  test('the public aggregate — GET /api/v1/stats', async () => {
     const h = makeHarness({ minAggregateCell: 1 });
     breakStore(h, 'aggregates');
-    await expectContained(h, await h.handler(getReq('/v1/stats')));
+    await expectContained(h, await h.handler(getReq('/api/v1/stats')));
   });
 
   test('the give-back page — GET /', async () => {
@@ -108,25 +108,25 @@ describe('a failing store is contained: coarse 500, counted, nothing internal on
     // is incremented only after the snapshot is in hand.
     const h = makeHarness({ minAggregateCell: 1 });
     breakStore(h, 'aggregates');
-    await h.handler(getReq('/v1/stats'));
+    await h.handler(getReq('/api/v1/stats'));
     expect(h.counters.get('read_aggregate_ok')).toBe(0);
   });
 });
 
 describe('KNOWN DEFECT — routes whose failures escape the catch (see this file’s header)', () => {
-  test('POST /v1/ingest — a store throw is contained as 500 internal, not a bare rejection', async () => {
+  test('POST /api/v1/ingest — a store throw is contained as 500 internal, not a bare rejection', async () => {
     const h = makeHarness();
     breakStore(h, 'recordHeartbeat');
     await expectContained(h, await h.handler(ingestReq(makeHeartbeat('brokkr', INSTANCE_A), SECRET_A)));
   });
 
-  test('GET /v1/instances/:uuid/stats — a store throw is contained as 500 internal', async () => {
+  test('GET /api/v1/instances/:uuid/stats — a store throw is contained as 500 internal', async () => {
     const h = makeHarness();
     breakStore(h, 'getInstance');
     await expectContained(h, await h.handler(statsReq(INSTANCE_A, 'brokkr', { secret: SECRET_A })));
   });
 
-  test('DELETE /v1/instances/:uuid — a store throw is contained as 500 internal', async () => {
+  test('DELETE /api/v1/instances/:uuid — a store throw is contained as 500 internal', async () => {
     const h = makeHarness();
     breakStore(h, 'deleteInstance');
     await expectContained(h, await h.handler(deleteReq(INSTANCE_A, SECRET_A)));

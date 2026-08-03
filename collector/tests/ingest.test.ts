@@ -1,4 +1,4 @@
-// POST /v1/ingest — write integrity (derived identity, stateless,
+// POST /api/v1/ingest — write integrity (derived identity, stateless,
 // constant-time), strict rejection of anything that is not THE heartbeat shape
 // (including the retired legacy one), body cap, day window, upsert idempotency,
 // and the observability of every rejection.
@@ -216,7 +216,7 @@ describe('ingest: body cap', () => {
         controller.enqueue(chunk);
       },
     });
-    const req = new Request('http://telemetry.local/v1/ingest', {
+    const req = new Request('http://telemetry.local/api/v1/ingest', {
       method: 'POST',
       headers: { 'x-mythical-instance-secret': SECRET_A },
       body,
@@ -235,7 +235,7 @@ describe('ingest: body cap', () => {
     const body = new ReadableStream<Uint8Array>({
       pull(controller) { pulls += 1; controller.enqueue(new Uint8Array(512)); },
     });
-    const req = new Request('http://telemetry.local/v1/ingest', {
+    const req = new Request('http://telemetry.local/api/v1/ingest', {
       method: 'POST',
       headers: { 'x-mythical-instance-secret': SECRET_A, 'content-length': '999999' },
       body,

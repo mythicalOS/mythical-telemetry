@@ -180,10 +180,10 @@ export function deliveryStateFilePath(stateRoot: string): string {
   return path.join(telemetryDirPath(stateRoot), "delivery.json");
 }
 
-/** `<endpoint>/v1/ingest`, preserving any query string the operator configured. */
+/** `<endpoint>/api/v1/ingest`, preserving any query string the operator configured. */
 export function ingestUrlFor(normalizedDestination: string): string {
   const url = new URL(normalizedDestination);
-  url.pathname = `${url.pathname.replace(/\/+$/, "")}/v1/ingest`;
+  url.pathname = `${url.pathname.replace(/\/+$/, "")}/api/v1/ingest`;
   return url.toString();
 }
 

@@ -280,36 +280,41 @@ describe('stats: window trimming', () => {
 });
 
 describe('service plumbing', () => {
-  test('GET /healthz => 200 {ok:true}', async () => {
+  test('GET /health => 200 C5 liveness triple {ok, version, uptime_s}', async () => {
     const { handler } = makeHarness();
-    const r = await handler(new Request('http://telemetry.local/healthz'));
+    const r = await handler(new Request('http://telemetry.local/health'));
     expect(r.status).toBe(200);
-    expect(await r.json()).toEqual({ ok: true });
+    const body = (await r.json()) as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    expect(typeof body.version).toBe('string');
+    expect(typeof body.uptime_s).toBe('number');
+    // Liveness and nothing else — no roster, counts, pid or configuration (C5).
+    expect(Object.keys(body).sort()).toEqual(['ok', 'uptime_s', 'version']);
   });
 
-  test('GET /v1/schema serves the operator-supplied text verbatim, and 404s when none is wired', async () => {
+  test('GET /api/v1/schema serves the operator-supplied text verbatim, and 404s when none is wired', async () => {
     const withSchema = makeHarness({ schemaJson: '{"title":"heartbeat v1"}' });
-    const r = await withSchema.handler(new Request('http://telemetry.local/v1/schema'));
+    const r = await withSchema.handler(new Request('http://telemetry.local/api/v1/schema'));
     expect(r.status).toBe(200);
     expect(r.headers.get('content-type')).toContain('application/json');
     expect(await r.text()).toBe('{"title":"heartbeat v1"}');
 
     const without = makeHarness();
-    expect((await without.handler(new Request('http://telemetry.local/v1/schema'))).status).toBe(404);
+    expect((await without.handler(new Request('http://telemetry.local/api/v1/schema'))).status).toBe(404);
   });
 
   test('an unknown route => 404', async () => {
     const { handler } = makeHarness();
-    expect((await handler(new Request('http://telemetry.local/v1/other'))).status).toBe(404);
+    expect((await handler(new Request('http://telemetry.local/api/v1/other'))).status).toBe(404);
   });
 
   test('a wrong method on a known path falls through to 404 rather than half-executing', async () => {
     const { handler } = makeHarness();
     for (const [path, method] of [
-      ['/v1/ingest', 'GET'],
-      [`/v1/instances/${INSTANCE_A}/stats`, 'DELETE'],
-      [`/v1/instances/${INSTANCE_A}`, 'GET'],
-      ['/v1/stats', 'POST'],
+      ['/api/v1/ingest', 'GET'],
+      [`/api/v1/instances/${INSTANCE_A}/stats`, 'DELETE'],
+      [`/api/v1/instances/${INSTANCE_A}`, 'GET'],
+      ['/api/v1/stats', 'POST'],
     ] as const) {
       const r = await handler(new Request(`http://telemetry.local${path}`, { method }));
       expect(r.status, `${method} ${path}`).toBe(404);

@@ -26,7 +26,7 @@ describe('aggregate JSON', () => {
     await seed(h, 'brokkr', 3);
     await seed(h, 'saga', 2);
 
-    const body = await (await h.handler(getReq('/v1/stats'))).json() as any;
+    const body = await (await h.handler(getReq('/api/v1/stats'))).json() as any;
     expect(body.ok).toBe(true);
     expect(body.contract_version).toBe(2);
     expect(body.products).toEqual([
@@ -45,7 +45,7 @@ describe('aggregate JSON', () => {
     const h = makeHarness({ minAggregateCell: 1 });
     await seed(h, 'brokkr', 1);
     for (let i = 0; i < 20; i++) {
-      expect((await h.handler(getReq('/v1/stats'))).status).toBe(200);
+      expect((await h.handler(getReq('/api/v1/stats'))).status).toBe(200);
       expect((await h.handler(getReq('/'))).status).toBe(200);
     }
     expect(h.counters.get('read_aggregate_ok')).toBe(40);
@@ -53,7 +53,7 @@ describe('aggregate JSON', () => {
 
     // ...and it does refresh once the window passes.
     h.advanceMs(61_000);
-    await h.handler(getReq('/v1/stats'));
+    await h.handler(getReq('/api/v1/stats'));
     expect(h.counters.get('read_aggregate_recomputed')).toBe(2);
   });
 
@@ -65,7 +65,7 @@ describe('aggregate JSON', () => {
     await seed(h, 'brokkr', 3);
     await seed(h, 'saga', 1);
 
-    const r = await h.handler(getReq('/v1/stats'));
+    const r = await h.handler(getReq('/api/v1/stats'));
     const text = await r.text();
     const body = JSON.parse(text);
     expect(body.products.map((p: any) => p.product)).toEqual(['brokkr']);
@@ -86,7 +86,7 @@ describe('aggregate JSON', () => {
     for (const id of ['dormant-1', 'dormant-2']) {
       h.db.recordHeartbeat(id, 'brokkr', '2026-01-01', 2, '{}', '2026-01-01');
     }
-    const body = await (await h.handler(getReq('/v1/stats'))).json() as any;
+    const body = await (await h.handler(getReq('/api/v1/stats'))).json() as any;
     const brokkr = body.products.find((p: any) => p.product === 'brokkr');
     expect(brokkr.installs_seen).toBe(3);
     expect(brokkr.installs_active).toBeNull();
@@ -94,7 +94,7 @@ describe('aggregate JSON', () => {
 
   test('an empty store answers with an empty list, not an error', async () => {
     const h = makeHarness();
-    const r = await h.handler(getReq('/v1/stats'));
+    const r = await h.handler(getReq('/api/v1/stats'));
     expect(r.status).toBe(200);
     const body = await r.json() as any;
     expect(body.products).toEqual([]);
@@ -104,7 +104,7 @@ describe('aggregate JSON', () => {
   test('the aggregate needs no credential', async () => {
     const h = makeHarness({ minAggregateCell: 1 });
     await seed(h, 'brokkr', 1);
-    expect((await h.handler(getReq('/v1/stats'))).status).toBe(200);
+    expect((await h.handler(getReq('/api/v1/stats'))).status).toBe(200);
   });
 });
 
@@ -187,7 +187,7 @@ describe('aggregate page', () => {
     // reads as all-time, and the store no longer holds all time.
     expect(page).not.toMatch(/Installations seen<\/th>/);
 
-    const body = await (await h.handler(getReq('/v1/stats'))).json() as any;
+    const body = await (await h.handler(getReq('/api/v1/stats'))).json() as any;
     expect(body.retention_days).toBe(45);
   });
 });

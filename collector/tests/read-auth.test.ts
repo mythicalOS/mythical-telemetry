@@ -41,7 +41,7 @@ describe('the instance id is no longer a bearer read capability', () => {
   test('the historical header name authorizes a read too', async () => {
     const h = makeHarness();
     await seed(h);
-    const req = new Request(`http://telemetry.local/v1/instances/${INSTANCE_A}/stats?product=brokkr`, {
+    const req = new Request(`http://telemetry.local/api/v1/instances/${INSTANCE_A}/stats?product=brokkr`, {
       headers: { 'x-mythical-write-key': SECRET_A },
     });
     expect((await h.handler(req)).status).toBe(200);
@@ -117,9 +117,9 @@ describe('the per-install page is GONE, not merely unlinked', () => {
     for (const path of [
       `/i/${INSTANCE_A}/`,
       `/instances/${INSTANCE_A}`,
-      `/v1/instances/${INSTANCE_A}`,
-      `/v1/instances/${INSTANCE_A}/page`,
-      `/v1/stats/${INSTANCE_A}`,
+      `/api/v1/instances/${INSTANCE_A}`,
+      `/api/v1/instances/${INSTANCE_A}/page`,
+      `/api/v1/stats/${INSTANCE_A}`,
     ]) {
       const r = await h.handler(getReq(path));
       const text = await r.text();
@@ -131,8 +131,8 @@ describe('the per-install page is GONE, not merely unlinked', () => {
   test('the aggregate route ignores an instance query parameter rather than honouring it', async () => {
     const h = makeHarness({ minAggregateCell: 1 });
     await seed(h);
-    const withParam = await h.handler(getReq(`/v1/stats?instance=${INSTANCE_A}`));
-    const without = await h.handler(getReq('/v1/stats'));
+    const withParam = await h.handler(getReq(`/api/v1/stats?instance=${INSTANCE_A}`));
+    const without = await h.handler(getReq('/api/v1/stats'));
     expect(withParam.status).toBe(200);
     const text = await withParam.text();
     expect(text).not.toContain(INSTANCE_A);
@@ -142,7 +142,7 @@ describe('the per-install page is GONE, not merely unlinked', () => {
   test('the public aggregate never names an installation', async () => {
     const h = makeHarness({ minAggregateCell: 1 });
     await seed(h);
-    for (const path of ['/', '/v1/stats']) {
+    for (const path of ['/', '/api/v1/stats']) {
       const text = await (await h.handler(getReq(path))).text();
       expect(text, path).not.toContain(INSTANCE_A);
     }

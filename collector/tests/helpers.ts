@@ -72,7 +72,7 @@ export function makeHarness(opts: HarnessOptions = {}): Harness {
 export function ingestReq(payload: unknown, secret?: string, headers: Record<string, string> = {}): Request {
   const h: Record<string, string> = { 'content-type': 'application/json', ...headers };
   if (secret !== undefined) h['x-mythical-instance-secret'] = secret;
-  return new Request('http://telemetry.local/v1/ingest', {
+  return new Request('http://telemetry.local/api/v1/ingest', {
     method: 'POST',
     headers: h,
     body: typeof payload === 'string' ? payload : JSON.stringify(payload),
@@ -81,7 +81,7 @@ export function ingestReq(payload: unknown, secret?: string, headers: Record<str
 
 /** Ingest using the historical header name, as an older client would. */
 export function legacyIngestReq(payload: unknown, secret: string): Request {
-  return new Request('http://telemetry.local/v1/ingest', {
+  return new Request('http://telemetry.local/api/v1/ingest', {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-mythical-write-key': secret },
     body: JSON.stringify(payload),
@@ -95,13 +95,13 @@ export function statsReq(uuid: string, product?: string, opts: { secret?: string
   const q = params.toString();
   const headers: Record<string, string> = {};
   if (opts.secret !== undefined) headers['x-mythical-instance-secret'] = opts.secret;
-  return new Request(`http://telemetry.local/v1/instances/${uuid}/stats${q ? `?${q}` : ''}`, { headers });
+  return new Request(`http://telemetry.local/api/v1/instances/${uuid}/stats${q ? `?${q}` : ''}`, { headers });
 }
 
 export function deleteReq(uuid: string, secret?: string): Request {
   const headers: Record<string, string> = {};
   if (secret !== undefined) headers['x-mythical-instance-secret'] = secret;
-  return new Request(`http://telemetry.local/v1/instances/${uuid}`, { method: 'DELETE', headers });
+  return new Request(`http://telemetry.local/api/v1/instances/${uuid}`, { method: 'DELETE', headers });
 }
 
 export function getReq(path: string, headers: Record<string, string> = {}): Request {

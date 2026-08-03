@@ -18,6 +18,7 @@ import {
   DEFAULT_RATE_LIMIT_PER_MIN,
 } from '../server';
 import { loadCanonicalValidator } from '../validator';
+import pkg from '../../package.json' with { type: 'json' };
 
 const DEFAULT_PORT = 7910;
 const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -75,6 +76,7 @@ const validator = await loadCanonicalValidator();
 const handler = buildFetchHandler({
   db,
   validator,
+  version: pkg.version,
   maxBodyBytes: envInt('MYTHICAL_TELEMETRY_MAX_BODY', DEFAULT_MAX_BODY_BYTES),
   rateLimitPerMin: envInt('MYTHICAL_TELEMETRY_RATE_LIMIT_PER_MIN', DEFAULT_RATE_LIMIT_PER_MIN),
   newInstancePerSourcePerHour: envInt(

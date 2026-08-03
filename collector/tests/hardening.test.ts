@@ -48,7 +48,7 @@ describe('per-source throttle', () => {
 
 describe('the trusted-proxy model', () => {
   const req = (xff?: string) =>
-    new Request('http://telemetry.local/v1/ingest', { headers: xff === undefined ? {} : { 'x-forwarded-for': xff } });
+    new Request('http://telemetry.local/api/v1/ingest', { headers: xff === undefined ? {} : { 'x-forwarded-for': xff } });
   const server = (address: string) => ({ requestIP: () => ({ address }) });
   // The operator's own proxies. Nothing outside this list is ever believed.
   const PROXIES = parseTrustedProxies(['10.0.0.0/8', '2001:db8:1::/48']);
@@ -324,7 +324,7 @@ describe('authenticated reads and deletes are throttled too', () => {
 
     const read = () =>
       h.handler(
-        new Request(`http://telemetry.local/v1/instances/${INSTANCE_A}/stats?product=brokkr`, {
+        new Request(`http://telemetry.local/api/v1/instances/${INSTANCE_A}/stats?product=brokkr`, {
           headers: { 'x-mythical-instance-secret': SECRET_A },
         }),
         src,
@@ -345,7 +345,7 @@ describe('authenticated reads and deletes are throttled too', () => {
     const src = h.serverFor('198.51.100.7');
     const read = () =>
       h.handler(
-        new Request(`http://telemetry.local/v1/instances/${INSTANCE_C}/stats?product=brokkr`, {
+        new Request(`http://telemetry.local/api/v1/instances/${INSTANCE_C}/stats?product=brokkr`, {
           headers: { 'x-mythical-instance-secret': SECRET_C },
         }),
         src,
@@ -362,7 +362,7 @@ describe('authenticated reads and deletes are throttled too', () => {
     const src = h.serverFor('198.51.100.7');
     const purge = () =>
       h.handler(
-        new Request(`http://telemetry.local/v1/instances/${INSTANCE_C}`, {
+        new Request(`http://telemetry.local/api/v1/instances/${INSTANCE_C}`, {
           method: 'DELETE',
           headers: { 'x-mythical-instance-secret': SECRET_C },
         }),
@@ -382,7 +382,7 @@ describe('authenticated reads and deletes are throttled too', () => {
     // An unauthenticated caller still gets 403, not 429 — the answer must not
     // depend on someone else's traffic.
     const r = await h.handler(
-      new Request(`http://telemetry.local/v1/instances/${INSTANCE_A}/stats?product=brokkr`),
+      new Request(`http://telemetry.local/api/v1/instances/${INSTANCE_A}/stats?product=brokkr`),
       src,
     );
     expect(r.status).toBe(403);
@@ -396,7 +396,7 @@ describe('authenticated reads and deletes are throttled too', () => {
     const b = h.serverFor('203.0.113.9');
     const purge = (server: ReturnType<typeof h.serverFor>) =>
       h.handler(
-        new Request(`http://telemetry.local/v1/instances/${INSTANCE_C}`, {
+        new Request(`http://telemetry.local/api/v1/instances/${INSTANCE_C}`, {
           method: 'DELETE',
           headers: { 'x-mythical-instance-secret': SECRET_C },
         }),
@@ -413,8 +413,8 @@ describe('authenticated reads and deletes are throttled too', () => {
     const h = makeHarness({ rateLimitPerMin: 1, minAggregateCell: 1 });
     const src = h.serverFor('198.51.100.7');
     for (let i = 0; i < 5; i++) {
-      expect((await h.handler(getReq('/v1/stats'), src)).status).toBe(200);
-      expect((await h.handler(getReq('/healthz'), src)).status).toBe(200);
+      expect((await h.handler(getReq('/api/v1/stats'), src)).status).toBe(200);
+      expect((await h.handler(getReq('/health'), src)).status).toBe(200);
     }
   });
 });
@@ -443,7 +443,7 @@ describe('the operator metrics surface', () => {
     expect(write.status).toBe(403);
     // ...nor a read one.
     const read = await h.handler(
-      new Request(`http://telemetry.local/v1/instances/${INSTANCE_A}/stats?product=brokkr`, {
+      new Request(`http://telemetry.local/api/v1/instances/${INSTANCE_A}/stats?product=brokkr`, {
         headers: { 'x-mythical-ops-key': 'ops-secret' },
       }),
     );

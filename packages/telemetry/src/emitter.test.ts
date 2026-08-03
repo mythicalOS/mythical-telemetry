@@ -123,8 +123,8 @@ describe("disclosure — the destination-aware transparency surface", () => {
     expect(entries[0]!.instance_id).not.toBe(entries[1]!.instance_id);
     // The claim "these are the exact bytes" is only true per destination — the bodies differ.
     expect(entries[0]!.wire_bytes).not.toBe(entries[1]!.wire_bytes);
-    expect(entries[0]!.endpoint).toBe("https://telemetry.example.com/v1/ingest");
-    expect(entries[1]!.endpoint).toBe("https://ops.example.net/v1/ingest");
+    expect(entries[0]!.endpoint).toBe("https://telemetry.example.com/api/v1/ingest");
+    expect(entries[1]!.endpoint).toBe("https://ops.example.net/api/v1/ingest");
   });
 
   test("the disclosed bytes are EXACTLY what would be sent", async () => {

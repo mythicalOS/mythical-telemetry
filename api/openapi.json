@@ -4,7 +4,7 @@
     "title": "mythical-telemetry collector HTTP API",
     "version": "0.1.2",
     "summary": "Ingest and aggregate anonymous product heartbeats.",
-    "description": "The collector ingests anonymous product heartbeats (POST /v1/ingest), serves per-install and aggregate reads, and exposes an operator counters surface. The Worker twin (collector-worker) implements this SAME document over Cloudflare D1; a route-parity test binds the two. AUTH IS BY HEADER, NOT BEARER: writes and per-install reads require the x-mythical-instance-secret header (a derived per-install secret; the legacy x-mythical-write-key is also accepted), and /metrics requires x-mythical-ops-key. The docs renderer only expresses HTTP bearer schemes, so operations here declare security:[] and name the header credential in prose; this is a documentation limitation, not an auth downgrade. ERROR ENVELOPE: telemetry answers errors as a flat {ok:false, error:<token>} with deliberately coarse tokens (an absent and a wrong secret are the same answer, so the surface cannot be used as an oracle) — this predates C3's {error, message} shape and is retained by API-M3's reduced scope. api/openapi.test.ts probes the real collector with every route below.",
+    "description": "The collector ingests anonymous product heartbeats (POST /api/v1/ingest), serves per-install and aggregate reads, and exposes an operator counters surface. The Worker twin (collector-worker) implements this SAME document over Cloudflare D1; a route-parity test binds the two. AUTH IS BY HEADER, NOT BEARER: writes and per-install reads require the x-mythical-instance-secret header (a derived per-install secret; the legacy x-mythical-write-key is also accepted), and /metrics requires x-mythical-ops-key. The docs renderer only expresses HTTP bearer schemes, so operations here declare security:[] and name the header credential in prose; this is a documentation limitation, not an auth downgrade. ERROR ENVELOPE: telemetry answers errors as a flat {ok:false, error:<token>} with deliberately coarse tokens (an absent and a wrong secret are the same answer, so the surface cannot be used as an oracle) — this predates C3's {error, message} shape and is retained by API-M3's reduced scope. api/openapi.test.ts probes the real collector with every route below.",
     "x-honesty": "Two documented deviations from the family convention, both retained by API-M3's reduced scope (prefix migration + first spec, not an auth or envelope re-shape): (1) auth is a custom header, not an HTTP bearer scheme, so operations declare security:[] and describe the header in prose; (2) the error envelope is telemetry's flat {ok:false, error:<lowercase token>}, not C3's {error:\"SCREAMING_SNAKE\", message}. The coarse error tokens are intentional anti-oracle design."
   },
   "servers": [{ "url": "http://localhost:7910" }],
@@ -22,19 +22,39 @@
     { "name": "meta", "x-displayName": "Meta" }
   ],
   "paths": {
-    "/healthz": {
+    "/health": {
       "get": {
         "tags": ["meta"],
-        "summary": "Liveness probe",
+        "summary": "Liveness probe (C5 triple)",
+        "description": "Bare, unauthenticated liveness. Payload is liveness and nothing else — no roster, counts or configuration — which is what makes it safe to leave open.",
         "security": [],
         "responses": {
           "200": {
-            "description": "The process is alive.",
+            "description": "The service is alive.",
             "content": {
-              "application/json": {
-                "schema": { "type": "object", "required": ["ok"], "properties": { "ok": { "type": "boolean" } } }
-              }
+              "application/json": { "schema": { "$ref": "#/components/schemas/Health" } }
             }
+          }
+        }
+      },
+      "head": {
+        "tags": ["meta"],
+        "summary": "Liveness probe (HEAD)",
+        "description": "Same status and headers as GET /health, with an empty body.",
+        "security": [],
+        "responses": { "200": { "description": "The service is alive (no body)." } }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "tags": ["meta"],
+        "summary": "This OpenAPI document, served verbatim (C9)",
+        "description": "The bytes served are the document committed beside the router; a client can ask a running instance what it implements and get a tested answer.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The committed OpenAPI document.",
+            "content": { "application/json": { "schema": { "type": "object" } } }
           }
         }
       }
@@ -43,7 +63,7 @@
       "get": {
         "tags": ["reads"],
         "summary": "Public aggregate give-back page (HTML dashboard)",
-        "description": "A human-facing HTML dashboard — UI delivery, not a capability route. The machine-readable equivalent is GET /v1/stats.",
+        "description": "A human-facing HTML dashboard — UI delivery, not a capability route. The machine-readable equivalent is GET /api/v1/stats.",
         "security": [],
         "responses": {
           "200": {
@@ -53,7 +73,7 @@
         }
       }
     },
-    "/v1/stats": {
+    "/api/v1/stats": {
       "get": {
         "tags": ["reads"],
         "summary": "Public aggregate statistics (JSON)",
@@ -67,7 +87,7 @@
         }
       }
     },
-    "/v1/schema": {
+    "/api/v1/schema": {
       "get": {
         "tags": ["reads"],
         "summary": "The published heartbeat JSON Schema",
@@ -98,7 +118,7 @@
         }
       }
     },
-    "/v1/ingest": {
+    "/api/v1/ingest": {
       "post": {
         "tags": ["ingest"],
         "summary": "Ingest one heartbeat",
@@ -123,7 +143,7 @@
         }
       }
     },
-    "/v1/instances/{id}/stats": {
+    "/api/v1/instances/{id}/stats": {
       "get": {
         "tags": ["reads"],
         "summary": "Per-install statistics (authenticated)",
@@ -143,7 +163,7 @@
         }
       }
     },
-    "/v1/instances/{id}": {
+    "/api/v1/instances/{id}": {
       "delete": {
         "tags": ["ingest"],
         "summary": "Purge an install across every product (authenticated)",
@@ -197,6 +217,16 @@
         "type": "object",
         "required": ["ok"],
         "properties": { "ok": { "type": "boolean", "enum": [true] } }
+      },
+      "Health": {
+        "type": "object",
+        "description": "C5 liveness triple.",
+        "required": ["ok", "version", "uptime_s"],
+        "properties": {
+          "ok": { "type": "boolean", "enum": [true] },
+          "version": { "type": "string", "description": "The collector's package version." },
+          "uptime_s": { "type": "integer", "description": "Seconds since this handler started (unit-suffixed)." }
+        }
       },
       "Heartbeat": {
         "type": "object",

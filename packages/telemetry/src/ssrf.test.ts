@@ -123,7 +123,7 @@ async function reasonFor(fn: () => Promise<unknown>): Promise<string> {
 
 describe("resolveAndPin — policy", () => {
   test("https to a public address passes and is pinned to that address", async () => {
-    const pinned = await resolveAndPin("https://collector.example.com/v1/ingest", { lookup: publicLookup });
+    const pinned = await resolveAndPin("https://collector.example.com/api/v1/ingest", { lookup: publicLookup });
     expect(pinned.address).toBe("93.184.216.34");
     expect(pinned.family).toBe(4);
     expect(pinned.literal).toBe(false);
@@ -141,7 +141,7 @@ describe("resolveAndPin — policy", () => {
   });
 
   test("the http opt-in works for a loopback literal", async () => {
-    const pinned = await resolveAndPin("http://127.0.0.1:9999/v1/ingest", {
+    const pinned = await resolveAndPin("http://127.0.0.1:9999/api/v1/ingest", {
       allowInsecureLoopback: true,
       allowPrivateAddresses: true,
     });
@@ -173,7 +173,7 @@ describe("resolveAndPin — policy", () => {
   test("an IP literal in the URL is judged directly, with no DNS at all", async () => {
     let called = false;
     const reason = await reasonFor(() =>
-      resolveAndPin("https://10.0.0.1/v1/ingest", {
+      resolveAndPin("https://10.0.0.1/api/v1/ingest", {
         lookup: async () => {
           called = true;
           return [{ address: "93.184.216.34", family: 4 }];
@@ -238,7 +238,7 @@ afterAll(() => {
 });
 
 async function pinnedTo(port: number, host = "collector.example.com"): ReturnType<typeof resolveAndPin> {
-  return resolveAndPin(`http://${host}:${port}/v1/ingest`, {
+  return resolveAndPin(`http://${host}:${port}/api/v1/ingest`, {
     allowInsecureLoopback: true,
     allowPrivateAddresses: true,
     lookup: async () => [{ address: "127.0.0.1", family: 4 }],
@@ -393,7 +393,7 @@ describe("postPinned", () => {
   });
 
   test("a connection refused surfaces as a request failure, not a hang", async () => {
-    const endpoint = await resolveAndPin("http://collector.example.com:1/v1/ingest", {
+    const endpoint = await resolveAndPin("http://collector.example.com:1/api/v1/ingest", {
       allowInsecureLoopback: true,
       allowPrivateAddresses: true,
       lookup: async () => [{ address: "127.0.0.1", family: 4 }],
@@ -414,13 +414,13 @@ describe("postPinned", () => {
       res.writeHead(200);
       res.end("ok");
     });
-    const endpoint = await resolveAndPin(`http://collector.example.com:${port}/v1/ingest?tenant=7`, {
+    const endpoint = await resolveAndPin(`http://collector.example.com:${port}/api/v1/ingest?tenant=7`, {
       allowInsecureLoopback: true,
       allowPrivateAddresses: true,
       lookup: async () => [{ address: "127.0.0.1", family: 4 }],
     });
     await postPinned({ endpoint, body: "{}", headers: {}, timeoutMs: 2000 });
-    expect(seenUrl).toBe("/v1/ingest?tenant=7");
+    expect(seenUrl).toBe("/api/v1/ingest?tenant=7");
   });
 });
 

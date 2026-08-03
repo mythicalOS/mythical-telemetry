@@ -76,7 +76,7 @@ describe("router registry (ROUTES) and the document are the same route set (clau
 });
 
 describe("every documented path resolves on the booted collector (clause 1)", () => {
-  // opsKey + schemaJson set so /metrics and /v1/schema are ACTIVE; then an unrouted path is the
+  // opsKey + schemaJson set so /metrics and /api/v1/schema are ACTIVE; then an unrouted path is the
   // only thing that returns 404 with the not_found sentinel. No credential is sent, so authed
   // routes answer 400/403 (which resolve) — the point is the router HAS the route.
   const h = makeHarness({ opsKey: "test-ops-key", schemaJson: "{}" });
@@ -159,7 +159,7 @@ describe("real error responses carry telemetry's flat envelope (clause 5)", () =
   });
   test("malformed ingest body → 4xx flat envelope", async () => {
     const res = await h.handler(
-      new Request("http://telemetry.local/v1/ingest", {
+      new Request("http://telemetry.local/api/v1/ingest", {
         method: "POST",
         headers: { "content-type": "application/json", "x-mythical-instance-secret": "s".repeat(43) },
         body: "not json",
@@ -174,5 +174,23 @@ describe("real error responses carry telemetry's flat envelope (clause 5)", () =
     );
     expect(res.status).toBe(403);
     await assertEnvelope(res);
+  });
+});
+
+describe("GET /openapi.json serves the committed document byte-for-byte (clause 6)", () => {
+  const h = makeHarness({ opsKey: "k", schemaJson: "{}" });
+  test("the served bytes are the committed document", async () => {
+    const res = await h.handler(new Request("http://telemetry.local/openapi.json"));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const served = await res.text();
+    // The handler serves JSON.stringify(importedDocument); the committed file is that same
+    // document. Compare against its canonical serialization so the guarantee is "the served doc
+    // IS the committed doc" — a spec edit that was not re-imported would diverge here.
+    expect(served).toBe(JSON.stringify(JSON.parse(readFileSync(SPEC_PATH, "utf8"))));
+    // And it round-trips to the same product identity.
+    expect((JSON.parse(served) as { "x-mythical": { product: string } })["x-mythical"].product).toBe(
+      "telemetry",
+    );
   });
 });

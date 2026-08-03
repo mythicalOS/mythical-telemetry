@@ -53,6 +53,7 @@ import { buildFetchHandler, type FetchHandler } from './server';
 // module a supported public entry point, and nothing in this deployment needs
 // it.
 import { validateHeartbeat } from '../../packages/telemetry/src/envelope';
+import pkg from '../package.json' with { type: 'json' };
 
 export interface Env {
   DB: D1Database;
@@ -148,6 +149,7 @@ function getHandler(env: Env): { handler: FetchHandler; db: TelemetryD1 } {
   const built = buildFetchHandler({
     db,
     validator: canonicalValidator,
+    version: pkg.version,
     maxBodyBytes: envInt(env.MYTHICAL_TELEMETRY_MAX_BODY, 32_768),
     rateLimitPerMin: envInt(env.MYTHICAL_TELEMETRY_RATE_LIMIT_PER_MIN, 60),
     newInstancePerSourcePerHour: envInt(env.MYTHICAL_TELEMETRY_NEW_INSTANCE_PER_SOURCE_PER_HOUR, 20),
