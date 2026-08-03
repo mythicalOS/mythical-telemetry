@@ -51,11 +51,14 @@ jobs:
           # Tree scan. -a is mandatory: one NUL byte hides a whole file from bare grep.
           grep -rainE -e "$DENY" . --exclude-dir=.git --exclude-dir=.github --exclude=.git > /tmp/raw.txt && rc=0 || rc=$?
           [ "$rc" -le 1 ] || { echo "::error::tree scan failed (grep rc=$rc)"; exit 1; }
-          # ;base64, lines are inline data payloads, not prose — chance hits only.
-          grep -av ';base64,' /tmp/raw.txt | cut -d: -f1,2 > /tmp/tree.txt || true
-          if [ -s /tmp/tree.txt ]; then
+          # Re-test each hit with inline data-URI payloads stripped — base64 blobs are not prose
+          # and match by chance. Only the payload is removed, never the surrounding line.
+          sed -E 's#;base64,[A-Za-z0-9+/=]+#;base64,[payload]#g' /tmp/raw.txt > /tmp/stripped.txt
+          grep -aiE -e "$DENY" /tmp/stripped.txt > /tmp/hits.txt && rc=0 || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::tree re-scan failed (grep rc=$rc)"; exit 1; }
+          if [ -s /tmp/hits.txt ]; then
             echo "::error::banned term(s) in tree"
-            cat /tmp/tree.txt
+            cut -d: -f1,2 /tmp/hits.txt
             exit 1
           fi
 
@@ -64,16 +67,21 @@ jobs:
             if [ -n "$BEFORE" ] && git rev-parse -q --verify "$BEFORE^{commit}" >/dev/null 2>&1; then
               git log --format=%B "$BEFORE..$AFTER" > /tmp/msg.txt
             else
-              git log --format=%B -n 20 "$AFTER" > /tmp/msg.txt   # new branch: all-zeros before-sha
+              # New branch or force-push: no usable range. Bounded scan, announced as such.
+              echo "::warning::before-sha unusable — message scan limited to the last 20 commits"
+              git log --format=%B -n 20 "$AFTER" > /tmp/msg.txt
             fi
           else
             git fetch -q --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" || true
             git log --format=%B "origin/$BASE_REF..HEAD" > /tmp/msg.txt
           fi
-          if grep -aiqE -e "$DENY" /tmp/msg.txt; then
+          if grep -aiqE -e "$DENY" /tmp/msg.txt; then rc=0; else rc=$?; fi
+          [ "$rc" -le 1 ] || { echo "::error::message scan failed (grep rc=$rc)"; exit 1; }
+          if [ "$rc" -eq 0 ]; then
             echo "::error::banned term(s) in new commit message(s)"
+            # Prefix shrinks on short terms so the redaction cannot reconstruct them.
             grep -aoiE -e "$DENY" /tmp/msg.txt | sort -u |
-              awk '{printf "  match=%s… (len %d)\n", substr($0, 1, 3), length($0)}'
+              awk '{n = length($0); printf "  match=%s… (len %d)\n", substr($0, 1, (n > 6 ? 3 : 1)), n}'
             exit 1
           fi
 
