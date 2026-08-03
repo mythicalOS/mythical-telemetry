@@ -190,6 +190,44 @@ interface StatsBody {
   };
 }
 
+/** One entry in the route inventory: an HTTP method and an OpenAPI-style path template. */
+export interface RouteSignature {
+  readonly method: string;
+  readonly path: string;
+}
+
+/**
+ * The WORKER's route inventory — declared INDEPENDENTLY of the collector's (this file is the
+ * deliberate duplicate twin), so the route-parity test comparing the two is a real check: a
+ * route added to one and not the other makes the sets differ and the test fails. Kept identical
+ * to `collector/src/server.ts`'s ROUTES by that test, not by a shared import. `{id}` is the one
+ * path parameter (an instance UUID).
+ */
+export const ROUTES: readonly RouteSignature[] = [
+  { method: 'GET', path: '/healthz' },
+  { method: 'GET', path: '/' },
+  { method: 'GET', path: '/v1/stats' },
+  { method: 'GET', path: '/v1/schema' },
+  { method: 'GET', path: '/metrics' },
+  { method: 'POST', path: '/v1/ingest' },
+  { method: 'GET', path: '/v1/instances/{id}/stats' },
+  { method: 'DELETE', path: '/v1/instances/{id}' },
+];
+
+/** A route handler; resolving to `null` means "not active in this configuration" → falls to 404. */
+type RouteHandler = (
+  m: RegExpExecArray,
+  req: Request,
+  url: URL,
+  server?: ServerLike,
+) => Response | null | Promise<Response | null>;
+
+/** Compile an OpenAPI-style path template (`/v1/instances/{id}`) to an anchored matcher. */
+function compileRoutePattern(path: string): RegExp {
+  const body = path.replace(/[.]/g, '\\.').replace(/\{[^}]+\}/g, '([^/]+)');
+  return new RegExp(`^${body}$`);
+}
+
 export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
   const { db, validator } = config;
   const schemaJson = config.schemaJson ?? null;
@@ -675,39 +713,55 @@ export function buildFetchHandler(config: TelemetryServerConfig): FetchHandler {
     });
   }
 
+  // Handlers, keyed by "<method> <path>" to match ROUTES exactly. A handler returning null means
+  // the route is not active in this configuration (no ops key, no wired schema) and the dispatch
+  // falls through to 404 — the same behaviour the previous if-chain had for /metrics and /v1/schema.
+  const routeHandlers: Record<string, RouteHandler> = {
+    'GET /healthz': () => json(200, { ok: true }),
+    'GET /': async () => {
+      // The counter is incremented only AFTER the snapshot is in hand: a failed cache build must
+      // not be recorded as a served aggregate.
+      const page = (await aggregateSnapshot()).html;
+      counters.inc('read_aggregate_ok');
+      return html(200, page);
+    },
+    'GET /v1/stats': async () => {
+      const body = (await aggregateSnapshot()).json;
+      counters.inc('read_aggregate_ok');
+      return new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
+    },
+    'GET /v1/schema': () =>
+      schemaJson === null
+        ? null
+        : new Response(schemaJson, { status: 200, headers: { 'content-type': 'application/json' } }),
+    'GET /metrics': (_m, req, _url, server) => handleMetrics(req, server),
+    'POST /v1/ingest': (_m, req, _url, server) => handleIngest(req, server),
+    'GET /v1/instances/{id}/stats': (m, req, url, server) => handleStats(m[1] ?? '', url, req, server),
+    'DELETE /v1/instances/{id}': (m, req, _url, server) => handleDelete(m[1] ?? '', req, server),
+  };
+  // The dispatcher and the inventory cannot drift: every ROUTES entry must have exactly one
+  // handler and vice versa, or construction throws (caught by every test that builds a handler).
+  const expectedKeys = ROUTES.map((r) => `${r.method} ${r.path}`);
+  if (
+    Object.keys(routeHandlers).length !== expectedKeys.length ||
+    expectedKeys.some((k) => !(k in routeHandlers))
+  ) {
+    throw new Error('worker route table drift: ROUTES and routeHandlers disagree');
+  }
+  const compiled = ROUTES.map((r) => ({ ...r, re: compileRoutePattern(r.path) }));
+
   return async function fetchHandler(req: Request, server?: ServerLike): Promise<Response> {
     try {
       const url = new URL(req.url);
       const path = url.pathname;
-
-      if (path === '/healthz' && req.method === 'GET') return json(200, { ok: true });
-      // The counter is incremented only AFTER the snapshot is in hand: a
-      // failed cache build must not be recorded as a served aggregate.
-      if (path === '/' && req.method === 'GET') {
-        const page = (await aggregateSnapshot()).html;
-        counters.inc('read_aggregate_ok');
-        return html(200, page);
+      for (const route of compiled) {
+        if (route.method !== req.method) continue;
+        const m = route.re.exec(path);
+        if (m === null) continue;
+        const res = await routeHandlers[`${route.method} ${route.path}`]!(m, req, url, server);
+        if (res === null) break; // route not active in this configuration → 404
+        return res;
       }
-      if (path === '/v1/stats' && req.method === 'GET') {
-        const body = (await aggregateSnapshot()).json;
-        counters.inc('read_aggregate_ok');
-        return new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
-      }
-      if (path === '/v1/schema' && req.method === 'GET' && schemaJson !== null) {
-        return new Response(schemaJson, { status: 200, headers: { 'content-type': 'application/json' } });
-      }
-      if (path === '/metrics' && req.method === 'GET') {
-        const res = await handleMetrics(req, server);
-        if (res) return res;
-      }
-      if (path === '/v1/ingest' && req.method === 'POST') return await handleIngest(req, server);
-
-      const statsMatch = /^\/v1\/instances\/([^/]+)\/stats$/.exec(path);
-      if (statsMatch && req.method === 'GET') return await handleStats(statsMatch[1] ?? '', url, req, server);
-
-      const instanceMatch = /^\/v1\/instances\/([^/]+)$/.exec(path);
-      if (instanceMatch && req.method === 'DELETE') return await handleDelete(instanceMatch[1] ?? '', req, server);
-
       return json(404, { ok: false, error: 'not_found' });
     } catch {
       // Never leak internals, and never log bodies or addresses.

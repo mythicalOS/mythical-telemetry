@@ -1,0 +1,291 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "mythical-telemetry collector HTTP API",
+    "version": "0.1.2",
+    "summary": "Ingest and aggregate anonymous product heartbeats.",
+    "description": "The collector ingests anonymous product heartbeats (POST /v1/ingest), serves per-install and aggregate reads, and exposes an operator counters surface. The Worker twin (collector-worker) implements this SAME document over Cloudflare D1; a route-parity test binds the two. AUTH IS BY HEADER, NOT BEARER: writes and per-install reads require the x-mythical-instance-secret header (a derived per-install secret; the legacy x-mythical-write-key is also accepted), and /metrics requires x-mythical-ops-key. The docs renderer only expresses HTTP bearer schemes, so operations here declare security:[] and name the header credential in prose; this is a documentation limitation, not an auth downgrade. ERROR ENVELOPE: telemetry answers errors as a flat {ok:false, error:<token>} with deliberately coarse tokens (an absent and a wrong secret are the same answer, so the surface cannot be used as an oracle) — this predates C3's {error, message} shape and is retained by API-M3's reduced scope. api/openapi.test.ts probes the real collector with every route below.",
+    "x-honesty": "Two documented deviations from the family convention, both retained by API-M3's reduced scope (prefix migration + first spec, not an auth or envelope re-shape): (1) auth is a custom header, not an HTTP bearer scheme, so operations declare security:[] and describe the header in prose; (2) the error envelope is telemetry's flat {ok:false, error:<lowercase token>}, not C3's {error:\"SCREAMING_SNAKE\", message}. The coarse error tokens are intentional anti-oracle design."
+  },
+  "servers": [{ "url": "http://localhost:7910" }],
+  "security": [],
+  "x-mythical": {
+    "product": "telemetry",
+    "router": "collector/src/server.ts",
+    "surface": "published",
+    "errorEnvelopeExample": { "ok": false, "error": "not_found" }
+  },
+  "tags": [
+    { "name": "ingest", "x-displayName": "Ingest" },
+    { "name": "reads", "x-displayName": "Reads" },
+    { "name": "operator", "x-displayName": "Operator" },
+    { "name": "meta", "x-displayName": "Meta" }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": ["meta"],
+        "summary": "Liveness probe",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The process is alive.",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object", "required": ["ok"], "properties": { "ok": { "type": "boolean" } } }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/": {
+      "get": {
+        "tags": ["reads"],
+        "summary": "Public aggregate give-back page (HTML dashboard)",
+        "description": "A human-facing HTML dashboard — UI delivery, not a capability route. The machine-readable equivalent is GET /v1/stats.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The rendered aggregate page.",
+            "content": { "text/html": { "schema": { "type": "string" } } }
+          }
+        }
+      }
+    },
+    "/v1/stats": {
+      "get": {
+        "tags": ["reads"],
+        "summary": "Public aggregate statistics (JSON)",
+        "description": "Aggregate-only population figures, small-cell floored. Public and unauthenticated.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The aggregate view.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Aggregate" } } }
+          }
+        }
+      }
+    },
+    "/v1/schema": {
+      "get": {
+        "tags": ["reads"],
+        "summary": "The published heartbeat JSON Schema",
+        "description": "Served verbatim when the operator wired one; 404 when unwired.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The JSON Schema document.",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": ["operator"],
+        "summary": "Operator counters and store gauges",
+        "description": "Operator-gated by the x-mythical-ops-key header (constant-time compared). Absent unless an ops key is configured, in which case an unknown route (404) is indistinguishable from an unconfigured one.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Counters, store gauges and throttle sizes.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Metrics" } } }
+          },
+          "403": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/v1/ingest": {
+      "post": {
+        "tags": ["ingest"],
+        "summary": "Ingest one heartbeat",
+        "description": "Requires the x-mythical-instance-secret header (a derived per-install secret; legacy x-mythical-write-key also accepted). Per-source throttled. Coarse answers: an absent secret and a wrong secret are the same answer (write_key_mismatch), and a nonexistent identity and one you cannot authenticate for are the same answer.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/Heartbeat" },
+              "example": { "product": "brokkr", "schema_version": 1, "instance_id": "00000000-0000-4000-8000-000000000000" }
+            }
+          }
+        },
+        "responses": {
+          "202": { "$ref": "#/components/responses/Accepted" },
+          "400": { "$ref": "#/components/responses/IngestInvalidPayload" },
+          "403": { "$ref": "#/components/responses/IngestUnauthorized" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "429": { "$ref": "#/components/responses/IngestThrottled" },
+          "500": { "$ref": "#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/instances/{id}/stats": {
+      "get": {
+        "tags": ["reads"],
+        "summary": "Per-install statistics (authenticated)",
+        "description": "Authenticated read (gate G6): requires the x-mythical-instance-secret header proving possession of THIS install's secret. Unknown and unauthenticated are the same answer.",
+        "security": [],
+        "parameters": [{ "$ref": "#/components/parameters/InstanceId" }],
+        "responses": {
+          "200": {
+            "description": "The per-install stats body.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/InstanceStats" } } }
+          },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "403": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/UnknownInstance" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "500": { "$ref": "#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/instances/{id}": {
+      "delete": {
+        "tags": ["ingest"],
+        "summary": "Purge an install across every product (authenticated)",
+        "description": "Authenticated delete (gate G6): requires the x-mythical-instance-secret header. Purges the derived identity across EVERY product.",
+        "security": [],
+        "parameters": [{ "$ref": "#/components/parameters/InstanceId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Accepted" },
+          "403": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "500": { "$ref": "#/components/responses/Internal" }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "InstanceId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "The install's UUIDv4 identity.",
+        "schema": { "type": "string", "format": "uuid" }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "description": "Telemetry's flat error envelope. `error` is a coarse lowercase token; there is no `message` (anti-oracle). NOTE: this is NOT C3's {error:SCREAMING_SNAKE, message} shape — see info.x-honesty.",
+        "required": ["ok", "error"],
+        "properties": {
+          "ok": { "type": "boolean", "enum": [false] },
+          "error": {
+            "type": "string",
+            "enum": [
+              "invalid_payload",
+              "payload_too_large",
+              "write_key_mismatch",
+              "invalid_request",
+              "unauthorized",
+              "unknown_instance",
+              "not_found",
+              "rate_limited",
+              "instance_capacity",
+              "internal"
+            ]
+          }
+        }
+      },
+      "Ok": {
+        "type": "object",
+        "required": ["ok"],
+        "properties": { "ok": { "type": "boolean", "enum": [true] } }
+      },
+      "Heartbeat": {
+        "type": "object",
+        "description": "One anonymous product heartbeat. See docs/FIELDS.md and packages/telemetry/schema/heartbeat.v1.json for the full field set.",
+        "required": ["product", "schema_version"],
+        "properties": {
+          "product": { "type": "string", "enum": ["brokkr", "saga", "skuld"] },
+          "schema_version": { "type": "integer", "enum": [1] },
+          "instance_id": { "type": "string", "format": "uuid" }
+        }
+      },
+      "Aggregate": {
+        "type": "object",
+        "description": "Aggregate population view, small-cell floored.",
+        "required": ["ok"],
+        "properties": { "ok": { "type": "boolean", "enum": [true] } }
+      },
+      "InstanceStats": {
+        "type": "object",
+        "description": "Per-install stats: window totals, per-day rates and the reporting-day metadata.",
+        "required": ["ok", "contract_version"],
+        "properties": {
+          "ok": { "type": "boolean", "enum": [true] },
+          "contract_version": { "type": "integer", "enum": [2] },
+          "product": { "type": "string" }
+        }
+      },
+      "Metrics": {
+        "type": "object",
+        "description": "Operator counters, store gauges and throttle sizes.",
+        "required": ["ok"],
+        "properties": { "ok": { "type": "boolean", "enum": [true] } }
+      }
+    },
+    "responses": {
+      "Accepted": {
+        "description": "Accepted.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ok" } } }
+      },
+      "NotFound": {
+        "description": "No such route or resource.",
+        "x-error-codes": ["not_found"],
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "InvalidRequest": {
+        "description": "The query parameters were malformed or failed validation.",
+        "x-error-codes": ["invalid_request"],
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "IngestInvalidPayload": {
+        "description": "The heartbeat body was unparseable, failed schema validation, named an unknown product, or fell outside the ingest day window.",
+        "x-error-codes": ["invalid_payload"],
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "IngestUnauthorized": {
+        "description": "Absent, malformed or mismatched instance secret (coarse: all indistinguishable).",
+        "x-error-codes": ["write_key_mismatch"],
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "PayloadTooLarge": {
+        "description": "The heartbeat body exceeded the hard intake cap.",
+        "x-error-codes": ["payload_too_large"],
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Unauthorized": {
+        "description": "Absent or wrong credential (coarse: the two are indistinguishable).",
+        "x-error-codes": ["unauthorized"],
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "UnknownInstance": {
+        "description": "No such install, or one the caller cannot authenticate for (coarse: indistinguishable).",
+        "x-error-codes": ["unknown_instance"],
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "RateLimited": {
+        "description": "Per-source throttle exceeded.",
+        "x-error-codes": ["rate_limited"],
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "IngestThrottled": {
+        "description": "Per-source throttle exceeded, or the new-instance admission cap was hit.",
+        "x-error-codes": ["rate_limited", "instance_capacity"],
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Internal": {
+        "description": "Contained internal error; body never leaks internals.",
+        "x-error-codes": ["internal"],
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    }
+  }
+}
