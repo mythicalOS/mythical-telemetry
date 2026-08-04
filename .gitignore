@@ -9,8 +9,6 @@ dist/
 .superpowers/
 docs/superpowers/
 .claude/
-AGENTS.md
-CLAUDE.md
 
 # test / build outputs
 test-results/
