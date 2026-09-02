@@ -1,0 +1,19 @@
+{
+  "name": "collector-worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Heartbeat ingest as a Cloudflare Worker on D1. Deployed, never published — see README.md.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "dev": "npx --yes wrangler@4 dev --local --port 8812",
+    "migrate:local": "npx --yes wrangler@4 d1 migrations apply mythicalos-telemetry --local",
+    "migrate:remote": "npx --yes wrangler@4 d1 migrations apply mythicalos-telemetry --remote",
+    "deploy": "npx --yes wrangler@4 deploy",
+    "test": "bun test tests",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@mythicalos/telemetry": "workspace:*"
+  }
+}

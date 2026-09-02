@@ -1,0 +1,104 @@
+name: docs-bar
+
+# Fail-closed public-bar gate: banned terms must not enter the tree or new commit
+# messages. Scope is the whole tree, minus .github/ so the gate cannot match itself.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  docs-bar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Gate
+        env:
+          DENY: ${{ secrets.DOCS_DENY_PATTERN }}
+          PROBE: ${{ secrets.DOCS_DENY_PROBE }}
+          EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT" = pull_request ] && [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$THIS_REPO" ]; then
+            echo "::notice::docs-bar skipped on fork PRs — secret unavailable; maintainer review covers this"
+            exit 0
+          fi
+
+          if [ -z "${DENY:-}" ]; then
+            echo "::error::DOCS_DENY_PATTERN is unset — failing closed"
+            exit 1
+          fi
+
+          # Self-test — the probes come from a second organisation secret, one term
+          # per line, so no banned term is written in this file. Every probe must
+          # match: that proves the secret arrived, is a usable ERE, and still covers
+          # what it is declared to cover. It does NOT prove the list is complete.
+          [ -n "${PROBE:-}" ] || { echo "::error::DOCS_DENY_PROBE is unset or empty — failing closed"; exit 1; }
+          n=0
+          while IFS= read -r probe; do
+            [ -n "$probe" ] || continue
+            n=$((n+1))
+            printf '%s\n' "$probe" | grep -aiqE -e "$DENY" && rc=0 || rc=$?
+            [ "$rc" -eq 0 ] || { echo "::error::self-test failed (grep rc=$rc) — DOCS_DENY_PATTERN does not cover probe #$n, or is not a usable pattern; the gate is weaker than declared"; exit 1; }
+          done <<< "$PROBE"
+          [ "$n" -gt 0 ] || { echo "::error::DOCS_DENY_PROBE held no probes — failing closed"; exit 1; }
+          echo "self-test OK: DOCS_DENY_PATTERN covers $n probe(s)"
+
+          # Tree scan. -a is mandatory: one NUL byte hides a whole file from bare grep.
+          grep -rainE -e "$DENY" . --exclude-dir=.git --exclude-dir=.github --exclude=.git > /tmp/raw.txt && rc=0 || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::tree scan failed (grep rc=$rc)"; exit 1; }
+          # Re-test every hit with real data-URI payloads stripped: a long base64 blob is not prose
+          # and matches by chance. Only the payload is replaced — the data: prefix and any
+          # parameters are preserved, so nothing but >=40 chars of base64 leaves the scan. \b anchors
+          # data: to a word start, so a lookalike such as "metadata:...;base64,..." is not exempted.
+          sed -E 's#\b(data:[a-z0-9./+-]*(;[a-z0-9._+-]+=[a-z0-9._+-]+)*;base64,)[A-Za-z0-9+/=]{40,}#\1[payload]#g' /tmp/raw.txt > /tmp/stripped.txt
+          grep -aiE -e "$DENY" /tmp/stripped.txt > /tmp/hits.txt && rc=0 || rc=$?
+          [ "$rc" -le 1 ] || { echo "::error::tree re-scan failed (grep rc=$rc)"; exit 1; }
+          if [ -s /tmp/hits.txt ]; then
+            echo "::error::banned term(s) in tree"
+            cut -d: -f1,2 /tmp/hits.txt
+            exit 1
+          fi
+
+          # Message scan — new commit bodies only, never author/committer fields.
+          INCOMPLETE=0
+          if [ "$EVENT" = push ]; then
+            if [ -n "$BEFORE" ] && git rev-parse -q --verify "$BEFORE^{commit}" >/dev/null 2>&1; then
+              git log --format=%B "$BEFORE..$AFTER" > /tmp/msg.txt
+            else
+              # New branch or force-push: the range cannot be established, so the scan below is
+              # best-effort only and the job fails closed rather than reporting an unproven pass.
+              echo "::error::before-sha unusable — message range unknown; bounded scan is incomplete"
+              git log --format=%B -n 20 "$AFTER" > /tmp/msg.txt
+              INCOMPLETE=1
+            fi
+          else
+            git fetch -q --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" ||
+              { echo "::error::could not refresh origin/$BASE_REF — message range unreliable"; exit 1; }
+            git log --format=%B "origin/$BASE_REF..HEAD" > /tmp/msg.txt
+          fi
+          if grep -aiqE -e "$DENY" /tmp/msg.txt; then rc=0; else rc=$?; fi
+          [ "$rc" -le 1 ] || { echo "::error::message scan failed (grep rc=$rc)"; exit 1; }
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::banned term(s) in new commit message(s)"
+            # Prefix shrinks on short terms so the redaction cannot reconstruct them.
+            grep -aoiE -e "$DENY" /tmp/msg.txt | sort -u |
+              awk '{n = length($0); printf "  match=%s… (len %d)\n", substr($0, 1, (n > 6 ? 3 : 1)), n}'
+            exit 1
+          fi
+          [ "$INCOMPLETE" -eq 0 ] || exit 1
+
+          echo "docs-bar: clean"

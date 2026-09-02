@@ -1,0 +1,122 @@
+{
+  // The heartbeat collector, as a Cloudflare Worker on D1.
+  //
+  // Deploy runbook, verification, rollback and — read this before deploying —
+  // the list of guarantees this deployment does NOT have: ./README.md
+  //
+  // House style follows the family's other workers (`mythicalos-get`,
+  // `mythicalos-waitlist`): the same `compatibility_date`, the same
+  // "create the D1 first, then paste the id in here" convention.
+  "name": "mythicalos-telemetry",
+  "main": "src/worker.ts",
+
+  // Pinned to the same date as the family's other workers, so all of them see
+  // one set of runtime behaviour flags. Moving it is a deliberate act: read
+  // Cloudflare's compatibility-date changelog, then redeploy and re-run the
+  // verification in README.md.
+  "compatibility_date": "2026-07-01",
+
+  // REQUIRED, not a convenience. Identity derivation and the constant-time
+  // comparison are `node:crypto` (`createHash`, `timingSafeEqual`, `Buffer`)
+  // and the derivation is byte-frozen — every stored instance id depends on it,
+  // so it may not be re-implemented against WebCrypto "to drop the flag".
+  // Measured on workerd under this flag: `createHash().digest()` returns a
+  // Buffer synchronously (not a thenable) and matches the known SHA-256 vector,
+  // and `timingSafeEqual` is present and discriminating. Without the flag the
+  // Worker does not build.
+  "compatibility_flags": ["nodejs_compat"],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mythicalos-telemetry",
+
+      // ══════════════════════════════════════════════════════════════════════
+      //  Created 2026-07-30 with `wrangler d1 create mythicalos-telemetry --location weur`.
+      //  WEUR is a deliberate placement, not a default: it is the one property of this database
+      //  that cannot be changed later without recreating it and moving the data.
+      //
+      //  No database has been created; that is the operator's step, on the
+      //  operator's account. Run it, then paste the id it prints here:
+      //
+      //      wrangler d1 create mythicalos-telemetry --location weur
+      //
+      //  `--location weur` matches the waitlist database (EU residency). Choose
+      //  it deliberately or keep it — a D1 database's location cannot be
+      //  changed afterwards.
+      //
+      //  Local emulation never resolves this value, so every `--local` step in
+      //  README.md works while it is still a placeholder. `wrangler deploy`
+      //  DOES resolve it, and fails rather than deploying a Worker whose
+      //  binding points at nothing.
+      // ══════════════════════════════════════════════════════════════════════
+      "database_id": "0b8cecbe-0178-430a-8be7-238c3eb1209f",
+
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  "triggers": {
+    // The retention prune. This replaces BOTH the boot prune and the
+    // `setInterval(prune, 24h)` in `collector/src/cli/server.ts` — and only the
+    // interval half of that actually survives. See README.md → "Retention is no
+    // longer fail-closed", which is the most consequential difference between
+    // this deployment and the Bun service.
+    //
+    // 03:17 UTC: deliberately off the hour, so it does not queue behind every
+    // other cron on the platform that fires at :00.
+    "crons": ["17 3 * * *"]
+  },
+
+  // A failed prune throws out of the `scheduled` handler and logs its reason.
+  // There is no boot hook and no process to exit, so THIS IS THE ONLY PLACE A
+  // FAILED PRUNE BECOMES VISIBLE — the service keeps serving either way.
+  // Turning observability off makes the retention clock unobservable, which is
+  // exactly how the previous collector went years without deleting anything.
+  "observability": { "enabled": true },
+
+  // ── Hostnames ────────────────────────────────────────────────────────────
+  //
+  // Production answers on `telemetry.mythicalos.ai`. `custom_domain: true` makes
+  // Cloudflare create the DNS record and provision the certificate, so this one
+  // line is the whole hostname setup — the same arrangement the other services
+  // on this zone use.
+  //
+  // The `workers.dev` address keeps working alongside it. That is deliberate:
+  // it is the address to smoke-test a deploy against BEFORE the real hostname
+  // is carrying traffic, and it does not depend on DNS having propagated.
+  "routes": [{ "pattern": "telemetry.mythicalos.ai", "custom_domain": true }],
+
+  // ── Preview ──────────────────────────────────────────────────────────────
+  //
+  // A SEPARATE WORKER WITH A SEPARATE DATABASE, and the separation is the point.
+  // Preview exists to receive test heartbeats — from a development container, a
+  // client change, a load probe. Every one of those is a real row. Pointed at
+  // the production database they would become indistinguishable from genuine
+  // installs, inflate the public aggregate, and consume the per-day admission
+  // budget that exists to bound abuse. There is no way to un-mix them later:
+  // nothing on the wire says "this heartbeat was a test".
+  //
+  // Deploy it with `wrangler deploy --env preview`. It gets the same schema and
+  // the same migrations, applied separately with `--env preview`.
+  //
+  // The prune runs here too, on the same schedule. A preview database that
+  // never deletes would quietly become the longest-retained copy of test data
+  // on the account, which is the opposite of what preview is for.
+  "env": {
+    "preview": {
+      "name": "mythicalos-telemetry-preview",
+      "routes": [{ "pattern": "telemetry-preview.mythicalos.ai", "custom_domain": true }],
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "mythicalos-telemetry-preview",
+          "database_id": "3e7b66f5-022d-4621-b660-63703e578e6a",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "triggers": { "crons": ["17 3 * * *"] },
+      "observability": { "enabled": true }
+    }
+  }
+}

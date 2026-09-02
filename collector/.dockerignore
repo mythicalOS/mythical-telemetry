@@ -1,0 +1,15 @@
+# The build context is the repository ROOT (see Dockerfile), so this file is
+# a convenience copy — Docker reads the ignore file next to the context, not
+# next to the Dockerfile. Keep it in step with the root .gitignore.
+node_modules/
+dist/
+**/node_modules/
+**/*.db
+**/*.db-wal
+**/*.db-shm
+.git/
+.github/
+**/.env
+**/.env.*
+**/*.log
+.DS_Store

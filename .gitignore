@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+.env
+.env.*
+
+# never publish internal planning / orchestration artifacts to this repo
+.superpowers/
+docs/superpowers/
+.claude/
+
+# test / build outputs
+test-results/
+playwright-report/
+coverage/

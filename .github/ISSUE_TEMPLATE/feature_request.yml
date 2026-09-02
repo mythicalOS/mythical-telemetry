@@ -1,0 +1,53 @@
+name: Feature request
+description: Propose a change in behaviour or a new capability.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        These projects are early and opinionated. A proposal that explains the **problem**
+        travels much further than one that specifies a solution.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched existing open and closed issues and did not find this.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what stops you today?
+      placeholder: "When I …, I cannot … because …"
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+      description: If you have a specific change in mind, describe it. If not, say so — that is fine.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including any workaround you are using now.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: contributing
+    attributes:
+      label: Would you be willing to implement this?
+      options:
+        - "Maybe, with guidance"
+        - "Yes"
+        - "No"
+    validations:
+      required: false
