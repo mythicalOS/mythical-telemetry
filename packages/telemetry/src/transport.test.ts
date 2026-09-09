@@ -1044,6 +1044,45 @@ describe("delivery state ages out on the INJECTED clock", () => {
     expect(transport.record("2026-09-01", "central", CENTRAL_URL)).toBeDefined();
   });
 
+  test("the drain's eligibility decision follows the clock the CALLER injects", async () => {
+    // The other tests in this file all run on the harness's own default clock, so nothing exercised
+    // the path where a caller supplies one — and `Transport` ignoring `options.nowMs` outright would
+    // still have satisfied them. This one hands two transports the SAME state on disk and two
+    // different injected clocks, one either side of the record's own next-attempt time, and the
+    // answers have to differ. A transport reading any single clock of its own — wall time included —
+    // cannot produce both.
+    const root = tmpRoot();
+    const RETRY_AT = Date.parse("2026-08-02T12:00:00.000Z");
+
+    const seed = harness(() => FAIL, { stateRoot: root, maxAttempts: 99 });
+    await seed.transport.send({ ...sendInput(CONSENT), copy: undefined });
+    patchRecordOnDisk(root, DAY, "central", CENTRAL_URL, { attempts: 0, next_attempt_at: new Date(RETRY_AT).toISOString() });
+
+    // A minute BEFORE the record may next be attempted: it is in backoff, so nothing is eligible.
+    const early = harness(() => OK, { stateRoot: root, maxAttempts: 99, nowMs: () => RETRY_AT - 60_000 });
+    expect(early.transport.unresolvedDays({ central: { url: CENTRAL_URL } })).toEqual([]);
+
+    // A minute AFTER it, against the same bytes on disk: eligible, and drained.
+    let calls = 0;
+    const late = harness(
+      () => {
+        calls += 1;
+        return OK;
+      },
+      { stateRoot: root, maxAttempts: 99, nowMs: () => RETRY_AT + 60_000 },
+    );
+    expect(late.transport.unresolvedDays({ central: { url: CENTRAL_URL } })).toEqual([DAY]);
+    const reports = await late.transport.drain({
+      product: "brokkr",
+      consent: CONSENT,
+      central: { url: CENTRAL_URL, identity: identity("a") },
+      exceptDay: "2026-07-28",
+      maxDays: 3,
+    });
+    expect(calls).toBe(1);
+    expect(reports.map((r) => r.day)).toEqual([DAY]);
+  });
+
   test("an explicit `nowMs: undefined` still gets the harness clock, never the wall clock", async () => {
     const { transport, now } = harness(() => FAIL, { nowMs: undefined, maxAttempts: 99 });
     await transport.send({ ...sendInput(CONSENT), copy: undefined });

@@ -341,9 +341,13 @@ Each block gives the command and **the exact response to expect**. Anything else
 curl -s -w '\nHTTP %{http_code}\n' "$BASE/health"
 ```
 ```
-{"ok":true}
+{"ok":true,"version":"<deployed version>","uptime_s":<seconds since boot>}
 HTTP 200
 ```
+
+`version` and `uptime_s` are what they say and will differ on every deployment and every call;
+`"ok":true` and the 200 are the invariant. `HEAD /health` answers the same status with an empty
+body.
 
 **Signed ingest is accepted.**
 

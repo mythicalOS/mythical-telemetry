@@ -99,6 +99,9 @@ throttle sits **after** the identity proof, so a 403 never depends on someone el
 The two public routes (`/` and `/api/v1/stats`) serve a **cached** aggregate, recomputed at most once a
 minute. The figures move at day granularity, so recomputing per request is pure waste — and on a
 public route that waste is an amplification lever.
+
+| Route | Method | Auth | Notes |
+|---|---|---|---|
 | `/api/v1/stats` | GET | none | per-product aggregate, small-cell suppressed |
 | `/` | GET | none | the aggregate give-back page |
 | `/api/v1/schema` | GET | none | the published JSON Schema, when the operator wired one; otherwise absent |

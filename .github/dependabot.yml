@@ -50,10 +50,18 @@ updates:
   # the cost is that nothing moves until something rewrites it. This is what
   # rewrites it, tag and digest together.
   #
-  # It rewrites the FROM line ONLY: the lifecycle comment above that line is
-  # prose Dependabot cannot see. A reviewer merging one of these must refresh
-  # that comment's check date and lifecycle statement in the same pull request,
-  # or the file will assert a fact about a version it no longer pins.
+  # It rewrites the FROM line ONLY. Two things it cannot see have to move with
+  # it, in the same pull request, or merging one of these leaves the repository
+  # green and wrong:
+  #   - the lifecycle comment above that line is prose, so its check date and
+  #     lifecycle statement must be refreshed by hand, or the file asserts a
+  #     fact about a version it no longer pins;
+  #   - `BUN_VERSION` in BOTH .github/workflows/ci.yml and release.yml pins the
+  #     Bun that installs, typechecks and tests the tree. It is a plain string,
+  #     not a dependency, so nothing updates it and nothing compares it to the
+  #     image. Leave it behind and CI keeps passing on one Bun while the shipped
+  #     container runs another — the drift is silent until something only one of
+  #     them supports reaches production.
   - package-ecosystem: docker
     directory: /collector
     schedule:
