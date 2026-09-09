@@ -86,9 +86,9 @@ open to anyone holding the id, and the unauthenticated per-installation page tha
 
 | Route | Method | Auth | Notes |
 |---|---|---|---|
-| `/v1/ingest` | POST | instance secret | 32 KB body cap; day window (≤ today UTC, ≥ today−30); upsert per (instance, product, day), last write wins; `202 {ok:true}` |
-| `/v1/instances/<uuid>/stats?product=<name>` | GET | instance secret | that installation's own days, totals and per-day rates; optional `&days=N` (1 – the configured retention, 90 by default) |
-| `/v1/instances/<uuid>` | DELETE | instance secret | purges the identity across **every** product; idempotent `204` |
+| `/api/v1/ingest` | POST | instance secret | 32 KB body cap; day window (≤ today UTC, ≥ today−30); upsert per (instance, product, day), last write wins; `202 {ok:true}` |
+| `/api/v1/instances/<uuid>/stats?product=<name>` | GET | instance secret | that installation's own days, totals and per-day rates; optional `&days=N` (1 – the configured retention, 90 by default) |
+| `/api/v1/instances/<uuid>` | DELETE | instance secret | purges the identity across **every** product; idempotent `204` |
 
 Every authenticated route is per-source throttled. Anyone can mint a valid (secret, id) pair, so an
 authenticated request is not a scarce one — an unthrottled read or no-op purge would reach the
@@ -96,14 +96,15 @@ database for the price of a hash. Reads and deletes draw on a **separate** budge
 read flood cannot stop heartbeat delivery for installations behind the same address, and the
 throttle sits **after** the identity proof, so a 403 never depends on someone else's traffic.
 
-The two public routes (`/` and `/v1/stats`) serve a **cached** aggregate, recomputed at most once a
+The two public routes (`/` and `/api/v1/stats`) serve a **cached** aggregate, recomputed at most once a
 minute. The figures move at day granularity, so recomputing per request is pure waste — and on a
 public route that waste is an amplification lever.
-| `/v1/stats` | GET | none | per-product aggregate, small-cell suppressed |
+| `/api/v1/stats` | GET | none | per-product aggregate, small-cell suppressed |
 | `/` | GET | none | the aggregate give-back page |
-| `/v1/schema` | GET | none | the published JSON Schema, when the operator wired one; otherwise absent |
+| `/api/v1/schema` | GET | none | the published JSON Schema, when the operator wired one; otherwise absent |
 | `/metrics` | GET | operator key | counters and gauges; **absent entirely** unless `MYTHICAL_TELEMETRY_OPS_KEY` is set |
-| `/healthz` | GET | none | `200 {ok:true}` |
+| `/health` | GET, HEAD | none | `200 {ok, version, uptime_s}` |
+| `/openapi.json` | GET | none | the committed OpenAPI document, served verbatim; the Worker twin serves the same bytes |
 
 Wire answers are deliberately coarse. An absent secret and a wrong secret are the same answer; a
 nonexistent installation and one you cannot authenticate for are the same answer. Operators get the
@@ -566,7 +567,7 @@ silently deleting every heartbeat on the next prune would be worse than saying s
 
 ### What this changes about the published figures
 
-Identity rows expire, so `installs_seen` on `/` and `/v1/stats` counts installations seen **within
+Identity rows expire, so `installs_seen` on `/` and `/api/v1/stats` counts installations seen **within
 the retention window**, never since the beginning. The page carries the window in the column heading
 and in prose, and the JSON carries `retention_days`, because an unqualified "seen" reads as all-time
 and would overstate the population.
@@ -578,7 +579,7 @@ arrive up to 30 days after the day it covers. "Installations seen in the last 90
 
 ## Deleting your data
 
-`DELETE /v1/instances/<uuid>` with the installation's secret purges every row for that identity,
+`DELETE /api/v1/instances/<uuid>` with the installation's secret purges every row for that identity,
 across every product. Idempotent `204`. The secret proves ownership of the id itself, so the purge
 is not scoped to one product — an erasure that left rows behind under another would be erasure in
 name only.

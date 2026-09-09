@@ -125,7 +125,7 @@ every isolate.
 The real fix for the limiters is Cloudflare's [rate limiting
 binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/) or a WAF rule
 in front of the Worker, not more code in `src/server.ts`. If this service is exposed publicly and
-matters, put an edge rate-limit rule on `POST /v1/ingest`.
+matters, put an edge rate-limit rule on `POST /api/v1/ingest`.
 
 ### One further inexactness, smaller than the four above
 
@@ -338,7 +338,7 @@ Each block gives the command and **the exact response to expect**. Anything else
 **Health.**
 
 ```sh
-curl -s -w '\nHTTP %{http_code}\n' "$BASE/healthz"
+curl -s -w '\nHTTP %{http_code}\n' "$BASE/health"
 ```
 ```
 {"ok":true}
@@ -348,7 +348,7 @@ HTTP 200
 **Signed ingest is accepted.**
 
 ```sh
-curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/v1/ingest" \
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/api/v1/ingest" \
   -H 'content-type: application/json' \
   -H "X-Mythical-Instance-Secret: $SECRET" \
   --data-binary @/tmp/heartbeat.json
@@ -364,7 +364,7 @@ HTTP 202
 **Unsigned ingest is refused.** No secret header at all:
 
 ```sh
-curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/v1/ingest" \
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/api/v1/ingest" \
   -H 'content-type: application/json' --data-binary @/tmp/heartbeat.json
 ```
 ```
@@ -376,7 +376,7 @@ HTTP 403
 distinguishable:
 
 ```sh
-curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/v1/ingest" \
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/api/v1/ingest" \
   -H 'content-type: application/json' \
   -H "X-Mythical-Instance-Secret: $(printf '0%.0s' $(seq 1 64))" \
   --data-binary @/tmp/heartbeat.json
@@ -390,7 +390,7 @@ HTTP 403
 the response never says which, and never echoes the request:
 
 ```sh
-curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/v1/ingest" \
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/api/v1/ingest" \
   -H 'content-type: application/json' \
   -H "X-Mythical-Instance-Secret: $SECRET" --data-binary 'not json'
 ```
@@ -403,7 +403,7 @@ HTTP 400
 
 ```sh
 curl -s -w '\nHTTP %{http_code}\n' \
-  "$BASE/v1/instances/$ID/stats?product=brokkr" \
+  "$BASE/api/v1/instances/$ID/stats?product=brokkr" \
   -H "X-Mythical-Instance-Secret: $SECRET"
 ```
 
@@ -424,7 +424,7 @@ not a one-day delta and is excluded from every rate (see `../collector/README.md
 **The id alone is not a read capability.** Same URL, no secret header:
 
 ```sh
-curl -s -w '\nHTTP %{http_code}\n' "$BASE/v1/instances/$ID/stats?product=brokkr"
+curl -s -w '\nHTTP %{http_code}\n' "$BASE/api/v1/instances/$ID/stats?product=brokkr"
 ```
 ```
 {"ok":false,"error":"unauthorized"}
@@ -436,7 +436,7 @@ product is below the default floor of 5 and is withheld **entirely** — an empt
 here is the small-cell floor working, not a broken query:
 
 ```sh
-curl -s -w '\nHTTP %{http_code}\n' "$BASE/v1/stats"
+curl -s -w '\nHTTP %{http_code}\n' "$BASE/api/v1/stats"
 ```
 ```
 {"ok":true,"contract_version":2,"generated_day":"2026-07-30","active_window_days":28,
@@ -472,12 +472,12 @@ any of those numbers.
 **Erasure works, and is idempotent.**
 
 ```sh
-curl -s -o /dev/null -w 'HTTP %{http_code}\n' -X DELETE "$BASE/v1/instances/$ID"                        # 403
-curl -s -o /dev/null -w 'HTTP %{http_code}\n' -X DELETE "$BASE/v1/instances/$ID" \
+curl -s -o /dev/null -w 'HTTP %{http_code}\n' -X DELETE "$BASE/api/v1/instances/$ID"                        # 403
+curl -s -o /dev/null -w 'HTTP %{http_code}\n' -X DELETE "$BASE/api/v1/instances/$ID" \
   -H "X-Mythical-Instance-Secret: $SECRET"                                                              # 204
-curl -s -o /dev/null -w 'HTTP %{http_code}\n' -X DELETE "$BASE/v1/instances/$ID" \
+curl -s -o /dev/null -w 'HTTP %{http_code}\n' -X DELETE "$BASE/api/v1/instances/$ID" \
   -H "X-Mythical-Instance-Secret: $SECRET"                                                              # 204 again
-curl -s -w '\nHTTP %{http_code}\n' "$BASE/v1/instances/$ID/stats?product=brokkr" \
+curl -s -w '\nHTTP %{http_code}\n' "$BASE/api/v1/instances/$ID/stats?product=brokkr" \
   -H "X-Mythical-Instance-Secret: $SECRET"
 ```
 ```
