@@ -42,17 +42,29 @@ interface Attempt {
   body: string;
 }
 
+/** The one clock every harness in this file runs on. Fixture days are dated relative to it. */
+const HARNESS_NOW_MS = Date.parse("2026-07-27T06:00:00.000Z");
+
+/**
+ * Retention, stated here rather than inherited from the transport's default.
+ *
+ * Every fixture day in this file sits inside this window measured from {@link HARNESS_NOW_MS}, so
+ * a change to the production default cannot quietly start pruning fixtures out from under an
+ * assertion.
+ */
+const HARNESS_RETENTION_DAYS = 35;
+
 function harness(
   responder: (attempt: Attempt) => Promise<PostResult> | PostResult,
   overrides: Partial<TransportOptions> = {},
 ): { transport: Transport; attempts: Attempt[]; root: string; now: { value: number } } {
   const root = overrides.stateRoot ?? tmpRoot();
   const attempts: Attempt[] = [];
-  const now = { value: Date.parse("2026-07-27T06:00:00.000Z") };
+  const now = { value: HARNESS_NOW_MS };
   const transport = new Transport({
     stateRoot: root,
-    nowMs: () => now.value,
     random: () => 0.5,
+    retentionDays: HARNESS_RETENTION_DAYS,
     resolveImpl: async (url): Promise<PinnedEndpoint> => ({
       url: new URL(url),
       address: "93.184.216.34",
@@ -65,6 +77,14 @@ function harness(
       return responder(attempt);
     },
     ...overrides,
+    // AFTER the spread, and coalescing on purpose. A caller writing `nowMs: undefined` means "this
+    // harness brings its own clock", not "use the wall clock" — but spread ahead of this line an
+    // explicit `undefined` key overrode the injected one, so the transport read Date.now(). Since
+    // it prunes delivery state older than the retention window, every fixture day here expired the
+    // moment real time moved a retention window past it: the state file emptied mid-drain and the
+    // assertions began answering to the calendar, surfacing as a wrong attempt count rather than
+    // as an expired fixture. The clock is injected here and cannot be replaced by an absent value.
+    nowMs: overrides.nowMs ?? (() => now.value),
   });
   return { transport, attempts, root, now };
 }
@@ -798,7 +818,7 @@ describe("drain fences for itself — it does not assume a preceding send() did"
     // The identity rotates. The stored body carries the OLD instance_id, so authenticating it with
     // the NEW secret would fail the collector's derived-identity check, burn attempts and could
     // exhaust the day. The fence purges it instead — a rotation is meant to orphan what came before.
-    const second = harness(() => OK, { stateRoot: root, nowMs: undefined });
+    const second = harness(() => OK, { stateRoot: root });
     const drained = await second.transport.drain({
       product: "brokkr",
       consent: CONSENT,
@@ -833,7 +853,7 @@ describe("drain fences for itself — it does not assume a preceding send() did"
 
     // A copy is configured later. Draining central's backlog must not mint a body-less copy record
     // for a day the copy was never configured for.
-    const second = harness(() => OK, { stateRoot: root, nowMs: undefined });
+    const second = harness(() => OK, { stateRoot: root });
     await second.transport.drain({
       product: "brokkr",
       consent: CONSENT,
@@ -893,7 +913,7 @@ describe("the drain cap counts ATTEMPTS, not selections", () => {
         calls += 1;
         return FAIL;
       },
-      { stateRoot: root, maxAttempts: 99, breakerThreshold: 1, breakerCooldownMs: 7 * 24 * 3_600_000, nowMs: undefined },
+      { stateRoot: root, maxAttempts: 99, breakerThreshold: 1, breakerCooldownMs: 7 * 24 * 3_600_000 },
     );
     const reports = await drainer.transport.drain({
       product: "brokkr",
@@ -924,7 +944,7 @@ describe("the drain cap counts ATTEMPTS, not selections", () => {
         calls += 1;
         return OK;
       },
-      { stateRoot: root, maxAttempts: 99, breakerThreshold: 99, nowMs: undefined },
+      { stateRoot: root, maxAttempts: 99, breakerThreshold: 99 },
     );
     const reports = await drainer.transport.drain({
       product: "brokkr",
@@ -989,5 +1009,47 @@ describe("only CLOSED-SET reasons reach durable state", () => {
     // pattern-matching free text.
     expect(TRANSPORT_REASONS).toContain("transport_error");
     expect(new Set(TRANSPORT_REASONS).size).toBe(TRANSPORT_REASONS.length);
+  });
+});
+
+describe("delivery state ages out on the INJECTED clock", () => {
+  const CONSENT = userConsent(true, Date.parse("2026-01-01T00:00:00.000Z"));
+  const DAY_MS = 86_400_000;
+
+  // Pruning is what made this suite time-dependent: it is driven by the transport's clock, and a
+  // harness whose clock silently fell back to Date.now() dropped every fixture day the moment real
+  // time moved a retention window past it — mid-drain, so the visible symptom was a wrong attempt
+  // count, not an expired fixture. These three pin the mechanism to the injected clock.
+
+  test("a record still inside the retention window survives a later write", async () => {
+    const { transport, now } = harness(() => FAIL, { maxAttempts: 99 });
+    await transport.send({ ...sendInput(CONSENT), copy: undefined });
+
+    now.value += (HARNESS_RETENTION_DAYS - 1) * DAY_MS;
+    await transport.send({ ...sendInput(CONSENT), day: "2026-08-30", copy: undefined });
+
+    expect(transport.record(DAY, "central", CENTRAL_URL)).toBeDefined();
+  });
+
+  test("a record older than the retention window is pruned by the next write", async () => {
+    const { transport, now } = harness(() => FAIL, { maxAttempts: 99 });
+    await transport.send({ ...sendInput(CONSENT), copy: undefined });
+
+    now.value += (HARNESS_RETENTION_DAYS + 1) * DAY_MS;
+    await transport.send({ ...sendInput(CONSENT), day: "2026-09-01", copy: undefined });
+
+    expect(transport.record(DAY, "central", CENTRAL_URL)).toBeUndefined();
+    // The write really happened — the older day is gone because it aged out, not because the
+    // state file was empty or unwritten.
+    expect(transport.record("2026-09-01", "central", CENTRAL_URL)).toBeDefined();
+  });
+
+  test("an explicit `nowMs: undefined` still gets the harness clock, never the wall clock", async () => {
+    const { transport, now } = harness(() => FAIL, { nowMs: undefined, maxAttempts: 99 });
+    await transport.send({ ...sendInput(CONSENT), copy: undefined });
+
+    // Asserted against the harness clock rather than against "the fixture is still there", so this
+    // holds whatever the machine's date is.
+    expect(transport.record(DAY, "central", CENTRAL_URL)!.last_attempt_at).toBe(new Date(now.value).toISOString());
   });
 });

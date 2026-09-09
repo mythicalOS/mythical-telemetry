@@ -13,3 +13,53 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+
+  # JavaScript dependencies. The ecosystem is `bun`, NOT `npm`: this repository
+  # commits a text-based `bun.lock` and no `package-lock.json`, and CI installs
+  # with `bun install --frozen-lockfile`. The npm updater cannot write bun.lock,
+  # so it would land a package.json bump against a lockfile that no longer
+  # matches it and every one of its own pull requests would fail the install
+  # step. Dependabot's bun support reads and rewrites bun.lock (bun >= 1.1.39).
+  #
+  # Every manifest directory is listed rather than relying on the root workspace
+  # being walked: a directory Dependabot is not pointed at is never scanned, and
+  # the silence is indistinguishable from having nothing to update. `collector`
+  # and `collector-worker` currently depend only on the workspace sibling, so
+  # they are expected to be quiet — they are listed so that stops being true the
+  # moment either grows a real dependency, instead of being noticed later.
+  #
+  # Minor and patch land as one grouped pull request so routine bumps do not
+  # arrive as a stream of near-identical PRs. Majors stay ungrouped and separate:
+  # each is a breaking change and deserves to be read on its own.
+  - package-ecosystem: bun
+    directories:
+      - /
+      - /packages/*
+      - /collector
+      - /collector-worker
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      bun-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # The collector's base image is pinned by INDEX digest, so it cannot pick up a
+  # rebuilt or newer base on its own — immutability is the point of the pin, and
+  # the cost is that nothing moves until something rewrites it. This is what
+  # rewrites it, tag and digest together.
+  #
+  # It rewrites the FROM line ONLY: the lifecycle comment above that line is
+  # prose Dependabot cannot see. A reviewer merging one of these must refresh
+  # that comment's check date and lifecycle statement in the same pull request,
+  # or the file will assert a fact about a version it no longer pins.
+  - package-ecosystem: docker
+    directory: /collector
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      docker-minor-patch:
+        update-types: ["minor", "patch"]
