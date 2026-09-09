@@ -43,6 +43,7 @@ updates:
       prefix: "chore(deps)"
     groups:
       bun-minor-patch:
+        patterns: ["*"]
         update-types: ["minor", "patch"]
 
   # The collector's base image is pinned by INDEX digest, so it cannot pick up a
@@ -70,4 +71,5 @@ updates:
       prefix: "chore(deps)"
     groups:
       docker-minor-patch:
+        patterns: ["*"]
         update-types: ["minor", "patch"]
