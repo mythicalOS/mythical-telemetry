@@ -85,7 +85,7 @@ jobs:
           bun-version: ${{ env.BUN_VERSION }}
 
       - name: Set up Node + npm (publish)
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           # Checked 2026-09-09 against endoflife.date: Node 24 is the active LTS line (24.21.0;
           # LTS since 2025-10-28, active support to 2026-10-20, security support to 2028-04-30).
